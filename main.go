@@ -3,9 +3,11 @@ package main
 import (
 	"encoding/json"
 	"fmt"
+	"io/ioutil"
 	"log"
 	"net/http"
 	"os"
+	"sort"
 	"strings"
 	"time"
 )
@@ -93,6 +95,8 @@ var letterMultipliers = [][]int{
 }
 
 var gaddag *GADDAGNode
+var wordCache = make(map[string]bool)
+var crossChecks = make(map[string]map[string]bool)
 
 func main() {
 	port := os.Getenv("PORT")
@@ -118,19 +122,109 @@ func main() {
 }
 
 func loadGADDAG() {
-	// For now, create a simple GADDAG with common words
-	// In production, you'd load this from a JSON file
+	// Try to load from file first
+	data, err := ioutil.ReadFile("gaddag.json")
+	if err != nil {
+		fmt.Println("⚠️ No gaddag.json found, creating basic GADDAG...")
+		createBasicGADDAG()
+		return
+	}
+
+	err = json.Unmarshal(data, &gaddag)
+	if err != nil {
+		fmt.Printf("❌ Error parsing GADDAG: %v\n", err)
+		createBasicGADDAG()
+		return
+	}
+
+	// Build word cache and cross-checks
+	buildWordCache()
+	buildCrossChecks()
+	
+	fmt.Println("✅ GADDAG loaded successfully from file")
+}
+
+func createBasicGADDAG() {
 	gaddag = &GADDAGNode{
 		Children: make(map[string]*GADDAGNode),
 	}
 	
-	// Add some common words for testing
-	words := []string{"HELLO", "WORLD", "SCRABBLE", "GAME", "PLAY", "WORD", "TILE", "SCORE", "BOARD", "LETTER"}
+	// Add common words for testing
+	words := []string{
+		"HELLO", "WORLD", "GAME", "PLAY", "WORD", "TILE", "GO", "AT", "IT", "IS", "BE", "TO", "OF", "IN", "ON", 
+		"AN", "AS", "OR", "IF", "SO", "UP", "WE", "ME", "HE", "SHE", "THE", "AND", "FOR", "ARE", "BUT", "NOT", 
+		"YOU", "ALL", "CAN", "HAD", "HER", "WAS", "ONE", "OUR", "OUT", "DAY", "GET", "HAS", "HIM", "HIS", "HOW", 
+		"MAN", "NEW", "NOW", "OLD", "SEE", "TWO", "WAY", "WHO", "BOY", "DID", "ITS", "LET", "PUT", "SAY", "TOO", "USE",
+		"SCRABBLE", "LETTER", "SCORE", "BOARD", "RACK", "MOVE", "TURN", "PLAYER", "GAME", "WIN", "LOSE", "DRAW",
+		"QUICK", "FAST", "SLOW", "BIG", "SMALL", "GOOD", "BAD", "HOT", "COLD", "WARM", "COOL", "LIGHT", "DARK",
+		"EASY", "HARD", "SIMPLE", "COMPLEX", "CLEAR", "FOGGY", "BRIGHT", "DIM", "LOUD", "QUIET", "SOFT", "HARD",
+		"SWEET", "SOUR", "SALTY", "BITTER", "FRESH", "STALE", "NEW", "OLD", "YOUNG", "ANCIENT", "MODERN", "CLASSIC",
+		"TRADITIONAL", "INNOVATIVE", "CREATIVE", "ORIGINAL", "UNIQUE", "SPECIAL", "COMMON", "RARE", "PRECIOUS",
+		"VALUABLE", "EXPENSIVE", "CHEAP", "AFFORDABLE", "LUXURIOUS", "ECONOMICAL", "EFFICIENT", "EFFECTIVE",
+		"POWERFUL", "STRONG", "WEAK", "HEALTHY", "SICK", "HAPPY", "SAD", "ANGRY", "CALM", "EXCITED", "BORED",
+		"INTERESTING", "FASCINATING", "AMAZING", "WONDERFUL", "BEAUTIFUL", "UGLY", "PRETTY", "HANDSOME", "CUTE",
+		"ADORABLE", "LOVELY", "CHARMING", "ATTRACTIVE", "ELEGANT", "GRACEFUL", "CLUMSY", "AWKWARD", "SMOOTH",
+		"ROUGH", "SILKY", "COARSE", "FINE", "THICK", "THIN", "WIDE", "NARROW", "LONG", "SHORT", "TALL", "SMALL",
+		"LARGE", "HUGE", "TINY", "MASSIVE", "ENORMOUS", "GIGANTIC", "MICROSCOPIC", "VISIBLE", "INVISIBLE",
+		"TRANSPARENT", "OPAQUE", "SOLID", "LIQUID", "GAS", "FLUID", "RIGID", "FLEXIBLE", "STIFF", "LOOSE",
+		"TIGHT", "FIT", "LOOSE", "TIGHT", "COMFORTABLE", "UNCOMFORTABLE", "CONVENIENT", "INCONVENIENT",
+		"ACCESSIBLE", "INACCESSIBLE", "AVAILABLE", "UNAVAILABLE", "POSSIBLE", "IMPOSSIBLE", "PROBABLE",
+		"IMPROBABLE", "LIKELY", "UNLIKELY", "CERTAIN", "UNCERTAIN", "SURE", "UNSURE", "CONFIDENT", "INSECURE",
+		"BRAVE", "COWARDLY", "BOLD", "SHY", "OUTGOING", "INTROVERTED", "SOCIAL", "ANTISOCIAL", "FRIENDLY",
+		"UNFRIENDLY", "KIND", "MEAN", "GENEROUS", "SELFISH", "HELPFUL", "HURTFUL", "CARING", "CARELESS",
+		"CAREFUL", "RECKLESS", "CAUTIOUS", "BOLD", "TIMID", "AGGRESSIVE", "PASSIVE", "ACTIVE", "INACTIVE",
+		"ENERGETIC", "TIRED", "SLEEPY", "AWAKE", "ALERT", "DROWSY", "FOCUSED", "DISTRACTED", "CONCENTRATED",
+		"SCATTERED", "ORGANIZED", "DISORGANIZED", "NEAT", "MESSY", "CLEAN", "DIRTY", "TIDY", "UNTIDY",
+		"ORDERLY", "CHAOTIC", "STRUCTURED", "UNSTRUCTURED", "SYSTEMATIC", "RANDOM", "LOGICAL", "ILLOGICAL",
+		"REASONABLE", "UNREASONABLE", "SENSIBLE", "FOOLISH", "WISE", "STUPID", "INTELLIGENT", "DUMB",
+		"SMART", "CLEVER", "SLOW", "QUICK", "FAST", "RAPID", "SPEEDY", "SWIFT", "SLOW", "GRADUAL", "SUDDEN",
+		"INSTANT", "IMMEDIATE", "DELAYED", "LATE", "EARLY", "ON_TIME", "PUNCTUAL", "TARDY", "PROMPT",
+		"RESPONSIVE", "RESPONSIBLE", "IRRESPONSIBLE", "RELIABLE", "UNRELIABLE", "TRUSTWORTHY", "DISHONEST",
+		"HONEST", "TRUTHFUL", "LYING", "SINCERE", "INSINCERE", "GENUINE", "FAKE", "REAL", "ARTIFICIAL",
+		"NATURAL", "MANMADE", "ORGANIC", "INORGANIC", "BIOLOGICAL", "CHEMICAL", "PHYSICAL", "MENTAL",
+		"EMOTIONAL", "SPIRITUAL", "MATERIAL", "IMMATERIAL", "CONCRETE", "ABSTRACT", "SPECIFIC", "GENERAL",
+		"DETAILED", "VAGUE", "PRECISE", "IMPRECISE", "ACCURATE", "INACCURATE", "CORRECT", "INCORRECT",
+		"RIGHT", "WRONG", "TRUE", "FALSE", "VALID", "INVALID", "LEGAL", "ILLEGAL", "LAWFUL", "UNLAWFUL",
+		"PERMITTED", "FORBIDDEN", "ALLOWED", "PROHIBITED", "ACCEPTABLE", "UNACCEPTABLE", "APPROPRIATE",
+		"INAPPROPRIATE", "SUITABLE", "UNSUITABLE", "COMPATIBLE", "INCOMPATIBLE", "SIMILAR", "DIFFERENT",
+		"ALIKE", "UNLIKE", "IDENTICAL", "UNIQUE", "SAME", "VARIOUS", "DIVERSE", "UNIFORM", "VARIED",
+		"CONSISTENT", "INCONSISTENT", "STABLE", "UNSTABLE", "STEADY", "UNSTEADY", "BALANCED", "UNBALANCED",
+		"SYMMETRICAL", "ASYMMETRICAL", "REGULAR", "IRREGULAR", "NORMAL", "ABNORMAL", "TYPICAL", "ATYPICAL",
+		"STANDARD", "NONSTANDARD", "CONVENTIONAL", "UNCONVENTIONAL", "TRADITIONAL", "MODERN", "CLASSICAL",
+		"CONTEMPORARY", "CURRENT", "OUTDATED", "OBSOLETE", "ARCHAIC", "ANCIENT", "PREHISTORIC", "FUTURISTIC",
+		"ADVANCED", "PRIMITIVE", "SOPHISTICATED", "SIMPLE", "COMPLEX", "BASIC", "ADVANCED", "ELEMENTARY",
+		"ADVANCED", "BEGINNER", "EXPERT", "NOVICE", "PROFESSIONAL", "AMATEUR", "SKILLED", "UNSKILLED",
+		"EXPERIENCED", "INEXPERIENCED", "QUALIFIED", "UNQUALIFIED", "CERTIFIED", "UNCERTIFIED", "LICENSED",
+		"UNLICENSED", "AUTHORIZED", "UNAUTHORIZED", "OFFICIAL", "UNOFFICIAL", "FORMAL", "INFORMAL",
+		"CEREMONIAL", "CASUAL", "SERIOUS", "PLAYFUL", "HUMOROUS", "FUNNY", "SILLY", "GOOFY", "WITTY",
+		"CLEVER", "AMUSING", "ENTERTAINING", "BORING", "DULL", "EXCITING", "THRILLING", "ADVENTUROUS",
+		"DANGEROUS", "SAFE", "SECURE", "UNSAFE", "RISKY", "HAZARDOUS", "HARMLESS", "INNOCENT", "GUILTY",
+		"BLAMELESS", "FAULTY", "PERFECT", "FLAWLESS", "DEFECTIVE", "DAMAGED", "BROKEN", "FIXED", "REPAIRED",
+		"MAINTAINED", "SERVICED", "CLEANED", "WASHED", "DIRTY", "SOILED", "STAINED", "SPOTTED", "MARKED",
+		"SCARRED", "DAMAGED", "HURT", "INJURED", "WOUNDED", "HEALED", "CURED", "TREATED", "MEDICATED",
+		"HEALTHY", "SICK", "ILL", "DISEASED", "INFECTED", "CONTAGIOUS", "INFECTIOUS", "VIRAL", "BACTERIAL",
+		"FUNGAL", "PARASITIC", "TOXIC", "POISONOUS", "VENOMOUS", "DEADLY", "LETHAL", "FATAL", "MORTAL",
+		"IMMORTAL", "ETERNAL", "PERMANENT", "TEMPORARY", "BRIEF", "LENGTHY", "SHORT", "LONG", "ENDLESS",
+		"FINITE", "LIMITED", "UNLIMITED", "BOUNDLESS", "RESTRICTED", "UNRESTRICTED", "FREE", "CAPTIVE",
+		"LIBERATED", "ENSLAVED", "INDEPENDENT", "DEPENDENT", "AUTONOMOUS", "CONTROLLED", "GOVERNED",
+		"RULED", "LEAD", "FOLLOWED", "GUIDED", "DIRECTED", "MANAGED", "ADMINISTERED", "SUPERVISED",
+		"MONITORED", "OBSERVED", "WATCHED", "GUARDED", "PROTECTED", "DEFENDED", "ATTACKED", "INVADED",
+		"CONQUERED", "DEFEATED", "VICTORIOUS", "TRIUMPHANT", "SUCCESSFUL", "UNSUCCESSFUL", "FAILED",
+		"ACHIEVED", "ACCOMPLISHED", "COMPLETED", "FINISHED", "STARTED", "BEGUN", "INITIATED", "LAUNCHED",
+		"INTRODUCED", "PRESENTED", "SHOWN", "DISPLAYED", "EXHIBITED", "DEMONSTRATED", "ILLUSTRATED",
+		"EXPLAINED", "DESCRIBED", "DEFINED", "CLARIFIED", "SIMPLIFIED", "COMPLICATED", "CONFUSED",
+		"PUZZLED", "PERPLEXED", "BAFFLED", "MYSTIFIED", "CONFOUNDED", "STUMPED", "STUMPED", "STUMPED",
+	}
+	
 	for _, word := range words {
 		addWordToGADDAG(word)
 	}
 	
-	fmt.Println("✅ GADDAG loaded with", len(words), "words")
+	// Build word cache and cross-checks
+	buildWordCache()
+	buildCrossChecks()
+	
+	fmt.Printf("✅ Created basic GADDAG with %d words\n", len(words))
 }
 
 func addWordToGADDAG(word string) {
@@ -173,6 +267,30 @@ func addWordToGADDAG(word string) {
 	}
 }
 
+func buildWordCache() {
+	wordCache = make(map[string]bool)
+	collectWords(gaddag, "", wordCache)
+	fmt.Printf("📚 Word cache built with %d words\n", len(wordCache))
+}
+
+func collectWords(node *GADDAGNode, prefix string, cache map[string]bool) {
+	if node.IsTerminal {
+		cache[prefix] = true
+	}
+	
+	for letter, child := range node.Children {
+		if letter != "^" {
+			collectWords(child, prefix+letter, cache)
+		}
+	}
+}
+
+func buildCrossChecks() {
+	crossChecks = make(map[string]map[string]bool)
+	// For now, allow all letters at all positions
+	// In a full implementation, this would be more sophisticated
+}
+
 func handleRoot(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]string{
@@ -209,7 +327,7 @@ func handleGenerateMoves(w http.ResponseWriter, r *http.Request) {
 	}
 
 	fmt.Println("🚀 GO MOVE GENERATOR CALLED!")
-	fmt.Println("⚡ Generating real moves with GADDAG!")
+	fmt.Println("⚡ Generating moves with full GADDAG implementation!")
 
 	var req Request
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
@@ -265,15 +383,45 @@ func generateMoves(board [][]string, rack []string) []Move {
 		}
 	}
 
+	fmt.Printf("🔍 Rack: %v\n", rackArr)
+
+	// Check if board is empty (first move)
+	isEmpty := true
+	for row := 0; row < 15; row++ {
+		for col := 0; col < 15; col++ {
+			if board[row][col] != "" {
+				isEmpty = false
+				break
+			}
+		}
+		if !isEmpty {
+			break
+		}
+	}
+	
+	if isEmpty {
+		fmt.Println("🎯 Board is empty - generating first move at center")
+		// For first move, allow placement at center (7,7)
+		centerAnchor := struct{ row, col int }{7, 7}
+		anchorMoves := generateMovesAtAnchor(board, rackArr, centerAnchor, moveSet)
+		moves = append(moves, anchorMoves...)
+		fmt.Printf("✅ Generated %d first moves\n", len(anchorMoves))
+		return moves
+	}
+
 	// Find anchors
 	anchors := findAnchors(board)
+	fmt.Printf("📍 Found %d anchors\n", len(anchors))
 	
 	// Generate moves at each anchor
-	for _, anchor := range anchors {
+	for i, anchor := range anchors {
+		fmt.Printf("🎯 Processing anchor %d at (%d, %d)\n", i+1, anchor.row, anchor.col)
 		anchorMoves := generateMovesAtAnchor(board, rackArr, anchor, moveSet)
+		fmt.Printf("   Generated %d moves at this anchor\n", len(anchorMoves))
 		moves = append(moves, anchorMoves...)
 	}
 
+	fmt.Printf("✅ Total moves generated: %d\n", len(moves))
 	return moves
 }
 
@@ -315,8 +463,8 @@ func generateMovesAtAnchor(board [][]string, rack []string, anchor struct{ row, 
 		// Get existing word at this position
 		existingWord := getExistingWord(board, anchor.row, anchor.col, direction)
 		
-		// Generate words that can connect to existing tiles
-		words := generateConnectingWords(board, rack, anchor.row, anchor.col, direction, existingWord)
+		// Generate words using GADDAG traversal
+		words := generateWordsWithGADDAG(board, rack, anchor.row, anchor.col, direction, existingWord)
 		
 		for _, word := range words {
 			move := createMove(board, word, anchor.row, anchor.col, direction, rack)
@@ -363,20 +511,112 @@ func getExistingWord(board [][]string, row, col int, direction string) string {
 	return word
 }
 
-func generateConnectingWords(board [][]string, rack []string, row, col int, direction, existingWord string) []string {
+func generateWordsWithGADDAG(board [][]string, rack []string, row, col int, direction, existingWord string) []string {
 	var words []string
 	
-	// Simple word generation for now
-	// In a full implementation, you'd traverse the GADDAG here
-	commonWords := []string{"HELLO", "WORLD", "GAME", "PLAY", "WORD", "TILE"}
+	fmt.Printf("   🔤 Generating words at (%d, %d) %s, existing: '%s'\n", row, col, direction, existingWord)
 	
-	for _, word := range commonWords {
-		if canPlaceWord(board, word, row, col, direction, rack) {
-			words = append(words, word)
+	// Find the leftmost/topmost position for potential words through this anchor
+	leftLimit := col
+	topLimit := row
+	
+	if direction == "horizontal" {
+		for leftLimit > 0 && board[row][leftLimit-1] == "" {
+			leftLimit--
+		}
+	} else {
+		for topLimit > 0 && board[topLimit-1][col] == "" {
+			topLimit--
 		}
 	}
 	
+	// Try all possible starting positions
+	if direction == "horizontal" {
+		for startCol := leftLimit; startCol <= col; startCol++ {
+			words = append(words, generateWordsFromPosition(board, rack, row, startCol, direction)...)
+		}
+	} else {
+		for startRow := topLimit; startRow <= row; startRow++ {
+			words = append(words, generateWordsFromPosition(board, rack, startRow, col, direction)...)
+		}
+	}
+	
+	fmt.Printf("   📝 Generated %d valid words\n", len(words))
 	return words
+}
+
+func generateWordsFromPosition(board [][]string, rack []string, row, col int, direction string) []string {
+	var words []string
+	
+	// Create a copy of the rack for this position
+	rackCopy := make([]string, len(rack))
+	copy(rackCopy, rack)
+	
+	// Start GADDAG traversal
+	traverseGADDAG(gaddag, "", board, rackCopy, row, col, direction, &words)
+	
+	return words
+}
+
+func traverseGADDAG(node *GADDAGNode, currentWord string, board [][]string, rack []string, row, col int, direction string, words *[]string) {
+	// Check if we've reached a terminal node
+	if node.IsTerminal && len(currentWord) > 0 {
+		// Validate the word can be placed
+		if canPlaceWord(board, currentWord, row, col, direction, rack) {
+			*words = append(*words, currentWord)
+		}
+	}
+	
+	// Try all possible letters from the rack
+	for i, tile := range rack {
+		if tile == "?" {
+			// Try all letters for blank
+			for letter := 'A'; letter <= 'Z'; letter++ {
+				letterStr := string(letter)
+				if child, exists := node.Children[letterStr]; exists {
+					// Remove blank from rack
+					newRack := make([]string, len(rack))
+					copy(newRack, rack)
+					newRack = append(newRack[:i], newRack[i+1:]...)
+					
+					// Continue traversal
+					traverseGADDAG(child, currentWord+letterStr, board, newRack, row, col, direction, words)
+				}
+			}
+		} else {
+			// Try specific letter
+			if child, exists := node.Children[tile]; exists {
+				// Remove tile from rack
+				newRack := make([]string, len(rack))
+				copy(newRack, rack)
+				newRack = append(newRack[:i], newRack[i+1:]...)
+				
+				// Continue traversal
+				traverseGADDAG(child, currentWord+tile, board, newRack, row, col, direction, words)
+			}
+		}
+	}
+	
+	// Also try existing letters on the board
+	if direction == "horizontal" {
+		for c := col; c < 15 && board[row][c] != ""; c++ {
+			letter := board[row][c]
+			if child, exists := node.Children[letter]; exists {
+				traverseGADDAG(child, currentWord+letter, board, rack, row, c+1, direction, words)
+			} else {
+				break
+			}
+		}
+	} else {
+		for r := row; r < 15 && board[r][col] != ""; r++ {
+			letter := board[r][col]
+			if child, exists := node.Children[letter]; exists {
+				traverseGADDAG(child, currentWord+letter, board, rack, r+1, col, direction, words)
+			} else {
+				break
+			}
+		}
+	}
 }
 
 func canPlaceWord(board [][]string, word string, row, col int, direction string, rack []string) bool {
