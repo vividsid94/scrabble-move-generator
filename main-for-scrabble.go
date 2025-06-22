@@ -19,6 +19,18 @@ import (
 
 // Request/Response structures
 // Board is a 15x15 array of strings ("" for empty, or a single letter)
+
+func setCORSHeaders(w http.ResponseWriter, r *http.Request) {
+	origin := r.Header.Get("Origin")
+	if origin == "http://localhost:8888" || origin == "https://tileturnover.com" {
+		w.Header().Set("Access-Control-Allow-Origin", origin)
+		w.Header().Set("Vary", "Origin")
+	}
+	w.Header().Set("Access-Control-Allow-Methods", "POST, OPTIONS")
+	w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization")
+	w.Header().Set("Access-Control-Max-Age", "86400") // 24 hours
+}
+
 type GenerateMovesRequest struct {
 	Rack  string     `json:"rack"`
 	Board [][]string `json:"board"` // 15x15 board as strings
@@ -87,9 +99,7 @@ func healthHandler(w http.ResponseWriter, r *http.Request) {
 }
 
 func generateMovesHandler(w http.ResponseWriter, r *http.Request) {
-	w.Header().Set("Access-Control-Allow-Origin", "*")
-	w.Header().Set("Access-Control-Allow-Methods", "POST, OPTIONS")
-	w.Header().Set("Access-Control-Allow-Headers", "Content-Type")
+	setCORSHeaders(w, r)
 	if r.Method == http.MethodOptions {
 		w.WriteHeader(http.StatusOK)
 		return
