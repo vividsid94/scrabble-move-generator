@@ -6,6 +6,7 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"sort"
 	"strings"
 
 	"github.com/domino14/word-golib/kwg"
@@ -59,6 +60,28 @@ type ValidateWordResponse struct {
 	Lexicon   string `json:"lexicon"`
 }
 
+type SubanagramSearchRequest struct {
+	Letters string `json:"letters"`
+}
+
+type SubanagramSearchResponse struct {
+	Letters      string   `json:"letters"`
+	Subanagrams  []string `json:"subanagrams"`
+	Count        int      `json:"count"`
+	Lexicon      string   `json:"lexicon"`
+}
+
+type AnagramSearchRequest struct {
+	Letters string `json:"letters"`
+}
+
+type AnagramSearchResponse struct {
+	Letters   string   `json:"letters"`
+	Anagrams  []string `json:"anagrams"`
+	Count     int      `json:"count"`
+	Lexicon   string   `json:"lexicon"`
+}
+
 // Global state (safe for demo, not for production concurrency)
 var (
 	gd   *kwg.KWG
@@ -74,6 +97,8 @@ func main() {
 	http.HandleFunc("/health", healthHandler)
 	http.HandleFunc("/generate-moves", generateMovesHandler)
 	http.HandleFunc("/validate-word", validateWordHandler)
+	http.HandleFunc("/find-subanagrams", findSubanagramsHandler)
+	http.HandleFunc("/find-anagrams", findAnagramsHandler)
 
 	port := os.Getenv("PORT")
 	if port == "" {
@@ -283,6 +308,184 @@ func validateWordHandler(w http.ResponseWriter, r *http.Request) {
 		Word:      word,
 		IsValid:   isValid,
 		Lexicon:   "NWL23", // Using the same lexicon that's already loaded
+	}
+	
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(response)
+}
+
+func findSubanagramsHandler(w http.ResponseWriter, r *http.Request) {
+	setCORSHeaders(w, r)
+	if r.Method == http.MethodOptions {
+		w.WriteHeader(http.StatusOK)
+		return
+	}
+	if r.Method != http.MethodPost {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	
+	var req SubanagramSearchRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, "Invalid JSON", http.StatusBadRequest)
+		return
+	}
+
+	if req.Letters == "" {
+		http.Error(w, "Letters are required", http.StatusBadRequest)
+		return
+	}
+
+	// Convert letters to uppercase and remove spaces
+	letters := strings.ToUpper(strings.ReplaceAll(req.Letters, " ", ""))
+	
+	// Create an empty board
+	bd := board.MakeBoard(board.CrosswordGameBoard)
+	
+	// Try to create a rack with the letters
+	rack := tilemapping.RackFromString(letters, alph)
+	if rack == nil {
+		http.Error(w, "Invalid letters provided", http.StatusBadRequest)
+		return
+	}
+	
+	// Generate cross-sets for the empty board
+	cross_set.GenAllCrossSets(bd, gd, ld)
+	bd.UpdateAllAnchors()
+	
+	// Generate all possible moves
+	generator := movegen.NewGordonGenerator(gd, bd, ld)
+	moves := generator.GenAll(rack, false)
+	
+	// Extract unique words from the moves
+	subanagrams := make(map[string]bool)
+	for _, m := range moves {
+		moveStr := m.String()
+		// Parse move string to extract word (same logic as generateMovesHandler)
+		if strings.Contains(moveStr, "play word:") {
+			parts := strings.Split(moveStr, "play word:")
+			if len(parts) > 1 {
+				wordPart := strings.TrimSpace(parts[1])
+				wordFields := strings.Fields(wordPart)
+				for _, field := range wordFields {
+					if len(field) >= 2 && !strings.ContainsAny(field, "0123456789") && 
+					   !strings.HasPrefix(field, "score:") && 
+					   !strings.HasPrefix(field, "tp:") && 
+					   !strings.HasPrefix(field, "leave:") {
+						if !strings.HasPrefix(field, ".....") {
+							subanagrams[field] = true
+							break
+						}
+						break
+					}
+				}
+			}
+		}
+	}
+	
+	// Convert map keys to slice and sort
+	subanagramList := make([]string, 0, len(subanagrams))
+	for word := range subanagrams {
+		subanagramList = append(subanagramList, word)
+	}
+	sort.Strings(subanagramList)
+	
+	response := SubanagramSearchResponse{
+		Letters:      letters,
+		Subanagrams:  subanagramList,
+		Count:        len(subanagramList),
+		Lexicon:      "NWL23",
+	}
+	
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(response)
+}
+
+func findAnagramsHandler(w http.ResponseWriter, r *http.Request) {
+	setCORSHeaders(w, r)
+	if r.Method == http.MethodOptions {
+		w.WriteHeader(http.StatusOK)
+		return
+	}
+	if r.Method != http.MethodPost {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	
+	var req AnagramSearchRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, "Invalid JSON", http.StatusBadRequest)
+		return
+	}
+
+	if req.Letters == "" {
+		http.Error(w, "Letters are required", http.StatusBadRequest)
+		return
+	}
+
+	// Convert letters to uppercase and remove spaces
+	letters := strings.ToUpper(strings.ReplaceAll(req.Letters, " ", ""))
+	inputLength := len(letters)
+	
+	// Create an empty board
+	bd := board.MakeBoard(board.CrosswordGameBoard)
+	
+	// Try to create a rack with the letters
+	rack := tilemapping.RackFromString(letters, alph)
+	if rack == nil {
+		http.Error(w, "Invalid letters provided", http.StatusBadRequest)
+		return
+	}
+	
+	// Generate cross-sets for the empty board
+	cross_set.GenAllCrossSets(bd, gd, ld)
+	bd.UpdateAllAnchors()
+	
+	// Generate all possible moves
+	generator := movegen.NewGordonGenerator(gd, bd, ld)
+	moves := generator.GenAll(rack, false)
+	
+	// Extract unique words from the moves that are the exact same length
+	anagrams := make(map[string]bool)
+	for _, m := range moves {
+		moveStr := m.String()
+		// Parse move string to extract word (same logic as generateMovesHandler)
+		if strings.Contains(moveStr, "play word:") {
+			parts := strings.Split(moveStr, "play word:")
+			if len(parts) > 1 {
+				wordPart := strings.TrimSpace(parts[1])
+				wordFields := strings.Fields(wordPart)
+				for _, field := range wordFields {
+					if len(field) >= 2 && !strings.ContainsAny(field, "0123456789") && 
+					   !strings.HasPrefix(field, "score:") && 
+					   !strings.HasPrefix(field, "tp:") && 
+					   !strings.HasPrefix(field, "leave:") {
+						if !strings.HasPrefix(field, ".....") {
+							// Only include words of the exact same length
+							if len(field) == inputLength {
+								anagrams[field] = true
+							}
+							break
+						}
+						break
+					}
+				}
+			}
+		}
+	}
+	
+	// Convert map keys to slice and sort
+	anagramList := make([]string, 0, len(anagrams))
+	for word := range anagrams {
+		anagramList = append(anagramList, word)
+	}
+	sort.Strings(anagramList)
+	
+	response := AnagramSearchResponse{
+		Letters:  letters,
+		Anagrams: anagramList,
+		Count:    len(anagramList),
+		Lexicon:  "NWL23",
 	}
 	
 	w.Header().Set("Content-Type", "application/json")
