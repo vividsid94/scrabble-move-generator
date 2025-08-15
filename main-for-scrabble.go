@@ -49,6 +49,16 @@ type GenerateMovesResponse struct {
 	Total int    `json:"total"`
 }
 
+type ValidateWordRequest struct {
+	Word string `json:"word"`
+}
+
+type ValidateWordResponse struct {
+	Word      string `json:"word"`
+	IsValid   bool   `json:"isValid"`
+	Lexicon   string `json:"lexicon"`
+}
+
 // Global state (safe for demo, not for production concurrency)
 var (
 	gd   *kwg.KWG
@@ -63,6 +73,7 @@ func main() {
 
 	http.HandleFunc("/health", healthHandler)
 	http.HandleFunc("/generate-moves", generateMovesHandler)
+	http.HandleFunc("/validate-word", validateWordHandler)
 
 	port := os.Getenv("PORT")
 	if port == "" {
@@ -210,4 +221,70 @@ func generateMovesHandler(w http.ResponseWriter, r *http.Request) {
 	}
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(resp)
+}
+
+func validateWordHandler(w http.ResponseWriter, r *http.Request) {
+	setCORSHeaders(w, r)
+	if r.Method == http.MethodOptions {
+		w.WriteHeader(http.StatusOK)
+		return
+	}
+	if r.Method != http.MethodPost {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	
+	var req ValidateWordRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, "Invalid JSON", http.StatusBadRequest)
+		return
+	}
+
+	if req.Word == "" {
+		http.Error(w, "Word is required", http.StatusBadRequest)
+		return
+	}
+
+	// Convert word to uppercase for consistency with lexicon
+	word := strings.ToUpper(strings.TrimSpace(req.Word))
+	
+	// Check if word exists in the loaded lexicon using existing logic
+	// We'll use the move generator to validate - if we can generate moves for this word, it's valid
+	var isValid bool
+	
+	// Create an empty board
+	bd := board.MakeBoard(board.CrosswordGameBoard)
+	
+	// Try to create a rack with the letters from the word
+	// This will fail if the word contains invalid characters
+	rack := tilemapping.RackFromString(word, alph)
+	if rack == nil {
+		isValid = false
+	} else {
+		// Generate cross-sets for the empty board
+		cross_set.GenAllCrossSets(bd, gd, ld)
+		bd.UpdateAllAnchors()
+		
+		// Try to generate moves - if any moves are generated, the word is valid
+		generator := movegen.NewGordonGenerator(gd, bd, ld)
+		moves := generator.GenAll(rack, false)
+		
+		// Check if any of the generated moves contain our word
+		for _, m := range moves {
+			moveStr := m.String()
+			if strings.Contains(moveStr, word) {
+				isValid = true
+				break
+			}
+		}
+	}
+	
+	response := ValidateWordResponse{
+		Word:      word,
+		IsValid:   isValid,
+		Lexicon:   "NWL23", // Using the same lexicon that's already loaded
+	}
+	
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(response)
 }
