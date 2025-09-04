@@ -99,6 +99,23 @@ type BulkMoveGenResponse struct {
 	Lexicon        string  `json:"lexicon"`
 }
 
+type ValidateWordsRequest struct {
+	Words []string `json:"words"`
+}
+
+type WordValidation struct {
+	Word    string `json:"word"`
+	IsValid bool   `json:"isValid"`
+}
+
+type ValidateWordsResponse struct {
+	Words    []WordValidation `json:"words"`
+	Count    int              `json:"count"`
+	Valid    int              `json:"valid"`
+	Invalid  int              `json:"invalid"`
+	Lexicon  string           `json:"lexicon"`
+}
+
 // Global state (safe for demo, not for production concurrency)
 var (
 	gd   *kwg.KWG
@@ -114,6 +131,7 @@ func main() {
 	http.HandleFunc("/health", healthHandler)
 	http.HandleFunc("/generate-moves", generateMovesHandler)
 	http.HandleFunc("/validate-word", validateWordHandler)
+	http.HandleFunc("/validate-words", validateWordsHandler)
 	http.HandleFunc("/find-subanagrams", findSubanagramsHandler)
 	http.HandleFunc("/find-anagrams", findAnagramsHandler)
 	http.HandleFunc("/bulk-move-gen", bulkMoveGenHandler)
@@ -351,6 +369,113 @@ func validateWordHandler(w http.ResponseWriter, r *http.Request) {
 		Word:      word,
 		IsValid:   isValid,
 		Lexicon:   "NWL23", // Using the same lexicon that's already loaded
+	}
+	
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(response)
+}
+
+func validateWordsHandler(w http.ResponseWriter, r *http.Request) {
+	setCORSHeaders(w, r)
+	if r.Method == http.MethodOptions {
+		w.WriteHeader(http.StatusOK)
+		return
+	}
+	if r.Method != http.MethodPost {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	
+	var req ValidateWordsRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, "Invalid JSON", http.StatusBadRequest)
+		return
+	}
+
+	if len(req.Words) == 0 {
+		http.Error(w, "Words array is required", http.StatusBadRequest)
+		return
+	}
+	
+	// Validate each word using the same logic as validateWordHandler
+	validations := make([]WordValidation, 0, len(req.Words))
+	validCount := 0
+	invalidCount := 0
+	
+	for _, word := range req.Words {
+		// Convert word to uppercase for consistency with lexicon
+		word = strings.ToUpper(strings.TrimSpace(word))
+		
+		// Check if word exists in the loaded lexicon using the same logic as validateWordHandler
+		var isValid bool
+		
+		// Create an empty board
+		bd := board.MakeBoard(board.CrosswordGameBoard)
+		
+		// Try to create a rack with the letters from the word
+		rack := tilemapping.RackFromString(word, alph)
+		if rack != nil {
+			// Generate cross-sets for the empty board
+			cross_set.GenAllCrossSets(bd, gd, ld)
+			bd.UpdateAllAnchors()
+			
+			// Try to generate moves - if any moves are generated, the word is valid
+			generator := movegen.NewGordonGenerator(gd, bd, ld)
+			moves := generator.GenAll(rack, false)
+			
+			// Check if any of the generated moves contain our word as a playable word
+			for _, m := range moves {
+				moveStr := m.String()
+				// Only consider moves that are actual word plays, not passes
+				if strings.Contains(moveStr, "play word:") {
+					// Extract the word from the move string using the same logic as other handlers
+					if strings.Contains(moveStr, "play word:") {
+						parts := strings.Split(moveStr, "play word:")
+						if len(parts) > 1 {
+							wordPart := strings.TrimSpace(parts[1])
+							wordFields := strings.Fields(wordPart)
+							for _, field := range wordFields {
+								if len(field) >= 2 && !strings.ContainsAny(field, "0123456789") && 
+								   !strings.HasPrefix(field, "score:") && 
+								   !strings.HasPrefix(field, "tp:") && 
+								   !strings.HasPrefix(field, "leave:") {
+									if !strings.HasPrefix(field, ".....") {
+										if field == word {
+											isValid = true
+											break
+										}
+										break
+									}
+									break
+								}
+							}
+						}
+					}
+					if isValid {
+						break
+					}
+				}
+			}
+		}
+		
+		validations = append(validations, WordValidation{
+			Word:    word,
+			IsValid: isValid,
+		})
+		
+		if isValid {
+			validCount++
+		} else {
+			invalidCount++
+		}
+	}
+	
+	response := ValidateWordsResponse{
+		Words:   validations,
+		Count:   len(req.Words),
+		Valid:   validCount,
+		Invalid: invalidCount,
+		Lexicon: "NWL23",
 	}
 	
 	w.Header().Set("Content-Type", "application/json")
