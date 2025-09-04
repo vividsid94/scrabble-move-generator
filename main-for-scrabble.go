@@ -294,12 +294,37 @@ func validateWordHandler(w http.ResponseWriter, r *http.Request) {
 		generator := movegen.NewGordonGenerator(gd, bd, ld)
 		moves := generator.GenAll(rack, false)
 		
-		// Check if any of the generated moves contain our word
+		// Check if any of the generated moves contain our word as a playable word
 		for _, m := range moves {
 			moveStr := m.String()
-			if strings.Contains(moveStr, word) {
-				isValid = true
-				break
+			// Only consider moves that are actual word plays, not passes
+			if strings.Contains(moveStr, "play word:") {
+				// Extract the word from the move string using the same logic as other handlers
+				if strings.Contains(moveStr, "play word:") {
+					parts := strings.Split(moveStr, "play word:")
+					if len(parts) > 1 {
+						wordPart := strings.TrimSpace(parts[1])
+						wordFields := strings.Fields(wordPart)
+						for _, field := range wordFields {
+							if len(field) >= 2 && !strings.ContainsAny(field, "0123456789") && 
+							   !strings.HasPrefix(field, "score:") && 
+							   !strings.HasPrefix(field, "tp:") && 
+							   !strings.HasPrefix(field, "leave:") {
+								if !strings.HasPrefix(field, ".....") {
+									if field == word {
+										isValid = true
+										break
+									}
+									break
+								}
+								break
+							}
+						}
+					}
+				}
+				if isValid {
+					break
+				}
 			}
 		}
 	}
