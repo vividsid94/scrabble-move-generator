@@ -4,10 +4,12 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
+	"math/rand"
 	"net/http"
 	"os"
 	"sort"
 	"strings"
+	"time"
 
 	"github.com/domino14/word-golib/kwg"
 	"github.com/domino14/word-golib/tilemapping"
@@ -82,6 +84,21 @@ type AnagramSearchResponse struct {
 	Lexicon   string   `json:"lexicon"`
 }
 
+type BulkMoveGenRequest struct {
+	Board      [][]string `json:"board"`      // 15x15 board as strings
+	TilePool   string     `json:"tilePool"`   // String representation of available tiles (e.g., "AABCDEFGHIJKLMNOPQRSTUVWXYZ")
+	Iterations int        `json:"iterations,omitempty"` // Number of iterations (default 1000)
+}
+
+type BulkMoveGenResponse struct {
+	Iterations     int     `json:"iterations"`
+	AverageScore   float64 `json:"averageScore"`
+	BingoPercent   float64 `json:"bingoPercent"`
+	TotalBingos    int     `json:"totalBingos"`
+	TotalScore     int     `json:"totalScore"`
+	Lexicon        string  `json:"lexicon"`
+}
+
 // Global state (safe for demo, not for production concurrency)
 var (
 	gd   *kwg.KWG
@@ -99,6 +116,7 @@ func main() {
 	http.HandleFunc("/validate-word", validateWordHandler)
 	http.HandleFunc("/find-subanagrams", findSubanagramsHandler)
 	http.HandleFunc("/find-anagrams", findAnagramsHandler)
+	http.HandleFunc("/bulk-move-gen", bulkMoveGenHandler)
 
 	port := os.Getenv("PORT")
 	if port == "" {
@@ -515,4 +533,156 @@ func findAnagramsHandler(w http.ResponseWriter, r *http.Request) {
 	
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(response)
+}
+
+func bulkMoveGenHandler(w http.ResponseWriter, r *http.Request) {
+	setCORSHeaders(w, r)
+	if r.Method == http.MethodOptions {
+		w.WriteHeader(http.StatusOK)
+		return
+	}
+	if r.Method != http.MethodPost {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	
+	var req BulkMoveGenRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, "Invalid JSON", http.StatusBadRequest)
+		return
+	}
+
+	if req.TilePool == "" {
+		http.Error(w, "TilePool is required", http.StatusBadRequest)
+		return
+	}
+	
+	if len(req.Board) != 15 {
+		http.Error(w, "Board must have 15 rows", http.StatusBadRequest)
+		return
+	}
+	for i := range req.Board {
+		if len(req.Board[i]) != 15 {
+			http.Error(w, "Each board row must have 15 columns", http.StatusBadRequest)
+			return
+		}
+	}
+	
+	if req.Iterations <= 0 {
+		req.Iterations = 1000
+	}
+	
+	// Convert tile pool to uppercase and remove spaces
+	tilePool := strings.ToUpper(strings.ReplaceAll(req.TilePool, " ", ""))
+	
+	// Create and initialize the board
+	bd := board.MakeBoard(board.CrosswordGameBoard)
+	
+	// Set letters on the board
+	tilesPlayed := 0
+	for row := 0; row < 15; row++ {
+		for col := 0; col < 15; col++ {
+			tile := req.Board[row][col]
+			if tile != "" {
+				if ml, err := alph.Val(tile); err == nil {
+					bd.SetLetter(row, col, ml)
+					tilesPlayed++
+				}
+			}
+		}
+	}
+	
+	// Manually set the tiles played count since SetLetter doesn't do this
+	bd.TestSetTilesPlayed(tilesPlayed)
+	
+	// Generate cross-sets for the empty board
+	cross_set.GenAllCrossSets(bd, gd, ld)
+	bd.UpdateAllAnchors()
+	
+	// Initialize random seed
+	rand.Seed(time.Now().UnixNano())
+	
+	// Statistics tracking
+	totalScore := 0
+	totalBingos := 0
+	
+	fmt.Printf("Starting bulk move generation with %d iterations...\n", req.Iterations)
+	
+	// Run iterations
+	for i := 0; i < req.Iterations; i++ {
+		// Generate random 7-tile rack from pool
+		rack := generateRandomRack(tilePool, 7, alph)
+		if rack == nil {
+			continue // Skip if we can't generate a valid rack
+		}
+		
+		// Generate moves for this rack
+		generator := movegen.NewGordonGenerator(gd, bd, ld)
+		moves := generator.GenAll(rack, false)
+		
+		if len(moves) > 0 {
+			// Get the top move (first move)
+			topMove := moves[0]
+			score := topMove.Score()
+			totalScore += score
+			
+			// Check if it's a bingo (7 tiles played)
+			leave := topMove.Leave()
+			if leave != nil {
+				leaveStr := leave.UserVisible(alph)
+				// If leave is empty or very short, it's likely a bingo
+				if len(strings.TrimSpace(leaveStr)) <= 1 {
+					totalBingos++
+				}
+			}
+		}
+		
+		// Progress update every 100 iterations
+		if (i+1)%100 == 0 {
+			fmt.Printf("Completed %d/%d iterations...\n", i+1, req.Iterations)
+		}
+	}
+	
+	// Calculate statistics
+	averageScore := float64(totalScore) / float64(req.Iterations)
+	bingoPercent := float64(totalBingos) / float64(req.Iterations) * 100.0
+	
+	response := BulkMoveGenResponse{
+		Iterations:   req.Iterations,
+		AverageScore: averageScore,
+		BingoPercent: bingoPercent,
+		TotalBingos:  totalBingos,
+		TotalScore:   totalScore,
+		Lexicon:      "NWL23",
+	}
+	
+	fmt.Printf("Bulk move generation complete. Average score: %.2f, Bingo rate: %.2f%%\n", 
+		averageScore, bingoPercent)
+	
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(response)
+}
+
+// generateRandomRack creates a random rack of specified size from the given tile pool
+func generateRandomRack(tilePool string, size int, alph *tilemapping.TileMapping) *tilemapping.Rack {
+	// Convert tile pool to a slice of individual tiles
+	var tiles []string
+	for _, char := range tilePool {
+		tiles = append(tiles, string(char))
+	}
+	
+	if len(tiles) < size {
+		return nil // Not enough tiles in pool
+	}
+	
+	// Shuffle the tiles and take the first 'size' tiles
+	shuffled := make([]string, len(tiles))
+	copy(shuffled, tiles)
+	rand.Shuffle(len(shuffled), func(i, j int) {
+		shuffled[i], shuffled[j] = shuffled[j], shuffled[i]
+	})
+	
+	// Take first 'size' tiles and create rack
+	rackTiles := strings.Join(shuffled[:size], "")
+	return tilemapping.RackFromString(rackTiles, alph)
 }
