@@ -34,10 +34,17 @@ func setCORSHeaders(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Access-Control-Max-Age", "86400") // 24 hours
 }
 
+type PremiumSquare struct {
+	Row    int    `json:"row"`    // 0-14
+	Col    int    `json:"col"`    // 0-14
+	Type   string `json:"type"`   // "DLS", "TLS", "DWS", "TWS", "CENTER"
+}
+
 type GenerateMovesRequest struct {
-	Rack  string     `json:"rack"`
-	Board [][]string `json:"board"` // 15x15 board as strings
-	TopN  int        `json:"topN,omitempty"`
+	Rack          string          `json:"rack"`
+	Board         [][]string      `json:"board"`         // 15x15 board as strings
+	PremiumSquares []PremiumSquare `json:"premiumSquares,omitempty"` // Optional custom premium squares
+	TopN          int             `json:"topN,omitempty"`
 }
 
 type Move struct {
@@ -85,9 +92,10 @@ type AnagramSearchResponse struct {
 }
 
 type BulkMoveGenRequest struct {
-	Board      [][]string `json:"board"`      // 15x15 board as strings
-	TilePool   string     `json:"tilePool"`   // String representation of available tiles (e.g., "AABCDEFGHIJKLMNOPQRSTUVWXYZ")
-	Iterations int        `json:"iterations,omitempty"` // Number of iterations (default 1000)
+	Board         [][]string       `json:"board"`         // 15x15 board as strings
+	TilePool      string           `json:"tilePool"`      // String representation of available tiles (e.g., "AABCDEFGHIJKLMNOPQRSTUVWXYZ")
+	PremiumSquares []PremiumSquare `json:"premiumSquares,omitempty"` // Optional custom premium squares
+	Iterations    int              `json:"iterations,omitempty"` // Number of iterations (default 1000)
 }
 
 type BulkMoveGenResponse struct {
@@ -122,6 +130,67 @@ var (
 	alph *tilemapping.TileMapping
 	ld   *tilemapping.LetterDistribution
 )
+
+// createCustomBoardLayout creates a board layout from premium square definitions
+// If premiumSquares is nil or empty, returns the default CrosswordGameBoard
+// Premium square types: "DLS" (double letter = '), "TLS" (triple letter = -), 
+// "DWS" (double word = "), "TWS" (triple word = =), "CENTER" (center square = -)
+// Format based on Macondo board layout: ' = DLS, - = TLS, " = DWS, = = TWS
+func createCustomBoardLayout(premiumSquares []PremiumSquare) []string {
+	// If no custom premium squares, use default
+	if len(premiumSquares) == 0 {
+		return board.CrosswordGameBoard
+	}
+	
+	// Start with a base layout - use default board as base
+	layout := make([]string, 15)
+	baseLayout := board.CrosswordGameBoard
+	
+	// Copy the base layout
+	for i := 0; i < 15; i++ {
+		layout[i] = baseLayout[i]
+	}
+	
+	// Convert layout strings to byte slices for modification
+	layoutBytes := make([][]byte, 15)
+	for i := 0; i < 15; i++ {
+		layoutBytes[i] = []byte(layout[i])
+	}
+	
+	// Apply custom premium squares (overrides default board squares)
+	for _, ps := range premiumSquares {
+		if ps.Row < 0 || ps.Row >= 15 || ps.Col < 0 || ps.Col >= 15 {
+			continue // Skip invalid coordinates
+		}
+		
+		var char byte
+		switch strings.ToUpper(ps.Type) {
+		case "DLS": // Double Letter Score
+			char = '\'' // single quote
+		case "TLS": // Triple Letter Score
+			char = '-' // hyphen
+		case "DWS": // Double Word Score
+			char = '"' // double quote
+		case "TWS": // Triple Word Score
+			char = '=' // equals sign
+		case "CENTER": // Center square (typically TLS in standard layout)
+			char = '-' // hyphen (center is TLS in standard Scrabble)
+		case "REGULAR", "": // Regular square (no premium)
+			char = ' ' // space
+		default:
+			continue // Skip unknown types
+		}
+		
+		layoutBytes[ps.Row][ps.Col] = char
+	}
+	
+	// Convert back to strings
+	for i := 0; i < 15; i++ {
+		layout[i] = string(layoutBytes[i])
+	}
+	
+	return layout
+}
 
 func main() {
 	if err := initService(); err != nil {
@@ -204,8 +273,9 @@ func generateMovesHandler(w http.ResponseWriter, r *http.Request) {
 		req.TopN = 10
 	}
 	
-	// Create and initialize the board
-	bd := board.MakeBoard(board.CrosswordGameBoard)
+	// Create and initialize the board with custom premium squares if provided
+	boardLayout := createCustomBoardLayout(req.PremiumSquares)
+	bd := board.MakeBoard(boardLayout)
 	
 	// Set letters on the board
 	tilesPlayed := 0
@@ -700,8 +770,9 @@ func bulkMoveGenHandler(w http.ResponseWriter, r *http.Request) {
 	// Convert tile pool to uppercase and remove spaces
 	tilePool := strings.ToUpper(strings.ReplaceAll(req.TilePool, " ", ""))
 	
-	// Create and initialize the board
-	bd := board.MakeBoard(board.CrosswordGameBoard)
+	// Create and initialize the board with custom premium squares if provided
+	boardLayout := createCustomBoardLayout(req.PremiumSquares)
+	bd := board.MakeBoard(boardLayout)
 	
 	// Set letters on the board
 	tilesPlayed := 0

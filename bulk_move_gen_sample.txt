@@ -1,0 +1,32 @@
+BULK MOVE GENERATION ENDPOINT SAMPLE
+=====================================
+
+REQUEST:
+POST /bulk-move-gen
+Content-Type: application/json
+
+{
+  "board": [15x15 empty board - all cells are empty strings],
+  "tilePool": "AABCDEFGHIJKLMNOPQRSTUVWXYZ",
+  "iterations": 10
+}
+
+RESPONSE:
+{
+  "iterations": 10,
+  "averageScore": 29.00,
+  "bingoPercent": 0.00,
+  "totalBingos": 0,
+  "totalScore": 290,
+  "lexicon": "NWL23"
+}
+
+DETAILED RESULTS:
+- Total iterations: 10
+- Average score per move: 29.00 points
+- Bingo percentage: 0.00%
+- Total bingos: 0 out of 10 iterations
+- Total score across all moves: 290 points
+- Lexicon used: NWL23
+
+STATUS: 200 OK
