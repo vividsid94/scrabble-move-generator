@@ -135,7 +135,7 @@ var (
 // If premiumSquares is nil or empty, returns the default CrosswordGameBoard
 // Premium square types: "DLS" (double letter = '), "TLS" (triple letter = -), 
 // "DWS" (double word = "), "TWS" (triple word = =), "CENTER" (center square = -)
-// Format based on Macondo board layout: ' = DLS, - = TLS, " = DWS, = = TWS
+// Format based on Macondo board layout: ' = DLS, - = DWS (SWITCHED), " = TLS (SWITCHED), = = TWS
 func createCustomBoardLayout(premiumSquares []PremiumSquare) []string {
 	// If no custom premium squares, use default
 	if len(premiumSquares) == 0 {
@@ -165,16 +165,16 @@ func createCustomBoardLayout(premiumSquares []PremiumSquare) []string {
 		
 		var char byte
 		switch strings.ToUpper(ps.Type) {
-		case "DLS": // Double Letter Score
-			char = '\'' // single quote
-		case "TLS": // Triple Letter Score
-			char = '-' // hyphen
-		case "DWS": // Double Word Score
-			char = '"' // double quote
-		case "TWS": // Triple Word Score
-			char = '=' // equals sign
-		case "CENTER": // Center square (typically TLS in standard layout)
-			char = '-' // hyphen (center is TLS in standard Scrabble)
+			case "DLS": // Double Letter Score
+				char = '\'' // single quote
+			case "TLS": // Triple Letter Score
+				char = '"' // double quote (SWITCHED - was DWS)
+			case "DWS": // Double Word Score
+				char = '-' // hyphen (SWITCHED - was TLS)
+			case "TWS": // Triple Word Score
+				char = '=' // equals sign
+		case "CENTER": // Center square (DWS for standard Scrabble)
+			char = '-' // hyphen (DWS after switch)
 		case "REGULAR", "": // Regular square (no premium)
 			char = ' ' // space
 		default:
