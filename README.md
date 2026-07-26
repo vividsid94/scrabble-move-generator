@@ -154,11 +154,12 @@ Generate statistics on move quality by testing random racks from a tile pool.
   "premiumSquares": [
     {"row": 7, "col": 7, "type": "REGULAR"}
   ],
-  "iterations": 1000
+  "iterations": 1000,
+  "includeMoveDetails": false
 }
 ```
 
-**Response:**
+**Response (default / `includeMoveDetails` absent or false):**
 ```json
 {
   "iterations": 1000,
@@ -169,6 +170,49 @@ Generate statistics on move quality by testing random racks from a tile pool.
   "lexicon": "NWL23"
 }
 ```
+
+When `includeMoveDetails` is omitted or `false`, behavior matches the original aggregate-only path (single random rack → top move stats). No `iterationDetails` field is returned.
+
+**Response (with `"includeMoveDetails": true`):**
+
+Runs a two-ply simulation per iteration: opponent’s best reply on the given board, then our best reply after that play is placed. Aggregates (`totalScore`, `averageScore`, `totalBingos`, `bingoPercent`) are taken from **our reply**. Also returns `iterationDetails` with one entry per iteration:
+
+```json
+{
+  "iterations": 2,
+  "averageScore": 31.5,
+  "bingoPercent": 0,
+  "totalBingos": 0,
+  "totalScore": 63,
+  "lexicon": "NWL23",
+  "iterationDetails": [
+    {
+      "opponentMove": {
+        "word": "QI",
+        "score": 22,
+        "direction": "right",
+        "startPosition": "8H",
+        "tiles": [
+          {"row": 7, "col": 7, "letter": "Q", "isNew": true, "isBlank": false},
+          {"row": 7, "col": 8, "letter": "I", "isNew": true, "isBlank": false}
+        ]
+      },
+      "ourReply": {
+        "word": "QI",
+        "score": 11,
+        "direction": "down",
+        "startPosition": "H8",
+        "tiles": [
+          {"row": 7, "col": 7, "letter": "Q", "isNew": false, "isBlank": false},
+          {"row": 8, "col": 7, "letter": "I", "isNew": true, "isBlank": false}
+        ]
+      }
+    }
+  ]
+}
+```
+
+If a side has no legal play in an iteration, that side’s move field is `null`. Prefer a small `iterations` value when requesting details (payload grows with each iteration).
 
 **Note:** `premiumSquares` is optional. If omitted, uses standard board layout.
 
