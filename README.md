@@ -175,7 +175,7 @@ When `includeMoveDetails` is omitted or `false`, behavior matches the original a
 
 **Optional `ourLeave` (only used with `includeMoveDetails: true`):**
 
-Pin tiles on our reply rack every iteration. Example: `"ourLeave": "QZ"` → each `ourReply` uses rack `QZ` + 5 random tiles. The fill is drawn from `tilePool` minus that iteration’s opponent rack **and** minus the `ourLeave` tiles themselves (so a leave `Q` cannot also be redrawn from the pool). Opponent racks stay fully random from the full `tilePool`. If omitted, both sides still get fully random racks.
+Pin tiles on our reply rack every iteration. Example: `"ourLeave": "QZ"` → each `ourReply` uses rack `QZ` + 5 random tiles drawn from `tilePool` minus that iteration’s opponent rack. Opponent racks stay fully random. If omitted, both sides still get fully random racks.
 
 **Response (with `"includeMoveDetails": true`):**
 

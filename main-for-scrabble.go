@@ -867,8 +867,6 @@ func bulkMoveGenHandler(w http.ResponseWriter, r *http.Request) {
 			remainingPool := removeRackFromPool(tilePool, opponentRack.String())
 			var ourRack *tilemapping.Rack
 			if ourLeave != "" {
-				// Leave tiles are already on our rack — exclude them from the fill draw
-				// so we can't redraw the same physical tiles (e.g. a second Q).
 				ourRack = generateRackWithFixedLeave(remainingPool, ourLeave, 7, alph)
 			} else {
 				ourRack = generateRandomRack(remainingPool, 7, alph)
@@ -1025,8 +1023,6 @@ func removeRackFromPool(pool, rack string) string {
 
 // generateRackWithFixedLeave builds a rack that always includes fixedLeave, then
 // fills with random tiles from pool up to targetSize (or fewer if the pool is short).
-// fixedLeave tiles are removed from the pool before the fill draw so they cannot
-// be drawn again (e.g. ourLeave "Q" will not also pull Q from the bag).
 func generateRackWithFixedLeave(pool, fixedLeave string, targetSize int, alph *tilemapping.TileMapping) *tilemapping.Rack {
 	if fixedLeave == "" {
 		return generateRandomRack(pool, targetSize, alph)
@@ -1037,11 +1033,9 @@ func generateRackWithFixedLeave(pool, fixedLeave string, targetSize int, alph *t
 		return tilemapping.RackFromString(string(leaveRunes[:targetSize]), alph)
 	}
 
-	fillPool := removeRackFromPool(pool, fixedLeave)
 	need := targetSize - len(leaveRunes)
-	fill := drawRandomTiles(fillPool, need)
-	// fixedLeave is always present on the rack, independent of what was in the pool.
-	return tilemapping.RackFromString(string(leaveRunes)+fill, alph)
+	fill := drawRandomTiles(pool, need)
+	return tilemapping.RackFromString(fixedLeave+fill, alph)
 }
 
 // drawRandomTiles returns up to n random tiles from pool (fewer if pool is shorter).
