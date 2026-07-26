@@ -173,6 +173,10 @@ Generate statistics on move quality by testing random racks from a tile pool.
 
 When `includeMoveDetails` is omitted or `false`, behavior matches the original aggregate-only path (single random rack → top move stats). No `iterationDetails` field is returned.
 
+**Optional `ourLeave` (only used with `includeMoveDetails: true`):**
+
+Pin tiles on our reply rack every iteration. Example: `"ourLeave": "QZ"` → each `ourReply` uses rack `QZ` + 5 random tiles. The fill is drawn from `tilePool` minus that iteration’s opponent rack **and** minus the `ourLeave` tiles themselves (so a leave `Q` cannot also be redrawn from the pool). Opponent racks stay fully random from the full `tilePool`. If omitted, both sides still get fully random racks.
+
 **Response (with `"includeMoveDetails": true`):**
 
 Runs a two-ply simulation per iteration: opponent’s best reply on the given board, then our best reply after that play is placed. Aggregates (`totalScore`, `averageScore`, `totalBingos`, `bingoPercent`) are taken from **our reply**. Also returns `iterationDetails` with one entry per iteration:

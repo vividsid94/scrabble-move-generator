@@ -93,11 +93,12 @@ type AnagramSearchResponse struct {
 }
 
 type BulkMoveGenRequest struct {
-	Board              [][]string       `json:"board"`         // 15x15 board as strings
-	TilePool           string           `json:"tilePool"`      // String representation of available tiles (e.g., "AABCDEFGHIJKLMNOPQRSTUVWXYZ")
-	PremiumSquares     []PremiumSquare `json:"premiumSquares,omitempty"` // Optional custom premium squares
-	Iterations         int              `json:"iterations,omitempty"` // Number of iterations (default 1000)
-	IncludeMoveDetails bool             `json:"includeMoveDetails,omitempty"` // When true, include per-iteration move details
+	Board              [][]string      `json:"board"`                        // 15x15 board as strings
+	TilePool           string          `json:"tilePool"`                     // Available tiles (e.g., "AABCDEFG..."); "?" = blank
+	PremiumSquares     []PremiumSquare `json:"premiumSquares,omitempty"`     // Optional custom premium squares
+	Iterations         int             `json:"iterations,omitempty"`         // Number of iterations (default 1000)
+	IncludeMoveDetails bool            `json:"includeMoveDetails,omitempty"` // When true, include per-iteration move details
+	OurLeave           string          `json:"ourLeave,omitempty"`           // Optional fixed tiles for ourReply rack (rest drawn randomly)
 }
 
 // MoveTile describes one square in a played word (new tiles and play-throughs).
@@ -796,6 +797,8 @@ func bulkMoveGenHandler(w http.ResponseWriter, r *http.Request) {
 
 	// Convert tile pool to uppercase and remove spaces
 	tilePool := strings.ToUpper(strings.ReplaceAll(req.TilePool, " ", ""))
+	ourLeave := strings.ToUpper(strings.ReplaceAll(req.OurLeave, " ", ""))
+	// Preserve blank encoding: ToUpper leaves '?' alone.
 
 	// Create and initialize the board with custom premium squares if provided
 	boardLayout := createCustomBoardLayout(req.PremiumSquares)
@@ -862,7 +865,14 @@ func bulkMoveGenHandler(w http.ResponseWriter, r *http.Request) {
 			cross_set.UpdateCrossSetsForMove(iterBd, opponentMove, gd, ld)
 
 			remainingPool := removeRackFromPool(tilePool, opponentRack.String())
-			ourRack := generateRandomRack(remainingPool, 7, alph)
+			var ourRack *tilemapping.Rack
+			if ourLeave != "" {
+				// Leave tiles are already on our rack — exclude them from the fill draw
+				// so we can't redraw the same physical tiles (e.g. a second Q).
+				ourRack = generateRackWithFixedLeave(remainingPool, ourLeave, 7, alph)
+			} else {
+				ourRack = generateRandomRack(remainingPool, 7, alph)
+			}
 			if ourRack == nil {
 				iterationDetails = append(iterationDetails, BulkIterationDetail{
 					OpponentMove: opponentDetail,
@@ -1013,26 +1023,51 @@ func removeRackFromPool(pool, rack string) string {
 	return remaining.String()
 }
 
-// generateRandomRack creates a random rack of specified size from the given tile pool
-func generateRandomRack(tilePool string, size int, alph *tilemapping.TileMapping) *tilemapping.Rack {
-	// Convert tile pool to a slice of individual tiles
-	var tiles []string
-	for _, char := range tilePool {
-		tiles = append(tiles, string(char))
+// generateRackWithFixedLeave builds a rack that always includes fixedLeave, then
+// fills with random tiles from pool up to targetSize (or fewer if the pool is short).
+// fixedLeave tiles are removed from the pool before the fill draw so they cannot
+// be drawn again (e.g. ourLeave "Q" will not also pull Q from the bag).
+func generateRackWithFixedLeave(pool, fixedLeave string, targetSize int, alph *tilemapping.TileMapping) *tilemapping.Rack {
+	if fixedLeave == "" {
+		return generateRandomRack(pool, targetSize, alph)
 	}
 
-	if len(tiles) < size {
-		return nil // Not enough tiles in pool
+	leaveRunes := []rune(fixedLeave)
+	if len(leaveRunes) >= targetSize {
+		return tilemapping.RackFromString(string(leaveRunes[:targetSize]), alph)
 	}
 
-	// Shuffle the tiles and take the first 'size' tiles
-	shuffled := make([]string, len(tiles))
+	fillPool := removeRackFromPool(pool, fixedLeave)
+	need := targetSize - len(leaveRunes)
+	fill := drawRandomTiles(fillPool, need)
+	// fixedLeave is always present on the rack, independent of what was in the pool.
+	return tilemapping.RackFromString(string(leaveRunes)+fill, alph)
+}
+
+// drawRandomTiles returns up to n random tiles from pool (fewer if pool is shorter).
+func drawRandomTiles(pool string, n int) string {
+	if n <= 0 || pool == "" {
+		return ""
+	}
+
+	tiles := []rune(pool)
+	if len(tiles) <= n {
+		return string(tiles)
+	}
+
+	shuffled := make([]rune, len(tiles))
 	copy(shuffled, tiles)
 	rand.Shuffle(len(shuffled), func(i, j int) {
 		shuffled[i], shuffled[j] = shuffled[j], shuffled[i]
 	})
+	return string(shuffled[:n])
+}
 
-	// Take first 'size' tiles and create rack
-	rackTiles := strings.Join(shuffled[:size], "")
-	return tilemapping.RackFromString(rackTiles, alph)
+// generateRandomRack creates a random rack of specified size from the given tile pool
+func generateRandomRack(tilePool string, size int, alph *tilemapping.TileMapping) *tilemapping.Rack {
+	fill := drawRandomTiles(tilePool, size)
+	if len([]rune(fill)) < size {
+		return nil // Not enough tiles in pool
+	}
+	return tilemapping.RackFromString(fill, alph)
 }
