@@ -1,16 +1,19 @@
 package main
 
-// Full-game Theo-vs-Theo simulator. Additive to main-for-scrabble.go: reuses
-// its package-level gd/alph/ld, its DetailedMove/MoveTile types, and its
+// Full-game simulator for any matchup of "static" bots - ones that pick a
+// fixed rank from a score+leaveValue-ranked candidate list every turn, with
+// no per-move opponent simulation (that's Tess, which stays client-side).
+// Theo is just rank 1; "Nth static" is any other rank 1-15 the app's UI
+// offers. Additive to main-for-scrabble.go: reuses its package-level
+// gd/alph/ld, its DetailedMove/MoveTile types, and its
 // toDetailedMove/drawRandomTiles/removeRackFromPool helpers rather than
 // duplicating them, but does not modify any existing handler.
 //
-// "Theo" is defined the same way the JS app defines it: best move by
-// score + leaveValue, where leaveValue comes from a static, context-free
-// lookup table keyed by the sorted leave string (leaves.json, embedded
-// below). That table - not whatever internal equity Macondo's own GenAll
-// ordering might use - is what decides every move here, so this endpoint's
-// choices match the app's existing Theo bot rather than some other
+// Ranking is by score + leaveValue, where leaveValue comes from a static,
+// context-free lookup table keyed by the sorted leave string (leaves.json,
+// embedded below). That table - not whatever internal equity Macondo's own
+// GenAll ordering might use - is what decides every move here, so rank 1
+// matches the app's existing Theo bot rather than some other
 // Macondo-internal notion of "best."
 //
 // Note: getTopMoves.js (the JS equivalent of this endpoint) discards the Go
@@ -24,7 +27,6 @@ package main
 import (
 	_ "embed"
 	"encoding/json"
-	"math"
 	"math/rand"
 	"net/http"
 	"sort"
@@ -93,21 +95,21 @@ func sortLeaveString(s string) string {
 	return string(runes)
 }
 
-// findBestExchange enumerates every non-empty subset of rack (up to 2^7-1
-// for a full rack) and returns whichever subset, once exchanged away, leaves
-// the highest-value leave behind - mirroring
-// sandboxBotFunctions.js's generateExchangeCombinations +
-// calculateExchangeLeave + best-value selection, just done as a bitmask scan
-// instead of recursive backtracking.
-func findBestExchange(rack string) (string, float64) {
+// allExchangeCandidates enumerates every non-empty subset of rack (up to
+// 2^7-1 for a full rack) as its own ranked candidate, valued by the leave it
+// would leave behind - mirrors sandboxBotFunctions.js's
+// generateExchangeCombinations + calculateExchangeLeave, just done as a
+// bitmask scan instead of recursive backtracking. Unlike the single-best
+// version this replaced, this returns every candidate so "Nth static" has a
+// full combined (word plays + exchanges) list to rank into.
+func allExchangeCandidates(rack string) []scoredCandidate {
 	tiles := []rune(rack)
 	n := len(tiles)
 	if n == 0 {
-		return "", math.Inf(-1)
+		return nil
 	}
 
-	bestValue := math.Inf(-1)
-	bestExchange := ""
+	candidates := make([]scoredCandidate, 0, (1<<uint(n))-1)
 	for mask := 1; mask < (1 << uint(n)); mask++ {
 		var toExchange []rune
 		var remaining []rune
@@ -119,13 +121,14 @@ func findBestExchange(rack string) (string, float64) {
 			}
 		}
 		leave := sortLeaveString(string(remaining))
-		value := getLeaveValue(leave)
-		if value > bestValue {
-			bestValue = value
-			bestExchange = string(toExchange)
-		}
+		candidates = append(candidates, scoredCandidate{
+			isExchange:    true,
+			exchangeTiles: string(toExchange),
+			leave:         leave,
+			total:         getLeaveValue(leave),
+		})
 	}
-	return bestExchange, bestValue
+	return candidates
 }
 
 type SimTurn struct {
@@ -153,29 +156,39 @@ type SimGameResult struct {
 }
 
 type SimulateSeriesRequest struct {
-	Games int `json:"games,omitempty"`
+	Games       int `json:"games,omitempty"`
+	Player1Rank int `json:"player1Rank,omitempty"` // 1 = Theo; N = "Nth static"
+	Player2Rank int `json:"player2Rank,omitempty"`
 }
 
 type SimulateSeriesResponse struct {
 	Games []SimGameResult `json:"games"`
 }
 
-// scoredCandidate pairs a raw generator move with its fully-resolved
-// DetailedMove (needed both to rank it and, if it wins, to report/apply it)
-// and the leave it would result in.
+// scoredCandidate is one ranked option for a turn - either a word play
+// (isExchange false, move/detailed set) or an exchange (isExchange true,
+// exchangeTiles set). Combining both kinds into one ranked list is what
+// makes "Nth static" well-defined: it's the Nth-best option overall,
+// matching how the original JS Intermediate bot picked from a single
+// word-plays+exchanges list sorted by totalValue.
 type scoredCandidate struct {
-	move     *macondomove.Move
-	detailed *DetailedMove
-	leave    string
-	total    float64
+	isExchange    bool
+	move          *macondomove.Move
+	detailed      *DetailedMove
+	exchangeTiles string
+	leave         string
+	total         float64
 }
 
-// simulateOneGame plays one complete Theo-vs-Theo game start to finish and
-// returns its full turn-by-turn history plus final scoring. Every move
-// decision re-ranks the generator's candidates by score+leaveValue itself
-// (rather than trusting whatever order GenAll returns them in), so this
-// matches the app's Theo definition by construction, not by coincidence.
-func simulateOneGame() SimGameResult {
+// simulateOneGame plays one complete game start to finish between two
+// "static" bots (player1Rank/player2Rank - Theo is rank 1) and returns its
+// full turn-by-turn history plus final scoring. Every move decision builds
+// the full candidate list (word plays + exchanges) and ranks it by
+// score+leaveValue itself (rather than trusting whatever order GenAll
+// returns moves in), so rank 1 matches the app's Theo definition by
+// construction, not by coincidence, and rank N just indexes further into
+// the same list.
+func simulateOneGame(player1Rank, player2Rank int) SimGameResult {
 	bd := board.MakeBoard(board.CrosswordGameBoard)
 	cross_set.GenAllCrossSets(bd, gd, ld)
 	bd.UpdateAllAnchors()
@@ -206,7 +219,9 @@ func simulateOneGame() SimGameResult {
 		generator := movegen.NewGordonGenerator(gd, bd, ld)
 		rawMoves := generator.GenAll(rack, false)
 
-		var best *scoredCandidate
+		// Word-play candidates first, exchange candidates after - order
+		// matters for the stable sort below (see comment there).
+		var candidates []scoredCandidate
 		for _, m := range rawMoves {
 			if !strings.Contains(m.String(), "play word:") {
 				continue
@@ -226,20 +241,37 @@ func simulateOneGame() SimGameResult {
 			leave := sortLeaveString(removeRackFromPool(currentRack, strings.Join(used, "")))
 			total := float64(detailed.Score) + getLeaveValue(leave)
 
-			if best == nil || total > best.total {
-				best = &scoredCandidate{move: m, detailed: detailed, leave: leave, total: total}
-			}
+			candidates = append(candidates, scoredCandidate{move: m, detailed: detailed, leave: leave, total: total})
 		}
 
 		canExchange := len(pool) >= 7
-		var exchangeTiles string
-		exchangeValue := math.Inf(-1)
 		if canExchange {
-			exchangeTiles, exchangeValue = findBestExchange(currentRack)
+			candidates = append(candidates, allExchangeCandidates(currentRack)...)
 		}
 
-		haveWordMove := best != nil
-		useExchange := canExchange && (!haveWordMove || exchangeValue > best.total)
+		// Stable sort: candidates were appended word-plays-first, so on an
+		// exact tie in total, a word play keeps its position ahead of a
+		// tied exchange, and two tied word plays keep GenAll's original
+		// relative order - the same tie-breaking a single-pass max-scan
+		// would give rank 1, just generalized to rank N.
+		sort.SliceStable(candidates, func(i, j int) bool { return candidates[i].total > candidates[j].total })
+
+		rank := player1Rank
+		if currentPlayer == 2 {
+			rank = player2Rank
+		}
+		idx := rank - 1
+		if idx < 0 || idx >= len(candidates) {
+			// Requested rank exceeds how many legal options exist this turn
+			// (common late-game) - fall back to the best available, matching
+			// the original client-side Intermediate bot's same fallback.
+			idx = 0
+		}
+
+		var chosen *scoredCandidate
+		if len(candidates) > 0 {
+			chosen = &candidates[idx]
+		}
 
 		currentScoreBefore := score1
 		if currentPlayer == 2 {
@@ -250,35 +282,42 @@ func simulateOneGame() SimGameResult {
 		var newRack string
 
 		switch {
-		case useExchange:
+		case chosen == nil:
+			turn.Type = "pass"
+			turn.Score = 0
+			turn.RunningTotal = currentScoreBefore
+			consecutiveScoreless++
+			newRack = currentRack
+
+		case chosen.isExchange:
 			turn.Type = "exchange"
-			turn.TilesExchanged = exchangeTiles
+			turn.TilesExchanged = chosen.exchangeTiles
 			turn.Score = 0
 			turn.RunningTotal = currentScoreBefore
 			consecutiveScoreless++
 
-			rackAfterRemoval := removeRackFromPool(currentRack, exchangeTiles)
+			rackAfterRemoval := removeRackFromPool(currentRack, chosen.exchangeTiles)
 			needed := 7 - len([]rune(rackAfterRemoval))
 			drawn := drawRandomTiles(pool, needed)
 			pool = removeRackFromPool(pool, drawn)
-			pool = pool + exchangeTiles
+			pool = pool + chosen.exchangeTiles
 			newRack = sortLeaveString(rackAfterRemoval + drawn)
 
-		case haveWordMove:
+		default: // word play
 			turn.Type = "play"
-			turn.Word = best.detailed.Word
-			turn.Score = best.detailed.Score
-			turn.Position = best.detailed.StartPosition
-			turn.Direction = best.detailed.Direction
-			turn.Tiles = best.detailed.Tiles
-			turn.RunningTotal = currentScoreBefore + best.detailed.Score
+			turn.Word = chosen.detailed.Word
+			turn.Score = chosen.detailed.Score
+			turn.Position = chosen.detailed.StartPosition
+			turn.Direction = chosen.detailed.Direction
+			turn.Tiles = chosen.detailed.Tiles
+			turn.RunningTotal = currentScoreBefore + chosen.detailed.Score
 			consecutiveScoreless = 0
 
-			bd.PlayMove(best.move)
-			cross_set.UpdateCrossSetsForMove(bd, best.move, gd, ld)
+			bd.PlayMove(chosen.move)
+			cross_set.UpdateCrossSetsForMove(bd, chosen.move, gd, ld)
 
 			var used []string
-			for _, t := range best.detailed.Tiles {
+			for _, t := range chosen.detailed.Tiles {
 				if t.IsNew {
 					if t.IsBlank {
 						used = append(used, "?")
@@ -298,13 +337,6 @@ func simulateOneGame() SimGameResult {
 			} else {
 				score2 = turn.RunningTotal
 			}
-
-		default:
-			turn.Type = "pass"
-			turn.Score = 0
-			turn.RunningTotal = currentScoreBefore
-			consecutiveScoreless++
-			newRack = currentRack
 		}
 
 		turns = append(turns, turn)
@@ -385,13 +417,22 @@ func simulateSeriesHandler(w http.ResponseWriter, r *http.Request) {
 	}
 	if games > 500 {
 		games = 500 // sane cap so one request can't run unbounded - matches the
-		// app's own Theo-vs-Theo UI cap (500), which is the only caller of
-		// this endpoint today
+		// app's own static-bot UI cap (500); Tess-involving matchups never
+		// reach this endpoint at all, they stay on the client-side loop
+	}
+
+	player1Rank := req.Player1Rank
+	if player1Rank < 1 {
+		player1Rank = 1 // default/fallback: Theo
+	}
+	player2Rank := req.Player2Rank
+	if player2Rank < 1 {
+		player2Rank = 1
 	}
 
 	results := make([]SimGameResult, 0, games)
 	for i := 0; i < games; i++ {
-		results = append(results, simulateOneGame())
+		results = append(results, simulateOneGame(player1Rank, player2Rank))
 	}
 
 	resp := SimulateSeriesResponse{Games: results}

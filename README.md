@@ -222,19 +222,26 @@ If a side has no legal play in an iteration, that side’s move field is `null`.
 
 ### POST `/simulate-series`
 
-Plays out one or more complete Theo-vs-Theo games (best move by score +
-leaveValue every turn, using the embedded `leaves.json` table) entirely
-server-side and returns the full turn-by-turn history for each game in a
-single response - built for bulk-simulating series without one HTTP call
-per move.
+Plays out one or more complete games between two "static" bots - ones that
+pick a fixed rank from a score+leaveValue-ranked candidate list every turn
+(word plays and exchanges ranked together), using the embedded `leaves.json`
+table - entirely server-side, returning the full turn-by-turn history for
+each game in a single response. Built for bulk-simulating series without one
+HTTP call per move. Rank 1 is "Theo" (best move); rank N is "Nth static".
+Bots that need per-move opponent simulation (Tess) aren't supported here and
+stay on the client-side loop.
 
 **Request:**
 ```json
 {
-  "games": 10
+  "games": 10,
+  "player1Rank": 1,
+  "player2Rank": 5
 }
 ```
-`games` defaults to 1 and is capped at 50 per request.
+`games` defaults to 1 and is capped at 500 per request. `player1Rank`/
+`player2Rank` default to 1 (Theo) and fall back to the best available move
+if the requested rank exceeds how many legal options exist on a given turn.
 
 **Response:**
 ```json
