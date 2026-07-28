@@ -383,8 +383,10 @@ func simulateSeriesHandler(w http.ResponseWriter, r *http.Request) {
 	if games <= 0 {
 		games = 1
 	}
-	if games > 50 {
-		games = 50 // sane cap so one request can't run unbounded
+	if games > 500 {
+		games = 500 // sane cap so one request can't run unbounded - matches the
+		// app's own Theo-vs-Theo UI cap (500), which is the only caller of
+		// this endpoint today
 	}
 
 	results := make([]SimGameResult, 0, games)
