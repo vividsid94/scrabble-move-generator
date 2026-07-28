@@ -232,6 +232,7 @@ func main() {
 	http.HandleFunc("/find-subanagrams", findSubanagramsHandler)
 	http.HandleFunc("/find-anagrams", findAnagramsHandler)
 	http.HandleFunc("/bulk-move-gen", bulkMoveGenHandler)
+	http.HandleFunc("/simulate-series", simulateSeriesHandler)
 
 	port := os.Getenv("PORT")
 	if port == "" {

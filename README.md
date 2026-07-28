@@ -220,6 +220,58 @@ If a side has no legal play in an iteration, that side’s move field is `null`.
 
 **Note:** `premiumSquares` is optional. If omitted, uses standard board layout.
 
+### POST `/simulate-series`
+
+Plays out one or more complete Theo-vs-Theo games (best move by score +
+leaveValue every turn, using the embedded `leaves.json` table) entirely
+server-side and returns the full turn-by-turn history for each game in a
+single response - built for bulk-simulating series without one HTTP call
+per move.
+
+**Request:**
+```json
+{
+  "games": 10
+}
+```
+`games` defaults to 1 and is capped at 50 per request.
+
+**Response:**
+```json
+{
+  "games": [
+    {
+      "turns": [
+        {
+          "player": 1,
+          "type": "play",
+          "word": "CAT",
+          "score": 10,
+          "position": "8H",
+          "direction": "right",
+          "tiles": [{"row": 7, "col": 7, "letter": "C", "isNew": true, "isBlank": false}],
+          "rackBefore": "ACHKMTZ",
+          "runningTotal": 10
+        }
+      ],
+      "player1Score": 245,
+      "player2Score": 198,
+      "winner": 1,
+      "endReason": "emptied",
+      "player1FinalRack": "",
+      "player2FinalRack": "IU",
+      "finalPool": ""
+    }
+  ]
+}
+```
+
+`type` is `"play"`, `"exchange"`, or `"pass"`. Exchange turns carry
+`tilesExchanged` instead of `tiles`/`word`/`position`/`direction`; pass turns
+carry neither. `winner` is `1`, `2`, or `0` for a tie. `endReason` is
+`"emptied"` (someone played their last tile with an empty pool) or
+`"sixPasses"` (six consecutive scoreless turns).
+
 ### GET `/health`
 
 Health check endpoint.
