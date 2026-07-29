@@ -46,13 +46,24 @@ type GenerateMovesRequest struct {
 	Board         [][]string      `json:"board"`         // 15x15 board as strings
 	PremiumSquares []PremiumSquare `json:"premiumSquares,omitempty"` // Optional custom premium squares
 	TopN          int             `json:"topN,omitempty"`
+	PoolSize      int             `json:"poolSize,omitempty"` // Tiles remaining in the bag; exchange candidates are only generated when this is >= 7
 }
 
+// Move is a single ranked candidate: a word play, or (when IsExchange is
+// true) an exchange. Direction/StartPosition/Tiles are only populated for
+// exchange entries - word plays keep their existing Position/Word string
+// format, which the client's display pipeline already depends on.
 type Move struct {
-	Position string `json:"position"`
-	Word     string `json:"word"`
-	Score    int    `json:"score"`
-	Leave    string `json:"leave"`
+	Position      string     `json:"position"`
+	Word          string     `json:"word"`
+	Score         int        `json:"score"`
+	Leave         string     `json:"leave"`
+	LeaveValue    float64    `json:"leaveValue"`
+	TotalValue    float64    `json:"totalValue"`
+	IsExchange    bool       `json:"isExchange,omitempty"`
+	Direction     string     `json:"direction,omitempty"`
+	StartPosition string     `json:"startPosition,omitempty"`
+	Tiles         []MoveTile `json:"tiles,omitempty"`
 }
 
 type GenerateMovesResponse struct {
@@ -332,47 +343,98 @@ func generateMovesHandler(w http.ResponseWriter, r *http.Request) {
 	moves := generator.GenAll(rack, false)
 	
 	fmt.Printf("Generated %d moves for rack '%s'\n", len(moves), req.Rack)
-	
-	responseMoves := make([]Move, 0, req.TopN)
-	for i, m := range moves {
-		if i >= req.TopN {
-			break
-		}
-		
-		// Extract word from move string
+
+	// rankedMove is a lightweight local scoring wrapper - unlike simulate.go's
+	// scoredCandidate, this never needs to actually play a move on a board, so
+	// it doesn't carry Move/DetailedMove pointers.
+	type rankedMove struct {
+		position, word, leave, exchangeTiles string
+		score                                int
+		leaveValue, total                    float64
+		isExchange                           bool
+	}
+
+	ranked := make([]rankedMove, 0, len(moves))
+	for _, m := range moves {
 		moveStr := m.String()
-		word := ""
-		
-		// Parse move string to extract word
+		if !strings.Contains(moveStr, "play word:") {
+			continue
+		}
+
+		// Extract word from move string
 		// Format: "<action: play word: POSITION WORD score: SCORE tp: TILES_PLAYED leave: LEAVE>"
-		if strings.Contains(moveStr, "play word:") {
-			parts := strings.Split(moveStr, "play word:")
-			if len(parts) > 1 {
-				wordPart := strings.TrimSpace(parts[1])
-				// Split by spaces and find the word (skip position)
-				wordFields := strings.Fields(wordPart)
-				for _, field := range wordFields {
-					// Skip position-like strings (like "8D") and score info
-					if len(field) >= 2 && !strings.ContainsAny(field, "0123456789") && 
-					   !strings.HasPrefix(field, "score:") && 
-					   !strings.HasPrefix(field, "tp:") && 
-					   !strings.HasPrefix(field, "leave:") {
-						// Found the word, but check if it's not just dots
-						if !strings.HasPrefix(field, ".....") {
-							word = field
-							break
-						}
-						break
+		word := ""
+		parts := strings.Split(moveStr, "play word:")
+		if len(parts) > 1 {
+			wordPart := strings.TrimSpace(parts[1])
+			// Split by spaces and find the word (skip position)
+			wordFields := strings.Fields(wordPart)
+			for _, field := range wordFields {
+				// Skip position-like strings (like "8D") and score info
+				if len(field) >= 2 && !strings.ContainsAny(field, "0123456789") &&
+					!strings.HasPrefix(field, "score:") &&
+					!strings.HasPrefix(field, "tp:") &&
+					!strings.HasPrefix(field, "leave:") {
+					// Found the word, but check if it's not just dots
+					if !strings.HasPrefix(field, ".....") {
+						word = field
 					}
+					break
 				}
 			}
 		}
-		
+
+		// Recompute the leave from the actual tiles used rather than trusting
+		// Move.Leave().UserVisible's blank/casing convention - same rationale
+		// as simulate.go's simulateSeriesHandler.
+		detailed := toDetailedMove(m, bd, alph)
+		var used []string
+		for _, t := range detailed.Tiles {
+			if t.IsNew {
+				if t.IsBlank {
+					used = append(used, "?")
+				} else {
+					used = append(used, t.Letter)
+				}
+			}
+		}
+		leave := sortLeaveString(removeRackFromPool(req.Rack, strings.Join(used, "")))
+		leaveValue := getLeaveValue(leave)
+
+		ranked = append(ranked, rankedMove{
+			position: m.BoardCoords(), word: word, score: m.Score(),
+			leave: leave, leaveValue: leaveValue, total: float64(m.Score()) + leaveValue,
+		})
+	}
+
+	if req.PoolSize >= 7 {
+		for _, ex := range allExchangeCandidates(req.Rack) {
+			ranked = append(ranked, rankedMove{
+				isExchange: true, exchangeTiles: ex.exchangeTiles,
+				leave: ex.leave, leaveValue: ex.total, total: ex.total,
+			})
+		}
+	}
+
+	sort.SliceStable(ranked, func(i, j int) bool { return ranked[i].total > ranked[j].total })
+	if len(ranked) > req.TopN {
+		ranked = ranked[:req.TopN]
+	}
+
+	responseMoves := make([]Move, 0, len(ranked))
+	for _, rm := range ranked {
+		if rm.isExchange {
+			responseMoves = append(responseMoves, Move{
+				Position: "Exchange", Word: "Exchange " + rm.exchangeTiles, Score: 0,
+				Leave: rm.leave, LeaveValue: rm.leaveValue, TotalValue: rm.total,
+				IsExchange: true, Direction: "exchange", StartPosition: "Exchange",
+				Tiles: exchangeTilesToMoveTiles(rm.exchangeTiles),
+			})
+			continue
+		}
 		responseMoves = append(responseMoves, Move{
-			Position: m.BoardCoords(),
-			Word:     word,
-			Score:    m.Score(),
-			Leave:    m.Leave().UserVisible(alph),
+			Position: rm.position, Word: rm.word, Score: rm.score,
+			Leave: rm.leave, LeaveValue: rm.leaveValue, TotalValue: rm.total,
 		})
 	}
 	resp := GenerateMovesResponse{
@@ -759,6 +821,49 @@ func findAnagramsHandler(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(response)
 }
 
+// pickBestByLeaveValue scans rawMoves and returns the single word play with
+// the highest score+leaveValue total, recomputing the leave from
+// toDetailedMove's tiles rather than trusting Move.Leave().UserVisible's
+// blank/casing convention - same rationale as simulate.go's header comment
+// and generateMovesHandler's word-play scoring. Returns a nil move (and zero
+// values otherwise) if rawMoves has no word plays.
+func pickBestByLeaveValue(rawMoves []*macondomove.Move, bd *board.GameBoard, alph *tilemapping.TileMapping, currentRack string) (*macondomove.Move, *DetailedMove, string, float64) {
+	var bestMove *macondomove.Move
+	var bestDetailed *DetailedMove
+	var bestLeave string
+	var bestTotal float64
+	found := false
+
+	for _, m := range rawMoves {
+		if !strings.Contains(m.String(), "play word:") {
+			continue
+		}
+		detailed := toDetailedMove(m, bd, alph)
+
+		var used []string
+		for _, t := range detailed.Tiles {
+			if t.IsNew {
+				if t.IsBlank {
+					used = append(used, "?")
+				} else {
+					used = append(used, t.Letter)
+				}
+			}
+		}
+		leave := sortLeaveString(removeRackFromPool(currentRack, strings.Join(used, "")))
+		total := float64(detailed.Score) + getLeaveValue(leave)
+
+		if !found || total > bestTotal {
+			found = true
+			bestTotal = total
+			bestMove = m
+			bestDetailed = detailed
+			bestLeave = leave
+		}
+	}
+	return bestMove, bestDetailed, bestLeave, bestTotal
+}
+
 func bulkMoveGenHandler(w http.ResponseWriter, r *http.Request) {
 	setCORSHeaders(w, r)
 	if r.Method == http.MethodOptions {
@@ -845,32 +950,32 @@ func bulkMoveGenHandler(w http.ResponseWriter, r *http.Request) {
 			var opponentDetail *DetailedMove
 			var ourDetail *DetailedMove
 
-			opponentRack := generateRandomRack(tilePool, 7, alph)
+			opponentRackStr, opponentRack := generateRandomRack(tilePool, 7, alph)
 			if opponentRack == nil {
 				iterationDetails = append(iterationDetails, BulkIterationDetail{})
 				continue
 			}
 
 			opponentGen := movegen.NewGordonGenerator(gd, baseBd, ld)
-			opponentMoves := opponentGen.GenAll(opponentRack, false)
-			if len(opponentMoves) == 0 {
+			opponentRawMoves := opponentGen.GenAll(opponentRack, false)
+			opponentMove, oppDetail, _, _ := pickBestByLeaveValue(opponentRawMoves, baseBd, alph, opponentRackStr)
+			if opponentMove == nil {
 				iterationDetails = append(iterationDetails, BulkIterationDetail{})
 				continue
 			}
-
-			opponentMove := opponentMoves[0]
-			opponentDetail = toDetailedMove(opponentMove, baseBd, alph)
+			opponentDetail = oppDetail
 
 			iterBd := baseBd.Copy()
 			iterBd.PlayMove(opponentMove)
 			cross_set.UpdateCrossSetsForMove(iterBd, opponentMove, gd, ld)
 
-			remainingPool := removeRackFromPool(tilePool, opponentRack.String())
+			remainingPool := removeRackFromPool(tilePool, opponentRackStr)
+			var ourRackStr string
 			var ourRack *tilemapping.Rack
 			if ourLeave != "" {
-				ourRack = generateRackWithFixedLeave(remainingPool, ourLeave, 7, alph)
+				ourRackStr, ourRack = generateRackWithFixedLeave(remainingPool, ourLeave, 7, alph)
 			} else {
-				ourRack = generateRandomRack(remainingPool, 7, alph)
+				ourRackStr, ourRack = generateRandomRack(remainingPool, 7, alph)
 			}
 			if ourRack == nil {
 				iterationDetails = append(iterationDetails, BulkIterationDetail{
@@ -880,14 +985,14 @@ func bulkMoveGenHandler(w http.ResponseWriter, r *http.Request) {
 			}
 
 			ourGen := movegen.NewGordonGenerator(gd, iterBd, ld)
-			ourMoves := ourGen.GenAll(ourRack, false)
-			if len(ourMoves) > 0 {
-				ourMove := ourMoves[0]
-				totalScore += ourMove.Score()
+			ourRawMoves := ourGen.GenAll(ourRack, false)
+			ourMove, ourDet, _, _ := pickBestByLeaveValue(ourRawMoves, iterBd, alph, ourRackStr)
+			if ourMove != nil {
+				totalScore += ourDet.Score
 				if ourMove.BingoPlayed() {
 					totalBingos++
 				}
-				ourDetail = toDetailedMove(ourMove, iterBd, alph)
+				ourDetail = ourDet
 			}
 
 			iterationDetails = append(iterationDetails, BulkIterationDetail{
@@ -903,24 +1008,19 @@ func bulkMoveGenHandler(w http.ResponseWriter, r *http.Request) {
 		// Aggregate-only path: preserve the existing single-rack top-move behavior
 		// so callers requesting thousands of iterations are unaffected.
 		for i := 0; i < req.Iterations; i++ {
-			rack := generateRandomRack(tilePool, 7, alph)
+			rackStr, rack := generateRandomRack(tilePool, 7, alph)
 			if rack == nil {
 				continue
 			}
 
 			generator := movegen.NewGordonGenerator(gd, baseBd, ld)
-			moves := generator.GenAll(rack, false)
+			rawMoves := generator.GenAll(rack, false)
+			_, bestDetailed, bestLeave, _ := pickBestByLeaveValue(rawMoves, baseBd, alph, rackStr)
 
-			if len(moves) > 0 {
-				topMove := moves[0]
-				totalScore += topMove.Score()
-
-				leave := topMove.Leave()
-				if leave != nil {
-					leaveStr := leave.UserVisible(alph)
-					if len(strings.TrimSpace(leaveStr)) <= 1 {
-						totalBingos++
-					}
+			if bestDetailed != nil {
+				totalScore += bestDetailed.Score // raw points - the selection criterion changed, the aggregate metric didn't
+				if len(strings.TrimSpace(bestLeave)) <= 1 {
+					totalBingos++
 				}
 			}
 
@@ -1003,6 +1103,18 @@ func toDetailedMove(m *macondomove.Move, bd *board.GameBoard, alph *tilemapping.
 	}
 }
 
+// exchangeTilesToMoveTiles converts an exchange candidate's tile string (e.g.
+// "AB?") into the MoveTile shape clients already know how to render, so an
+// exchange entry needs no special-case reconstruction downstream.
+func exchangeTilesToMoveTiles(s string) []MoveTile {
+	runes := []rune(s)
+	tiles := make([]MoveTile, 0, len(runes))
+	for _, r := range runes {
+		tiles = append(tiles, MoveTile{Letter: string(r), IsNew: false, IsBlank: r == '?'})
+	}
+	return tiles
+}
+
 // removeRackFromPool removes one occurrence of each rack letter from the pool.
 func removeRackFromPool(pool, rack string) string {
 	counts := make(map[rune]int, len(rack))
@@ -1024,19 +1136,23 @@ func removeRackFromPool(pool, rack string) string {
 
 // generateRackWithFixedLeave builds a rack that always includes fixedLeave, then
 // fills with random tiles from pool up to targetSize (or fewer if the pool is short).
-func generateRackWithFixedLeave(pool, fixedLeave string, targetSize int, alph *tilemapping.TileMapping) *tilemapping.Rack {
+// Returns the plain rack string alongside the *tilemapping.Rack since leave-value
+// scoring (removeRackFromPool) needs the string, not the tilemapping type.
+func generateRackWithFixedLeave(pool, fixedLeave string, targetSize int, alph *tilemapping.TileMapping) (string, *tilemapping.Rack) {
 	if fixedLeave == "" {
 		return generateRandomRack(pool, targetSize, alph)
 	}
 
 	leaveRunes := []rune(fixedLeave)
 	if len(leaveRunes) >= targetSize {
-		return tilemapping.RackFromString(string(leaveRunes[:targetSize]), alph)
+		s := string(leaveRunes[:targetSize])
+		return s, tilemapping.RackFromString(s, alph)
 	}
 
 	need := targetSize - len(leaveRunes)
 	fill := drawRandomTiles(pool, need)
-	return tilemapping.RackFromString(fixedLeave+fill, alph)
+	s := fixedLeave + fill
+	return s, tilemapping.RackFromString(s, alph)
 }
 
 // drawRandomTiles returns up to n random tiles from pool (fewer if pool is shorter).
@@ -1058,11 +1174,12 @@ func drawRandomTiles(pool string, n int) string {
 	return string(shuffled[:n])
 }
 
-// generateRandomRack creates a random rack of specified size from the given tile pool
-func generateRandomRack(tilePool string, size int, alph *tilemapping.TileMapping) *tilemapping.Rack {
+// generateRandomRack creates a random rack of specified size from the given tile pool.
+// Returns the plain rack string alongside the *tilemapping.Rack (see generateRackWithFixedLeave).
+func generateRandomRack(tilePool string, size int, alph *tilemapping.TileMapping) (string, *tilemapping.Rack) {
 	fill := drawRandomTiles(tilePool, size)
 	if len([]rune(fill)) < size {
-		return nil // Not enough tiles in pool
+		return "", nil // Not enough tiles in pool
 	}
-	return tilemapping.RackFromString(fill, alph)
+	return fill, tilemapping.RackFromString(fill, alph)
 }

@@ -7,7 +7,10 @@ package main
 // offers. Additive to main-for-scrabble.go: reuses its package-level
 // gd/alph/ld, its DetailedMove/MoveTile types, and its
 // toDetailedMove/drawRandomTiles/removeRackFromPool helpers rather than
-// duplicating them, but does not modify any existing handler.
+// duplicating them. generateMovesHandler and bulkMoveGenHandler now use this
+// same score+leaveValue infrastructure too (getLeaveValue/sortLeaveString/
+// allExchangeCandidates below), so this file is no longer the only place
+// leave-aware ranking happens - it remains the only one that plays full games.
 //
 // Ranking is by score + leaveValue, where leaveValue comes from a static,
 // context-free lookup table keyed by the sorted leave string (leaves.json,
