@@ -446,6 +446,19 @@ type SimTurn struct {
 	BaselineWord           string `json:"baselineWord,omitempty"`
 	BaselineScore          int    `json:"baselineScore,omitempty"`
 	BaselineTilesExchanged string `json:"baselineTilesExchanged,omitempty"`
+
+	// Same idea as RuleImpacted/Baseline* above, but for BingoAversion: only
+	// set when this player's bot has it configured AND it actually removed
+	// what would otherwise have been played this turn - i.e. re-running the
+	// same selection over the candidate list from BEFORE bingo filtering
+	// would have picked something else (almost always a bingo that got
+	// excluded). Like RuleImpacted, only computed for rank-based bots - see
+	// the comment at its computation site for why Tess is out of scope.
+	BingoAversionImpacted         bool   `json:"bingoAversionImpacted,omitempty"`
+	WithoutAversionType           string `json:"withoutAversionType,omitempty"` // "play" | "exchange"
+	WithoutAversionWord           string `json:"withoutAversionWord,omitempty"`
+	WithoutAversionScore          int    `json:"withoutAversionScore,omitempty"`
+	WithoutAversionTilesExchanged string `json:"withoutAversionTilesExchanged,omitempty"`
 }
 
 type SimGameResult struct {
@@ -602,6 +615,16 @@ func simulateOneGame(player1Bot, player2Bot BotConfig) SimGameResult {
 			}
 		}
 
+		// Snapshot the pool before bingo-filtering, purely so the
+		// BingoAversionImpacted comparison below (rank-based bots only) can
+		// later ask "what would this bot have picked with no aversion at
+		// all" - cheap to copy, skipped entirely when it'd never be used.
+		var unfilteredForBingoCompare []scoredCandidate
+		if currentBot.BingoAversion != nil && !currentBot.IsTess {
+			unfilteredForBingoCompare = make([]scoredCandidate, len(candidates))
+			copy(unfilteredForBingoCompare, candidates)
+		}
+
 		// Bingo aversion filters the pool before anything else sees it, so
 		// both the rank-based total sort below and Tess's own re-sort by
 		// baselineTotal are already working from the same reduced list -
@@ -692,12 +715,34 @@ func simulateOneGame(player1Bot, player2Bot BotConfig) SimGameResult {
 			ruleImpacted = !sameCandidate(chosen, baselineChosen)
 		}
 
+		// Bingo-aversion-impact check: what would this bot have picked from
+		// the candidate list from BEFORE bingo filtering - same rank, same
+		// board/rack, no RNG - i.e. a clean A/B on the aversion alone.
+		// unfilteredForBingoCompare is only non-nil when it's worth doing
+		// (BingoAversion set, rank-based bot) - see where it's populated.
+		var bingoAversionImpacted bool
+		var withoutAversionChosen *scoredCandidate
+		if unfilteredForBingoCompare != nil && len(unfilteredForBingoCompare) > 0 {
+			sort.SliceStable(unfilteredForBingoCompare, func(i, j int) bool {
+				return unfilteredForBingoCompare[i].total > unfilteredForBingoCompare[j].total
+			})
+			wIdx := rank - 1
+			if wIdx < 0 || wIdx >= len(unfilteredForBingoCompare) {
+				wIdx = 0
+			}
+			withoutAversionChosen = &unfilteredForBingoCompare[wIdx]
+			bingoAversionImpacted = !sameCandidate(chosen, withoutAversionChosen)
+		}
+
 		currentScoreBefore := score1
 		if currentPlayer == 2 {
 			currentScoreBefore = score2
 		}
 
-		turn := SimTurn{Player: currentPlayer, RackBefore: currentRack, RuleImpacted: ruleImpacted}
+		turn := SimTurn{
+			Player: currentPlayer, RackBefore: currentRack,
+			RuleImpacted: ruleImpacted, BingoAversionImpacted: bingoAversionImpacted,
+		}
 		if ruleImpacted {
 			if baselineChosen.isExchange {
 				turn.BaselineType = "exchange"
@@ -706,6 +751,16 @@ func simulateOneGame(player1Bot, player2Bot BotConfig) SimGameResult {
 				turn.BaselineType = "play"
 				turn.BaselineWord = baselineChosen.detailed.Word
 				turn.BaselineScore = baselineChosen.detailed.Score
+			}
+		}
+		if bingoAversionImpacted {
+			if withoutAversionChosen.isExchange {
+				turn.WithoutAversionType = "exchange"
+				turn.WithoutAversionTilesExchanged = withoutAversionChosen.exchangeTiles
+			} else {
+				turn.WithoutAversionType = "play"
+				turn.WithoutAversionWord = withoutAversionChosen.detailed.Word
+				turn.WithoutAversionScore = withoutAversionChosen.detailed.Score
 			}
 		}
 		var newRack string
