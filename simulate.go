@@ -248,6 +248,42 @@ type BotConfig struct {
 	// (candidate.baselineTotal), matching her original client-side
 	// behavior exactly regardless of what LeaveRules a caller sends.
 	IsTess bool `json:"isTess,omitempty"`
+	// BingoAversion, if set, makes this bot (comedically) reluctant to
+	// play bingos - see BingoAversionRule. Applies uniformly to whichever
+	// selection mechanism is in play (rank-based or Tess), since it
+	// filters the shared candidate pool before either one sees it.
+	BingoAversion *BingoAversionRule `json:"bingoAversion,omitempty"`
+}
+
+// BingoAversionRule excludes bingo candidates (word plays using all 7 rack
+// tiles) from a bot's candidate pool before ranking, via two independent,
+// composable mechanisms:
+//
+//   - Probability (0-1): a per-turn coin flip - this fraction of the time,
+//     ALL bingo candidates get excluded together. Checked once per turn
+//     (not once per bingo candidate), so a partial value reads as "how
+//     often does she chicken out," not "which specific bingo does she
+//     skip." 0 or omitted means this mechanism never triggers - callers
+//     must send 1 explicitly for "always never bingo," there's no
+//     "presence implies always" default anymore now that this field can
+//     be used independently of MaxProbabilityRank.
+//   - MaxProbabilityRank: deterministically excludes any INDIVIDUAL bingo
+//     candidate whose word - if exactly 7 or 8 letters - ranks worse
+//     (numerically higher, less probable) than this cutoff in its own
+//     length's NWL23 probability-order list (see bingoprobability.go;
+//     rank 1 = most probable). A 9+ letter bingo (formed by hooking onto
+//     board tiles) or a word simply absent from these lists is never
+//     excluded by this - only Probability can filter those. 0 or omitted
+//     disables this mechanism.
+//
+// Both apply every turn a bingo is on offer, in order: MaxProbabilityRank
+// first (per-candidate), then Probability's coin flip on whatever bingo
+// candidates remain (per-turn, all-or-nothing) - e.g. "she doesn't know
+// sufficiently obscure words at all, and even for ones she knows,
+// sometimes chickens out anyway."
+type BingoAversionRule struct {
+	Probability        float64 `json:"probability,omitempty"`
+	MaxProbabilityRank int     `json:"maxProbabilityRank,omitempty"`
 }
 
 // tessCandidateCount/tessSimIterations mirror sandboxBotFunctions.js's Tess
@@ -455,6 +491,10 @@ type scoredCandidate struct {
 	// a rule-free bot at the same rank would have picked from this exact
 	// same candidate list, without re-simulating anything.
 	baselineTotal float64
+	// isBingo is true for a word play that used all 7 of the tiles in the
+	// rack it was generated from - always false for exchanges. Used by
+	// BingoAversionRule to filter the candidate pool before ranking.
+	isBingo bool
 }
 
 // sameCandidate reports whether two candidates represent the same actual
@@ -543,7 +583,10 @@ func simulateOneGame(player1Bot, player2Bot BotConfig) SimGameResult {
 			total := float64(detailed.Score) + applyLeaveRules(leave, currentBot.LeaveRules)
 			baselineTotal := float64(detailed.Score) + baseLeaveValue
 
-			candidates = append(candidates, scoredCandidate{move: m, detailed: detailed, leave: leave, total: total, baselineTotal: baselineTotal})
+			candidates = append(candidates, scoredCandidate{
+				move: m, detailed: detailed, leave: leave, total: total, baselineTotal: baselineTotal,
+				isBingo: len(used) == 7,
+			})
 		}
 
 		canExchange := len(pool) >= 7
@@ -556,6 +599,43 @@ func simulateOneGame(player1Bot, player2Bot BotConfig) SimGameResult {
 				ex.baselineTotal = ex.total
 				ex.total = applyLeaveRules(ex.leave, currentBot.LeaveRules)
 				candidates = append(candidates, ex)
+			}
+		}
+
+		// Bingo aversion filters the pool before anything else sees it, so
+		// both the rank-based total sort below and Tess's own re-sort by
+		// baselineTotal are already working from the same reduced list -
+		// no special-casing needed downstream for either selection mode.
+		if ba := currentBot.BingoAversion; ba != nil {
+			// Per-candidate: deterministically drop any individual bingo
+			// whose word isn't well-known enough. Words with no rank at
+			// all (9+ letters via a hook, or absent from the NWL23 lists)
+			// are never excluded here - they're simply not restricted by
+			// this mechanism.
+			if ba.MaxProbabilityRank > 0 {
+				withinKnownRank := make([]scoredCandidate, 0, len(candidates))
+				for _, c := range candidates {
+					if c.isBingo {
+						if rank, ok := bingoProbabilityRank[c.detailed.Word]; ok && rank > ba.MaxProbabilityRank {
+							continue // too obscure - drop this one candidate
+						}
+					}
+					withinKnownRank = append(withinKnownRank, c)
+				}
+				candidates = withinKnownRank
+			}
+
+			// Per-turn: a coin flip that, when it lands, excludes every
+			// remaining bingo candidate together - layered on top of
+			// whatever the rank filter above already left her.
+			if ba.Probability > 0 && rand.Float64() < ba.Probability {
+				withoutBingos := make([]scoredCandidate, 0, len(candidates))
+				for _, c := range candidates {
+					if !c.isBingo {
+						withoutBingos = append(withoutBingos, c)
+					}
+				}
+				candidates = withoutBingos
 			}
 		}
 
