@@ -122,13 +122,17 @@ type MoveTile struct {
 }
 
 // DetailedMove is the renderable move shape used by clients that need
-// word/position/tiles (not just score aggregates).
+// word/position/tiles (not just score aggregates). IsExchange marks an
+// entry built from an exchange candidate rather than a word play - Tiles
+// then holds the exchanged letters (via exchangeTilesToMoveTiles), all
+// IsNew:false since nothing gets placed on the board.
 type DetailedMove struct {
 	Word          string     `json:"word"`
 	Score         int        `json:"score"`
-	Direction     string     `json:"direction"` // "right" or "down"
+	Direction     string     `json:"direction"` // "right", "down", or "exchange"
 	StartPosition string     `json:"startPosition"`
 	Tiles         []MoveTile `json:"tiles"`
+	IsExchange    bool       `json:"isExchange,omitempty"`
 }
 
 type BulkIterationDetail struct {
@@ -821,18 +825,21 @@ func findAnagramsHandler(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(response)
 }
 
-// pickBestByLeaveValue scans rawMoves and returns the single word play with
-// the highest score+leaveValue total, recomputing the leave from
-// toDetailedMove's tiles rather than trusting Move.Leave().UserVisible's
-// blank/casing convention - same rationale as simulate.go's header comment
-// and generateMovesHandler's word-play scoring. Returns a nil move (and zero
-// values otherwise) if rawMoves has no word plays.
-func pickBestByLeaveValue(rawMoves []*macondomove.Move, bd *board.GameBoard, alph *tilemapping.TileMapping, currentRack string) (*macondomove.Move, *DetailedMove, string, float64) {
-	var bestMove *macondomove.Move
-	var bestDetailed *DetailedMove
-	var bestLeave string
-	var bestTotal float64
-	found := false
+// pickBestCandidate scans rawMoves for word plays and, when poolForExchange
+// has >= 7 tiles, also considers exchanging (via allExchangeCandidates),
+// returning whichever single option scores highest by score+leaveValue -
+// same candidate-list-then-sort approach as simulateOneGame's per-turn
+// logic (and reuses its scoredCandidate type directly), just narrowed to
+// only the winner since bulk-move-gen only ever needs rank 1. Leave values
+// are recomputed from toDetailedMove's tiles rather than trusting
+// Move.Leave().UserVisible's blank/casing convention - same rationale as
+// simulate.go's header comment and generateMovesHandler's word-play
+// scoring. poolForExchange must already exclude currentRack (the bag
+// remaining, not counting the rack being chosen for) - same semantics as
+// simulateOneGame's own pool variable at its canExchange check. Returns nil
+// if rawMoves has no word plays and no exchange is available.
+func pickBestCandidate(rawMoves []*macondomove.Move, bd *board.GameBoard, alph *tilemapping.TileMapping, currentRack string, poolForExchange string) *scoredCandidate {
+	var best *scoredCandidate
 
 	for _, m := range rawMoves {
 		if !strings.Contains(m.String(), "play word:") {
@@ -853,15 +860,37 @@ func pickBestByLeaveValue(rawMoves []*macondomove.Move, bd *board.GameBoard, alp
 		leave := sortLeaveString(removeRackFromPool(currentRack, strings.Join(used, "")))
 		total := float64(detailed.Score) + getLeaveValue(leave)
 
-		if !found || total > bestTotal {
-			found = true
-			bestTotal = total
-			bestMove = m
-			bestDetailed = detailed
-			bestLeave = leave
+		if best == nil || total > best.total {
+			best = &scoredCandidate{move: m, detailed: detailed, leave: leave, total: total}
 		}
 	}
-	return bestMove, bestDetailed, bestLeave, bestTotal
+
+	if len(poolForExchange) >= 7 {
+		for _, ex := range allExchangeCandidates(currentRack) {
+			exCopy := ex
+			if best == nil || exCopy.total > best.total {
+				best = &exCopy
+			}
+		}
+	}
+
+	return best
+}
+
+// detailedMoveForExchange builds the client-facing DetailedMove shape for a
+// chosen exchange candidate - mirrors generateMovesHandler's exchange Move
+// construction (word/direction/startPosition conventions, tiles via
+// exchangeTilesToMoveTiles) so exchange entries look the same whether they
+// came from /generate-moves or /bulk-move-gen.
+func detailedMoveForExchange(exchangeTiles string) *DetailedMove {
+	return &DetailedMove{
+		Word:          "Exchange " + exchangeTiles,
+		Score:         0,
+		Direction:     "exchange",
+		StartPosition: "Exchange",
+		Tiles:         exchangeTilesToMoveTiles(exchangeTiles),
+		IsExchange:    true,
+	}
 }
 
 func bulkMoveGenHandler(w http.ResponseWriter, r *http.Request) {
@@ -956,20 +985,29 @@ func bulkMoveGenHandler(w http.ResponseWriter, r *http.Request) {
 				continue
 			}
 
+			// Bag remaining excluding the opponent's own rack - same
+			// semantics simulateOneGame uses for its canExchange check, and
+			// what's actually left over for our own rack draw either way.
+			remainingPool := removeRackFromPool(tilePool, opponentRackStr)
+
 			opponentGen := movegen.NewGordonGenerator(gd, baseBd, ld)
 			opponentRawMoves := opponentGen.GenAll(opponentRack, false)
-			opponentMove, oppDetail, _, _ := pickBestByLeaveValue(opponentRawMoves, baseBd, alph, opponentRackStr)
-			if opponentMove == nil {
+			opponentChosen := pickBestCandidate(opponentRawMoves, baseBd, alph, opponentRackStr, remainingPool)
+			if opponentChosen == nil {
 				iterationDetails = append(iterationDetails, BulkIterationDetail{})
 				continue
 			}
-			opponentDetail = oppDetail
 
 			iterBd := baseBd.Copy()
-			iterBd.PlayMove(opponentMove)
-			cross_set.UpdateCrossSetsForMove(iterBd, opponentMove, gd, ld)
+			if opponentChosen.isExchange {
+				opponentDetail = detailedMoveForExchange(opponentChosen.exchangeTiles)
+				// No board mutation - exchanging doesn't touch the board.
+			} else {
+				opponentDetail = opponentChosen.detailed
+				iterBd.PlayMove(opponentChosen.move)
+				cross_set.UpdateCrossSetsForMove(iterBd, opponentChosen.move, gd, ld)
+			}
 
-			remainingPool := removeRackFromPool(tilePool, opponentRackStr)
 			var ourRackStr string
 			var ourRack *tilemapping.Rack
 			if ourLeave != "" {
@@ -984,15 +1022,23 @@ func bulkMoveGenHandler(w http.ResponseWriter, r *http.Request) {
 				continue
 			}
 
+			// Bag remaining excluding both racks - our own canExchange check.
+			poolAfterBoth := removeRackFromPool(remainingPool, ourRackStr)
+
 			ourGen := movegen.NewGordonGenerator(gd, iterBd, ld)
 			ourRawMoves := ourGen.GenAll(ourRack, false)
-			ourMove, ourDet, _, _ := pickBestByLeaveValue(ourRawMoves, iterBd, alph, ourRackStr)
-			if ourMove != nil {
-				totalScore += ourDet.Score
-				if ourMove.BingoPlayed() {
-					totalBingos++
+			ourChosen := pickBestCandidate(ourRawMoves, iterBd, alph, ourRackStr, poolAfterBoth)
+			if ourChosen != nil {
+				if ourChosen.isExchange {
+					ourDetail = detailedMoveForExchange(ourChosen.exchangeTiles)
+					// Exchanges score 0 and aren't a bingo - nothing to add.
+				} else {
+					totalScore += ourChosen.detailed.Score
+					if ourChosen.move.BingoPlayed() {
+						totalBingos++
+					}
+					ourDetail = ourChosen.detailed
 				}
-				ourDetail = ourDet
 			}
 
 			iterationDetails = append(iterationDetails, BulkIterationDetail{
@@ -1013,16 +1059,21 @@ func bulkMoveGenHandler(w http.ResponseWriter, r *http.Request) {
 				continue
 			}
 
+			// Bag remaining excluding this rack - same canExchange semantics
+			// as the two-ply path and simulateOneGame.
+			poolForExchange := removeRackFromPool(tilePool, rackStr)
+
 			generator := movegen.NewGordonGenerator(gd, baseBd, ld)
 			rawMoves := generator.GenAll(rack, false)
-			_, bestDetailed, bestLeave, _ := pickBestByLeaveValue(rawMoves, baseBd, alph, rackStr)
+			chosen := pickBestCandidate(rawMoves, baseBd, alph, rackStr, poolForExchange)
 
-			if bestDetailed != nil {
-				totalScore += bestDetailed.Score // raw points - the selection criterion changed, the aggregate metric didn't
-				if len(strings.TrimSpace(bestLeave)) <= 1 {
+			if chosen != nil && !chosen.isExchange {
+				totalScore += chosen.detailed.Score // raw points - the selection criterion changed, the aggregate metric didn't
+				if len(strings.TrimSpace(chosen.leave)) <= 1 {
 					totalBingos++
 				}
 			}
+			// Exchanges score 0 and aren't a bingo - nothing to add for that case.
 
 			if (i+1)%100 == 0 {
 				fmt.Printf("Completed %d/%d iterations...\n", i+1, req.Iterations)
