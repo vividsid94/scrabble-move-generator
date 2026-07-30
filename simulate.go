@@ -242,6 +242,103 @@ func applyLeaveRules(leave string, rules []LeaveRule) float64 {
 type BotConfig struct {
 	Rank       int         `json:"rank,omitempty"`
 	LeaveRules []LeaveRule `json:"leaveRules,omitempty"`
+	// IsTess selects a completely different selection algorithm from Rank -
+	// see pickTessCandidate. Rank is ignored when this is true; LeaveRules
+	// still apply, since they feed into candidate.total, which both shapes
+	// the top-N pool Tess evaluates and is the base of her adjusted-value
+	// formula.
+	IsTess bool `json:"isTess,omitempty"`
+}
+
+// tessCandidateCount/tessSimIterations mirror sandboxBotFunctions.js's Tess
+// algorithm (top-15 candidates, N simulated opponent replies each) but with
+// far fewer iterations per candidate - the client's 100 was calibrated for
+// a single live HTTP decision; here the same decision gets made on every
+// turn of every game in a series, so 100 would make a multi-game Tess
+// series impractically slow. 20 is a starting guess, not a measured value -
+// worth revisiting once this can actually be timed against a deployment.
+const (
+	tessCandidateCount = 15
+	tessSimIterations  = 20
+)
+
+// pickTessCandidate mirrors sandboxBotFunctions.js's pickBotMove Tess
+// branch: from the top tessCandidateCount candidates (already sorted by
+// this bot's own score+leave total), simulate tessSimIterations random
+// opponent replies for each - drawing a random rack from the shared bag
+// (pool already excludes both players' actual racks, so this is the same
+// "unseen tiles" proxy the client version uses, not the specific known
+// opponent rack) and scoring their best generic score+plain-leave reply via
+// pickBestCandidate (the same logic /bulk-move-gen itself uses for its own
+// opponent-simulation) - then picks whichever candidate maximizes
+// total - 2*avgOpponentReply. Unlike the client's version (15 separate HTTP
+// calls to /bulk-move-gen, 100 iterations each), this runs entirely
+// in-process against the board/pool state simulateOneGame already holds in
+// memory - it never mutates bd or pool, only reads them (board copies for
+// word-play candidates are made and discarded internally).
+func pickTessCandidate(candidates []scoredCandidate, bd *board.GameBoard, alph *tilemapping.TileMapping, pool string) *scoredCandidate {
+	if len(candidates) == 0 {
+		return nil
+	}
+
+	topN := candidates
+	if len(topN) > tessCandidateCount {
+		topN = topN[:tessCandidateCount]
+	}
+
+	// No unseen tiles left to simulate an opponent reply from - fall back
+	// to the plain best-by-total candidate, matching the client's own
+	// "empty pool -> no simulated threat" fallback.
+	if len(pool) == 0 {
+		return &topN[0]
+	}
+
+	var best *scoredCandidate
+	bestAdjusted := 0.0
+
+	for i := range topN {
+		candidate := &topN[i]
+
+		candidateBd := bd
+		if !candidate.isExchange {
+			candidateBd = bd.Copy()
+			candidateBd.PlayMove(candidate.move)
+			cross_set.UpdateCrossSetsForMove(candidateBd, candidate.move, gd, ld)
+		}
+
+		totalOpponentScore := 0
+		validIterations := 0
+		for j := 0; j < tessSimIterations; j++ {
+			opponentRackStr, opponentRack := generateRandomRack(pool, 7, alph)
+			if opponentRack == nil {
+				continue
+			}
+			remainingPool := removeRackFromPool(pool, opponentRackStr)
+			opponentGen := movegen.NewGordonGenerator(gd, candidateBd, ld)
+			opponentRawMoves := opponentGen.GenAll(opponentRack, false)
+			opponentChosen := pickBestCandidate(opponentRawMoves, candidateBd, alph, opponentRackStr, remainingPool)
+
+			score := 0
+			if opponentChosen != nil && !opponentChosen.isExchange {
+				score = opponentChosen.detailed.Score
+			}
+			totalOpponentScore += score
+			validIterations++
+		}
+
+		avgOpponentScore := 0.0
+		if validIterations > 0 {
+			avgOpponentScore = float64(totalOpponentScore) / float64(validIterations)
+		}
+
+		adjusted := candidate.total - 2*avgOpponentScore
+		if best == nil || adjusted > bestAdjusted {
+			best = candidate
+			bestAdjusted = adjusted
+		}
+	}
+
+	return best
 }
 
 // allExchangeCandidates enumerates every non-empty subset of rack (up to
@@ -368,15 +465,17 @@ func sameCandidate(a, b *scoredCandidate) bool {
 		a.detailed.Direction == b.detailed.Direction
 }
 
-// simulateOneGame plays one complete game start to finish between two
-// "static" bots (player1Bot/player2Bot - Theo is rank 1, no rules) and
-// returns its full turn-by-turn history plus final scoring. Every move
-// decision builds the full candidate list (word plays + exchanges) and
-// ranks it by score+leaveValue itself (rather than trusting whatever order
-// GenAll returns moves in), so rank 1 matches the app's Theo definition by
-// construction, and rank N just indexes further into the same list. Each
-// bot's LeaveRules adjust every leave's value (via applyLeaveRules) before
-// ranking, so two bots at the same rank can genuinely play differently.
+// simulateOneGame plays one complete game start to finish between two bots
+// (player1Bot/player2Bot) and returns its full turn-by-turn history plus
+// final scoring. Every move decision builds the full candidate list (word
+// plays + exchanges), scored by score+leaveValue (rather than trusting
+// whatever order GenAll returns moves in). A "static" bot (Theo = rank 1,
+// or a user-chosen Nth rank) just indexes into that sorted list; a Tess bot
+// (IsTess true) instead runs pickTessCandidate's opponent-simulation
+// selection over the same list - see that function's comment. Each bot's
+// LeaveRules adjust every leave's value (via applyLeaveRules) before
+// ranking either way, so two bots of the same kind can still genuinely
+// play differently.
 func simulateOneGame(player1Bot, player2Bot BotConfig) SimGameResult {
 	bd := board.MakeBoard(board.CrosswordGameBoard)
 	cross_set.GenAllCrossSets(bd, gd, ld)
@@ -457,31 +556,41 @@ func simulateOneGame(player1Bot, player2Bot BotConfig) SimGameResult {
 		// would give rank 1, just generalized to rank N.
 		sort.SliceStable(candidates, func(i, j int) bool { return candidates[i].total > candidates[j].total })
 
-		rank := currentBot.Rank
-		if rank < 1 {
-			rank = 1
-		}
-		idx := rank - 1
-		if idx < 0 || idx >= len(candidates) {
-			// Requested rank exceeds how many legal options exist this turn
-			// (common late-game) - fall back to the best available, matching
-			// the original client-side Intermediate bot's same fallback.
-			idx = 0
-		}
-
 		var chosen *scoredCandidate
-		if len(candidates) > 0 {
-			chosen = &candidates[idx]
+		// rank stays 0 for Tess (meaningless for her selection mechanism) -
+		// only used below for the rank-based rule-impact baseline.
+		var rank int
+		if currentBot.IsTess {
+			chosen = pickTessCandidate(candidates, bd, alph, pool)
+		} else {
+			rank = currentBot.Rank
+			if rank < 1 {
+				rank = 1
+			}
+			idx := rank - 1
+			if idx < 0 || idx >= len(candidates) {
+				// Requested rank exceeds how many legal options exist this
+				// turn (common late-game) - fall back to the best available,
+				// matching the original client-side Intermediate bot's same
+				// fallback.
+				idx = 0
+			}
+			if len(candidates) > 0 {
+				chosen = &candidates[idx]
+			}
 		}
 
 		// Rule-impact check: what would a plain (no custom rules) bot at the
 		// same rank have picked from this EXACT same candidate list - same
 		// board, same rack, no RNG involved, so this is a clean A/B on the
-		// rule alone. Only worth computing when this bot actually has rules;
-		// a rule-free bot can never diverge from itself.
+		// rule alone. Only computed for rank-based bots for now - Tess's
+		// selection isn't rank-based (it's a 15-candidate x N-iteration
+		// opponent simulation), so a fair baseline would mean re-running
+		// that whole simulation a second time; left out of scope here to
+		// keep her already-heavier per-turn cost in check.
 		var ruleImpacted bool
 		var baselineChosen *scoredCandidate
-		if len(currentBot.LeaveRules) > 0 && len(candidates) > 0 {
+		if !currentBot.IsTess && len(currentBot.LeaveRules) > 0 && len(candidates) > 0 {
 			baseline := make([]scoredCandidate, len(candidates))
 			copy(baseline, candidates)
 			sort.SliceStable(baseline, func(i, j int) bool { return baseline[i].baselineTotal > baseline[j].baselineTotal })
@@ -646,9 +755,14 @@ func simulateSeriesHandler(w http.ResponseWriter, r *http.Request) {
 		games = 1
 	}
 	if games > 500 {
-		games = 500 // sane cap so one request can't run unbounded - matches the
-		// app's own static-bot UI cap (500); Tess-involving matchups never
-		// reach this endpoint at all, they stay on the client-side loop
+		// Sane cap so one request can't run unbounded - matches the app's
+		// static-bot UI cap. NOTE: this cap was sized for cheap rank-based
+		// bots. A Tess bot (IsTess) is ~tessCandidateCount*tessSimIterations
+		// (300x) more expensive per turn - the frontend is expected to send
+		// a much lower games count whenever either bot is Tess (see
+		// sandboxStore.js's getMaxGamesForBots), but this handler itself
+		// doesn't enforce a lower cap for that case yet.
+		games = 500
 	}
 
 	// Resolve each player into a full BotConfig - an explicit player*Bot
