@@ -281,16 +281,28 @@ func allExchangeCandidates(rack string) []scoredCandidate {
 }
 
 type SimTurn struct {
-	Player         int              `json:"player"` // 1 or 2
-	Type           string           `json:"type"`    // "play" | "exchange" | "pass"
-	Word           string           `json:"word,omitempty"`
-	Score          int              `json:"score"`
-	Position       string           `json:"position,omitempty"`
-	Direction      string           `json:"direction,omitempty"`
-	Tiles          []MoveTile       `json:"tiles,omitempty"`
-	RackBefore     string           `json:"rackBefore"`
-	TilesExchanged string           `json:"tilesExchanged,omitempty"`
-	RunningTotal   int              `json:"runningTotal"`
+	Player         int        `json:"player"` // 1 or 2
+	Type           string     `json:"type"`   // "play" | "exchange" | "pass"
+	Word           string     `json:"word,omitempty"`
+	Score          int        `json:"score"`
+	Position       string     `json:"position,omitempty"`
+	Direction      string     `json:"direction,omitempty"`
+	Tiles          []MoveTile `json:"tiles,omitempty"`
+	RackBefore     string     `json:"rackBefore"`
+	TilesExchanged string     `json:"tilesExchanged,omitempty"`
+	RunningTotal   int        `json:"runningTotal"`
+
+	// Only set when this player's bot has LeaveRules AND they actually
+	// changed the outcome this turn - i.e. re-ranking this exact same
+	// candidate list (same board, same rack, no RNG involved) by the plain
+	// no-rule leave value would have picked something else. Lets the
+	// frontend show which specific plays a custom rule actually affected,
+	// vs. turns where it happened to agree with the plain baseline anyway.
+	RuleImpacted           bool   `json:"ruleImpacted,omitempty"`
+	BaselineType           string `json:"baselineType,omitempty"` // "play" | "exchange"
+	BaselineWord           string `json:"baselineWord,omitempty"`
+	BaselineScore          int    `json:"baselineScore,omitempty"`
+	BaselineTilesExchanged string `json:"baselineTilesExchanged,omitempty"`
 }
 
 type SimGameResult struct {
@@ -329,6 +341,31 @@ type scoredCandidate struct {
 	exchangeTiles string
 	leave         string
 	total         float64
+	// baselineTotal is the same candidate's score/leave value with NO
+	// custom LeaveRules applied - i.e. applyLeaveRules(leave, nil), which
+	// is just the plain leaves.json lookup. Always populated (cheap to
+	// compute alongside total) so a second ranking pass can determine what
+	// a rule-free bot at the same rank would have picked from this exact
+	// same candidate list, without re-simulating anything.
+	baselineTotal float64
+}
+
+// sameCandidate reports whether two candidates represent the same actual
+// move - used to tell whether a custom leave rule actually changed this
+// turn's outcome, not just its score.
+func sameCandidate(a, b *scoredCandidate) bool {
+	if a == nil || b == nil {
+		return a == b
+	}
+	if a.isExchange != b.isExchange {
+		return false
+	}
+	if a.isExchange {
+		return a.exchangeTiles == b.exchangeTiles
+	}
+	return a.detailed.Word == b.detailed.Word &&
+		a.detailed.StartPosition == b.detailed.StartPosition &&
+		a.detailed.Direction == b.detailed.Direction
 }
 
 // simulateOneGame plays one complete game start to finish between two
@@ -393,18 +430,21 @@ func simulateOneGame(player1Bot, player2Bot BotConfig) SimGameResult {
 				}
 			}
 			leave := sortLeaveString(removeRackFromPool(currentRack, strings.Join(used, "")))
+			baseLeaveValue := getLeaveValue(leave)
 			total := float64(detailed.Score) + applyLeaveRules(leave, currentBot.LeaveRules)
+			baselineTotal := float64(detailed.Score) + baseLeaveValue
 
-			candidates = append(candidates, scoredCandidate{move: m, detailed: detailed, leave: leave, total: total})
+			candidates = append(candidates, scoredCandidate{move: m, detailed: detailed, leave: leave, total: total, baselineTotal: baselineTotal})
 		}
 
 		canExchange := len(pool) >= 7
 		if canExchange {
 			// allExchangeCandidates scores against the plain leaves.json table
 			// (it's shared with endpoints that have no concept of per-bot
-			// rules) - re-score each candidate's total through this bot's
-			// rules before it enters the ranked list.
+			// rules) - that plain value IS the baseline, so stash it before
+			// overwriting total with this bot's rule-adjusted value.
 			for _, ex := range allExchangeCandidates(currentRack) {
+				ex.baselineTotal = ex.total
 				ex.total = applyLeaveRules(ex.leave, currentBot.LeaveRules)
 				candidates = append(candidates, ex)
 			}
@@ -434,12 +474,41 @@ func simulateOneGame(player1Bot, player2Bot BotConfig) SimGameResult {
 			chosen = &candidates[idx]
 		}
 
+		// Rule-impact check: what would a plain (no custom rules) bot at the
+		// same rank have picked from this EXACT same candidate list - same
+		// board, same rack, no RNG involved, so this is a clean A/B on the
+		// rule alone. Only worth computing when this bot actually has rules;
+		// a rule-free bot can never diverge from itself.
+		var ruleImpacted bool
+		var baselineChosen *scoredCandidate
+		if len(currentBot.LeaveRules) > 0 && len(candidates) > 0 {
+			baseline := make([]scoredCandidate, len(candidates))
+			copy(baseline, candidates)
+			sort.SliceStable(baseline, func(i, j int) bool { return baseline[i].baselineTotal > baseline[j].baselineTotal })
+			bIdx := rank - 1
+			if bIdx < 0 || bIdx >= len(baseline) {
+				bIdx = 0
+			}
+			baselineChosen = &baseline[bIdx]
+			ruleImpacted = !sameCandidate(chosen, baselineChosen)
+		}
+
 		currentScoreBefore := score1
 		if currentPlayer == 2 {
 			currentScoreBefore = score2
 		}
 
-		turn := SimTurn{Player: currentPlayer, RackBefore: currentRack}
+		turn := SimTurn{Player: currentPlayer, RackBefore: currentRack, RuleImpacted: ruleImpacted}
+		if ruleImpacted {
+			if baselineChosen.isExchange {
+				turn.BaselineType = "exchange"
+				turn.BaselineTilesExchanged = baselineChosen.exchangeTiles
+			} else {
+				turn.BaselineType = "play"
+				turn.BaselineWord = baselineChosen.detailed.Word
+				turn.BaselineScore = baselineChosen.detailed.Score
+			}
+		}
 		var newRack string
 
 		switch {
