@@ -243,10 +243,10 @@ type BotConfig struct {
 	Rank       int         `json:"rank,omitempty"`
 	LeaveRules []LeaveRule `json:"leaveRules,omitempty"`
 	// IsTess selects a completely different selection algorithm from Rank -
-	// see pickTessCandidate. Rank is ignored when this is true; LeaveRules
-	// still apply, since they feed into candidate.total, which both shapes
-	// the top-N pool Tess evaluates and is the base of her adjusted-value
-	// formula.
+	// see pickTessCandidate. Rank AND LeaveRules are both ignored when this
+	// is true - Tess always evaluates on the plain leaves.json value
+	// (candidate.baselineTotal), matching her original client-side
+	// behavior exactly regardless of what LeaveRules a caller sends.
 	IsTess bool `json:"isTess,omitempty"`
 }
 
@@ -263,25 +263,35 @@ const (
 )
 
 // pickTessCandidate mirrors sandboxBotFunctions.js's pickBotMove Tess
-// branch: from the top tessCandidateCount candidates (already sorted by
-// this bot's own score+leave total), simulate tessSimIterations random
+// branch: from the top tessCandidateCount candidates by plain score+leave
+// value (baselineTotal - Tess ignores LeaveRules entirely, unlike the
+// rank-based bots, so any custom rules a caller attaches to a Tess
+// BotConfig have zero effect on her), simulate tessSimIterations random
 // opponent replies for each - drawing a random rack from the shared bag
 // (pool already excludes both players' actual racks, so this is the same
 // "unseen tiles" proxy the client version uses, not the specific known
 // opponent rack) and scoring their best generic score+plain-leave reply via
 // pickBestCandidate (the same logic /bulk-move-gen itself uses for its own
 // opponent-simulation) - then picks whichever candidate maximizes
-// total - 2*avgOpponentReply. Unlike the client's version (15 separate HTTP
-// calls to /bulk-move-gen, 100 iterations each), this runs entirely
-// in-process against the board/pool state simulateOneGame already holds in
-// memory - it never mutates bd or pool, only reads them (board copies for
-// word-play candidates are made and discarded internally).
+// baselineTotal - 2*avgOpponentReply. Unlike the client's version (15
+// separate HTTP calls to /bulk-move-gen, 100 iterations each), this runs
+// entirely in-process against the board/pool state simulateOneGame already
+// holds in memory - it never mutates bd or pool, only reads them (board
+// copies for word-play candidates are made and discarded internally).
 func pickTessCandidate(candidates []scoredCandidate, bd *board.GameBoard, alph *tilemapping.TileMapping, pool string) *scoredCandidate {
 	if len(candidates) == 0 {
 		return nil
 	}
 
-	topN := candidates
+	// Re-sort by baselineTotal rather than trusting the incoming order -
+	// candidates arrive already sorted by total, which may be rule-adjusted
+	// for a rank-based bot on the other side of the board; Tess's own pool
+	// selection must never be influenced by LeaveRules either.
+	sorted := make([]scoredCandidate, len(candidates))
+	copy(sorted, candidates)
+	sort.SliceStable(sorted, func(i, j int) bool { return sorted[i].baselineTotal > sorted[j].baselineTotal })
+
+	topN := sorted
 	if len(topN) > tessCandidateCount {
 		topN = topN[:tessCandidateCount]
 	}
@@ -331,7 +341,7 @@ func pickTessCandidate(candidates []scoredCandidate, bd *board.GameBoard, alph *
 			avgOpponentScore = float64(totalOpponentScore) / float64(validIterations)
 		}
 
-		adjusted := candidate.total - 2*avgOpponentScore
+		adjusted := candidate.baselineTotal - 2*avgOpponentScore
 		if best == nil || adjusted > bestAdjusted {
 			best = candidate
 			bestAdjusted = adjusted
@@ -470,12 +480,12 @@ func sameCandidate(a, b *scoredCandidate) bool {
 // final scoring. Every move decision builds the full candidate list (word
 // plays + exchanges), scored by score+leaveValue (rather than trusting
 // whatever order GenAll returns moves in). A "static" bot (Theo = rank 1,
-// or a user-chosen Nth rank) just indexes into that sorted list; a Tess bot
+// or a user-chosen Nth rank) just indexes into that list sorted by total,
+// which its own LeaveRules adjust (via applyLeaveRules) - so two static
+// bots at the same rank can genuinely play differently. A Tess bot
 // (IsTess true) instead runs pickTessCandidate's opponent-simulation
-// selection over the same list - see that function's comment. Each bot's
-// LeaveRules adjust every leave's value (via applyLeaveRules) before
-// ranking either way, so two bots of the same kind can still genuinely
-// play differently.
+// selection, which ignores LeaveRules entirely and always uses the plain
+// baselineTotal - see that function's comment for why.
 func simulateOneGame(player1Bot, player2Bot BotConfig) SimGameResult {
 	bd := board.MakeBoard(board.CrosswordGameBoard)
 	cross_set.GenAllCrossSets(bd, gd, ld)
