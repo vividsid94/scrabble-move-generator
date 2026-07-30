@@ -98,6 +98,152 @@ func sortLeaveString(s string) string {
 	return string(runes)
 }
 
+// vowelRunes classifies A/E/I/O/U as vowels for vowelCount/consonantCount
+// rules - Y is deliberately excluded (treated as a consonant), matching
+// common Scrabble rack-balance convention rather than linguistic rules.
+var vowelRunes = map[rune]bool{'A': true, 'E': true, 'I': true, 'O': true, 'U': true}
+
+func countRune(leave string, target rune) int {
+	n := 0
+	for _, c := range leave {
+		if c == target {
+			n++
+		}
+	}
+	return n
+}
+
+func countVowels(leave string) int {
+	n := 0
+	for _, c := range leave {
+		if vowelRunes[c] {
+			n++
+		}
+	}
+	return n
+}
+
+func countConsonants(leave string) int {
+	n := 0
+	for _, c := range leave {
+		if c != '?' && !vowelRunes[c] {
+			n++
+		}
+	}
+	return n
+}
+
+// compareCount applies a rule's comparator ("gte" is the default when
+// unset, plus "lte" and "eq") against an actual count and threshold.
+func compareCount(actual int, comparator string, threshold int) bool {
+	switch comparator {
+	case "lte":
+		return actual <= threshold
+	case "eq":
+		return actual == threshold
+	default:
+		return actual >= threshold
+	}
+}
+
+// LeaveRule is one adjustment applied to a leave's base leaves.json value
+// before ranking candidates - this is what lets a bot be more than just a
+// fixed rank off the standard list: two bots at the same rank with
+// different rules genuinely rank candidates differently. Bonus is a flat
+// addition (negative for a penalty); Multiplier scales the running total
+// at the point the rule appears, so a bot can combine several bonus rules
+// and/or stack multiple multipliers for a compounding effect.
+//
+// Type determines which other fields apply:
+//   - "containsLetter": Letter present anywhere in the leave -> Bonus
+//   - "containsAny": any letter in Letters present -> Bonus
+//   - "containsAll": every letter in Letters present -> Bonus
+//   - "containsCount": count of Letter compared (Comparator) to Count -> Bonus
+//   - "vowelCount": count of vowels (AEIOU) compared to Count -> Bonus
+//   - "consonantCount": count of consonants (excludes '?') compared to Count -> Bonus
+//   - "hasBlank": leave contains '?' -> Bonus
+//   - "lengthEquals": leave length == Count -> Bonus
+//   - "multiplier": scales the running total by Multiplier
+type LeaveRule struct {
+	Type       string  `json:"type"`
+	Letter     string  `json:"letter,omitempty"`     // single letter, for containsLetter/containsCount
+	Letters    string  `json:"letters,omitempty"`    // set of letters, for containsAny/containsAll
+	Comparator string  `json:"comparator,omitempty"` // "gte" (default), "lte", "eq"
+	Count      int     `json:"count,omitempty"`
+	Bonus      float64 `json:"bonus,omitempty"`
+	Multiplier float64 `json:"multiplier,omitempty"`
+}
+
+// applyLeaveRules starts from the base leaves.json value for `leave` and
+// applies each rule in order.
+func applyLeaveRules(leave string, rules []LeaveRule) float64 {
+	value := getLeaveValue(leave)
+
+	for _, rule := range rules {
+		switch rule.Type {
+		case "containsLetter":
+			if rule.Letter != "" && countRune(leave, []rune(rule.Letter)[0]) > 0 {
+				value += rule.Bonus
+			}
+		case "containsAny":
+			for _, l := range rule.Letters {
+				if countRune(leave, l) > 0 {
+					value += rule.Bonus
+					break
+				}
+			}
+		case "containsAll":
+			if rule.Letters == "" {
+				break
+			}
+			all := true
+			for _, l := range rule.Letters {
+				if countRune(leave, l) == 0 {
+					all = false
+					break
+				}
+			}
+			if all {
+				value += rule.Bonus
+			}
+		case "containsCount":
+			if rule.Letter != "" && compareCount(countRune(leave, []rune(rule.Letter)[0]), rule.Comparator, rule.Count) {
+				value += rule.Bonus
+			}
+		case "vowelCount":
+			if compareCount(countVowels(leave), rule.Comparator, rule.Count) {
+				value += rule.Bonus
+			}
+		case "consonantCount":
+			if compareCount(countConsonants(leave), rule.Comparator, rule.Count) {
+				value += rule.Bonus
+			}
+		case "hasBlank":
+			if countRune(leave, '?') > 0 {
+				value += rule.Bonus
+			}
+		case "lengthEquals":
+			if len([]rune(leave)) == rule.Count {
+				value += rule.Bonus
+			}
+		case "multiplier":
+			if rule.Multiplier != 0 {
+				value *= rule.Multiplier
+			}
+		}
+	}
+
+	return value
+}
+
+// BotConfig is one player's simulate-series configuration: a rank into the
+// leave-value-ranked candidate list (1 = Theo/best; N = "Nth static"), plus
+// an optional list of rules that adjust each leave's value before ranking.
+type BotConfig struct {
+	Rank       int         `json:"rank,omitempty"`
+	LeaveRules []LeaveRule `json:"leaveRules,omitempty"`
+}
+
 // allExchangeCandidates enumerates every non-empty subset of rack (up to
 // 2^7-1 for a full rack) as its own ranked candidate, valued by the leave it
 // would leave behind - mirrors sandboxBotFunctions.js's
@@ -159,9 +305,11 @@ type SimGameResult struct {
 }
 
 type SimulateSeriesRequest struct {
-	Games       int `json:"games,omitempty"`
-	Player1Rank int `json:"player1Rank,omitempty"` // 1 = Theo; N = "Nth static"
-	Player2Rank int `json:"player2Rank,omitempty"`
+	Games       int        `json:"games,omitempty"`
+	Player1Rank int        `json:"player1Rank,omitempty"` // legacy: rank-only, no rules. Ignored if Player1Bot is set.
+	Player2Rank int        `json:"player2Rank,omitempty"`
+	Player1Bot  *BotConfig `json:"player1Bot,omitempty"` // rank + optional leave rules; takes precedence over Player1Rank
+	Player2Bot  *BotConfig `json:"player2Bot,omitempty"`
 }
 
 type SimulateSeriesResponse struct {
@@ -184,14 +332,15 @@ type scoredCandidate struct {
 }
 
 // simulateOneGame plays one complete game start to finish between two
-// "static" bots (player1Rank/player2Rank - Theo is rank 1) and returns its
-// full turn-by-turn history plus final scoring. Every move decision builds
-// the full candidate list (word plays + exchanges) and ranks it by
-// score+leaveValue itself (rather than trusting whatever order GenAll
-// returns moves in), so rank 1 matches the app's Theo definition by
-// construction, not by coincidence, and rank N just indexes further into
-// the same list.
-func simulateOneGame(player1Rank, player2Rank int) SimGameResult {
+// "static" bots (player1Bot/player2Bot - Theo is rank 1, no rules) and
+// returns its full turn-by-turn history plus final scoring. Every move
+// decision builds the full candidate list (word plays + exchanges) and
+// ranks it by score+leaveValue itself (rather than trusting whatever order
+// GenAll returns moves in), so rank 1 matches the app's Theo definition by
+// construction, and rank N just indexes further into the same list. Each
+// bot's LeaveRules adjust every leave's value (via applyLeaveRules) before
+// ranking, so two bots at the same rank can genuinely play differently.
+func simulateOneGame(player1Bot, player2Bot BotConfig) SimGameResult {
 	bd := board.MakeBoard(board.CrosswordGameBoard)
 	cross_set.GenAllCrossSets(bd, gd, ld)
 	bd.UpdateAllAnchors()
@@ -214,8 +363,10 @@ func simulateOneGame(player1Rank, player2Rank int) SimGameResult {
 
 	for {
 		currentRack := rack1
+		currentBot := player1Bot
 		if currentPlayer == 2 {
 			currentRack = rack2
+			currentBot = player2Bot
 		}
 
 		rack := tilemapping.RackFromString(currentRack, alph)
@@ -242,14 +393,21 @@ func simulateOneGame(player1Rank, player2Rank int) SimGameResult {
 				}
 			}
 			leave := sortLeaveString(removeRackFromPool(currentRack, strings.Join(used, "")))
-			total := float64(detailed.Score) + getLeaveValue(leave)
+			total := float64(detailed.Score) + applyLeaveRules(leave, currentBot.LeaveRules)
 
 			candidates = append(candidates, scoredCandidate{move: m, detailed: detailed, leave: leave, total: total})
 		}
 
 		canExchange := len(pool) >= 7
 		if canExchange {
-			candidates = append(candidates, allExchangeCandidates(currentRack)...)
+			// allExchangeCandidates scores against the plain leaves.json table
+			// (it's shared with endpoints that have no concept of per-bot
+			// rules) - re-score each candidate's total through this bot's
+			// rules before it enters the ranked list.
+			for _, ex := range allExchangeCandidates(currentRack) {
+				ex.total = applyLeaveRules(ex.leave, currentBot.LeaveRules)
+				candidates = append(candidates, ex)
+			}
 		}
 
 		// Stable sort: candidates were appended word-plays-first, so on an
@@ -259,9 +417,9 @@ func simulateOneGame(player1Rank, player2Rank int) SimGameResult {
 		// would give rank 1, just generalized to rank N.
 		sort.SliceStable(candidates, func(i, j int) bool { return candidates[i].total > candidates[j].total })
 
-		rank := player1Rank
-		if currentPlayer == 2 {
-			rank = player2Rank
+		rank := currentBot.Rank
+		if rank < 1 {
+			rank = 1
 		}
 		idx := rank - 1
 		if idx < 0 || idx >= len(candidates) {
@@ -424,18 +582,33 @@ func simulateSeriesHandler(w http.ResponseWriter, r *http.Request) {
 		// reach this endpoint at all, they stay on the client-side loop
 	}
 
-	player1Rank := req.Player1Rank
-	if player1Rank < 1 {
-		player1Rank = 1 // default/fallback: Theo
+	// Resolve each player into a full BotConfig - an explicit player*Bot
+	// object (rank + optional leave rules) takes precedence; otherwise fall
+	// back to the legacy rank-only field for backward compatibility with
+	// existing callers that only ever sent player1Rank/player2Rank.
+	player1Bot := BotConfig{Rank: 1}
+	if req.Player1Bot != nil {
+		player1Bot = *req.Player1Bot
+	} else if req.Player1Rank >= 1 {
+		player1Bot.Rank = req.Player1Rank
 	}
-	player2Rank := req.Player2Rank
-	if player2Rank < 1 {
-		player2Rank = 1
+	if player1Bot.Rank < 1 {
+		player1Bot.Rank = 1 // default/fallback: Theo
+	}
+
+	player2Bot := BotConfig{Rank: 1}
+	if req.Player2Bot != nil {
+		player2Bot = *req.Player2Bot
+	} else if req.Player2Rank >= 1 {
+		player2Bot.Rank = req.Player2Rank
+	}
+	if player2Bot.Rank < 1 {
+		player2Bot.Rank = 1
 	}
 
 	results := make([]SimGameResult, 0, games)
 	for i := 0; i < games; i++ {
-		results = append(results, simulateOneGame(player1Rank, player2Rank))
+		results = append(results, simulateOneGame(player1Bot, player2Bot))
 	}
 
 	resp := SimulateSeriesResponse{Games: results}

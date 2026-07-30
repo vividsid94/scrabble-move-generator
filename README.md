@@ -231,7 +231,7 @@ HTTP call per move. Rank 1 is "Theo" (best move); rank N is "Nth static".
 Bots that need per-move opponent simulation (Tess) aren't supported here and
 stay on the client-side loop.
 
-**Request:**
+**Request (legacy, rank only):**
 ```json
 {
   "games": 10,
@@ -242,6 +242,44 @@ stay on the client-side loop.
 `games` defaults to 1 and is capped at 500 per request. `player1Rank`/
 `player2Rank` default to 1 (Theo) and fall back to the best available move
 if the requested rank exceeds how many legal options exist on a given turn.
+
+**Request (custom bot personalities):** `player1Bot`/`player2Bot` replace
+`player1Rank`/`player2Rank` and take precedence if both are sent. Each bot
+has a `rank` (same meaning as above, defaults to 1) plus an optional
+`leaveRules` list - adjustments applied to every candidate leave's base
+`leaves.json` value before ranking, letting two bots at the same rank play
+genuinely differently:
+
+```json
+{
+  "games": 10,
+  "player1Bot": {
+    "rank": 1,
+    "leaveRules": [
+      { "type": "containsLetter", "letter": "S", "bonus": 20 }
+    ]
+  },
+  "player2Bot": { "rank": 1 }
+}
+```
+
+`leaveRules` entries stack in order: `bonus` rules (flat, can be negative)
+sum together, and `multiplier` rules scale the running total at the point
+they appear. Supported `type` values:
+
+| type | fields used | effect |
+|---|---|---|
+| `containsLetter` | `letter`, `bonus` | leave contains `letter` anywhere |
+| `containsAny` | `letters`, `bonus` | leave contains any letter in `letters` |
+| `containsAll` | `letters`, `bonus` | leave contains every letter in `letters` |
+| `containsCount` | `letter`, `comparator`, `count`, `bonus` | count of `letter` compares to `count` |
+| `vowelCount` | `comparator`, `count`, `bonus` | count of A/E/I/O/U compares to `count` |
+| `consonantCount` | `comparator`, `count`, `bonus` | count of non-vowel, non-blank tiles compares to `count` |
+| `hasBlank` | `bonus` | leave contains `?` |
+| `lengthEquals` | `count`, `bonus` | leave length equals `count` |
+| `multiplier` | `multiplier` | scales the running total so far |
+
+`comparator` is `"gte"` (default), `"lte"`, or `"eq"`.
 
 **Response:**
 ```json
