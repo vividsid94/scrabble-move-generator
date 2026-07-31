@@ -1,7 +1,14 @@
 package main
 
 import (
+	"encoding/json"
+	"net/http"
+	"sort"
+	"strings"
+
 	"github.com/domino14/macondo/board"
+	"github.com/domino14/macondo/cross_set"
+	"github.com/domino14/macondo/movegen"
 	"github.com/domino14/word-golib/kwg"
 	"github.com/domino14/word-golib/tilemapping"
 )
@@ -105,6 +112,97 @@ var rulesBotVowels = map[string]bool{"A": true, "E": true, "I": true, "O": true,
 
 // ---- Entry point ----
 
+// candidatePenaltyBreakdown is every one of RulesBot's six penalty
+// components for one candidate, computed once and shared by both
+// pickRulesBotCandidate (which only needs the final adjusted total) and the
+// /rulesbot-debug endpoint below (which needs every component individually,
+// to answer "why did X beat Y" for one specific decision).
+type candidatePenaltyBreakdown struct {
+	candidate *scoredCandidate
+
+	openingVowelPenalty float64
+	openingStarPenalty  float64
+	vowelPremiumPenalty float64
+	hookPremiumPenalty  float64
+	closenessPenalty    float64
+	laneCountPenalty    float64
+
+	boxArea   int
+	laneCount int
+}
+
+func (b *candidatePenaltyBreakdown) totalPenalty() float64 {
+	return b.openingVowelPenalty + b.openingStarPenalty + b.vowelPremiumPenalty +
+		b.hookPremiumPenalty + b.closenessPenalty + b.laneCountPenalty
+}
+
+// adjustedTotal is the number RulesBot actually ranks candidates by - see
+// pickRulesBotCandidate's doc comment for why exchanges are exempt from
+// every penalty.
+func (b *candidatePenaltyBreakdown) adjustedTotal() float64 {
+	if b.candidate.isExchange {
+		return b.candidate.total
+	}
+	return b.candidate.total - b.totalPenalty()
+}
+
+// computeRulesBotBreakdowns runs all six rules against every candidate and
+// returns each one's full penalty breakdown, including rules 3 and 6's
+// relative-to-this-turn scaling (see relativeScaledPenalty). This is the one
+// place the per-candidate board-copy work happens - everything downstream
+// (the actual pick, its RulesBotImpact, or a /rulesbot-debug response) just
+// reads numbers back out of the result.
+func computeRulesBotBreakdowns(candidates []scoredCandidate, bd *board.GameBoard, isOpeningPlay bool) []candidatePenaltyBreakdown {
+	breakdowns := make([]candidatePenaltyBreakdown, len(candidates))
+	minBoxArea, maxBoxArea := -1, -1
+	minLanes, maxLanes := -1, -1
+
+	for i := range candidates {
+		c := &candidates[i]
+		breakdowns[i].candidate = c
+		if c.isExchange {
+			continue
+		}
+
+		candidateBd := bd.Copy()
+		candidateBd.PlayMove(c.move)
+
+		b := &breakdowns[i]
+		if isOpeningPlay {
+			b.openingVowelPenalty = openingDLSVowelPenalty(c.detailed)
+			b.openingStarPenalty = openingStarSPenalty(c.detailed)
+		}
+		b.vowelPremiumPenalty = tlsTwsVowelPenalty(c.detailed, candidateBd)
+		b.hookPremiumPenalty = hookOnPremiumPenalty(c.detailed, candidateBd)
+		b.boxArea = boardBoundingBoxArea(candidateBd)
+		b.laneCount = countCurrentBingoLanes(candidateBd)
+
+		if minBoxArea == -1 || b.boxArea < minBoxArea {
+			minBoxArea = b.boxArea
+		}
+		if b.boxArea > maxBoxArea {
+			maxBoxArea = b.boxArea
+		}
+		if minLanes == -1 || b.laneCount < minLanes {
+			minLanes = b.laneCount
+		}
+		if b.laneCount > maxLanes {
+			maxLanes = b.laneCount
+		}
+	}
+
+	for i := range breakdowns {
+		b := &breakdowns[i]
+		if b.candidate.isExchange {
+			continue
+		}
+		b.closenessPenalty = relativeScaledPenalty(b.boxArea, minBoxArea, maxBoxArea, rulesBotClosenessECL)
+		b.laneCountPenalty = relativeScaledPenalty(b.laneCount, minLanes, maxLanes, rulesBotLaneCountECL)
+	}
+
+	return breakdowns
+}
+
 // RulesBotImpact answers, per turn, "did the six defense rules actually
 // change what got played, and specifically which one(s) mattered" - the
 // same question simulate.go already answers for LeaveRules/BingoAversion
@@ -157,51 +255,7 @@ func pickRulesBotCandidate(candidates []scoredCandidate, bd *board.GameBoard, is
 		return nil, nil
 	}
 
-	type rawMetrics struct {
-		boxArea              int
-		laneCount            int
-		openingVowelPenalty  float64
-		openingStarPenalty   float64
-		vowelPremiumPenalty  float64
-		hookPremiumPenalty   float64
-	}
-	metrics := make([]rawMetrics, len(candidates))
-	minBoxArea, maxBoxArea := -1, -1
-	minLanes, maxLanes := -1, -1
-
-	for i := range candidates {
-		c := &candidates[i]
-		if c.isExchange {
-			continue
-		}
-
-		candidateBd := bd.Copy()
-		candidateBd.PlayMove(c.move)
-
-		m := rawMetrics{}
-		if isOpeningPlay {
-			m.openingVowelPenalty = openingDLSVowelPenalty(c.detailed)
-			m.openingStarPenalty = openingStarSPenalty(c.detailed)
-		}
-		m.vowelPremiumPenalty = tlsTwsVowelPenalty(c.detailed, candidateBd)
-		m.hookPremiumPenalty = hookOnPremiumPenalty(c.detailed, candidateBd)
-		m.boxArea = boardBoundingBoxArea(candidateBd)
-		m.laneCount = countCurrentBingoLanes(candidateBd)
-
-		metrics[i] = m
-		if minBoxArea == -1 || m.boxArea < minBoxArea {
-			minBoxArea = m.boxArea
-		}
-		if m.boxArea > maxBoxArea {
-			maxBoxArea = m.boxArea
-		}
-		if minLanes == -1 || m.laneCount < minLanes {
-			minLanes = m.laneCount
-		}
-		if m.laneCount > maxLanes {
-			maxLanes = m.laneCount
-		}
-	}
+	breakdowns := computeRulesBotBreakdowns(candidates, bd, isOpeningPlay)
 
 	// Each tracker holds the running best candidate for one selection
 	// objective. score>t.score (strict) on ties keeps whichever candidate
@@ -221,29 +275,19 @@ func pickRulesBotCandidate(candidates []scoredCandidate, bd *board.GameBoard, is
 
 	var real, baseline, noOpeningVowel, noOpeningStar, noCloseness, noVowelPremium, noHookPremium, noLaneCount tracker
 
-	for i := range candidates {
-		c := &candidates[i]
-		m := metrics[i]
-
-		closenessPenalty := 0.0
-		laneCountPenalty := 0.0
-		if !c.isExchange {
-			closenessPenalty = relativeScaledPenalty(m.boxArea, minBoxArea, maxBoxArea, rulesBotClosenessECL)
-			laneCountPenalty = relativeScaledPenalty(m.laneCount, minLanes, maxLanes, rulesBotLaneCountECL)
-		}
-
-		totalPenalty := m.openingVowelPenalty + m.openingStarPenalty + m.vowelPremiumPenalty +
-			m.hookPremiumPenalty + closenessPenalty + laneCountPenalty
-		adjusted := c.total - totalPenalty
+	for i := range breakdowns {
+		b := &breakdowns[i]
+		c := b.candidate
+		adjusted := b.adjustedTotal()
 
 		update(&real, c, adjusted)
 		update(&baseline, c, c.total)
-		update(&noOpeningVowel, c, adjusted+m.openingVowelPenalty)
-		update(&noOpeningStar, c, adjusted+m.openingStarPenalty)
-		update(&noCloseness, c, adjusted+closenessPenalty)
-		update(&noVowelPremium, c, adjusted+m.vowelPremiumPenalty)
-		update(&noHookPremium, c, adjusted+m.hookPremiumPenalty)
-		update(&noLaneCount, c, adjusted+laneCountPenalty)
+		update(&noOpeningVowel, c, adjusted+b.openingVowelPenalty)
+		update(&noOpeningStar, c, adjusted+b.openingStarPenalty)
+		update(&noCloseness, c, adjusted+b.closenessPenalty)
+		update(&noVowelPremium, c, adjusted+b.vowelPremiumPenalty)
+		update(&noHookPremium, c, adjusted+b.hookPremiumPenalty)
+		update(&noLaneCount, c, adjusted+b.laneCountPenalty)
 	}
 
 	chosen := real.best
@@ -529,4 +573,181 @@ func laneWindowIsLive(bd *board.GameBoard, startRow, startCol, length int, horiz
 		return coversStar
 	}
 	return touchesExisting
+}
+
+// ---- Debug/analysis endpoint ----
+//
+// /rulesbot-debug answers "why did RulesBot pick X over Y" for an arbitrary
+// rack+board, without playing a full game. simulate.go's per-turn
+// RulesBotImpacted/*Impacted flags (see RulesBotImpact above) tell you WHICH
+// rule(s) were decisive during an actual series, but not by how much, and
+// not what every other candidate scored - this exposes
+// computeRulesBotBreakdowns' full output directly for one turn: every
+// word-play candidate's raw score+leave, all six penalty components, and
+// the adjustedTotal RulesBot actually ranks by. Sorted by adjustedTotal, so
+// the top entry is exactly what RulesBot would play from this rack/board.
+// Registered in main-for-scrabble.go's route list - see this file's other
+// exported behavior for why the logic itself lives here instead.
+
+type RulesBotDebugRequest struct {
+	Rack  string     `json:"rack"`
+	Board [][]string `json:"board"` // 15x15, empty cells as ""
+	TopN  int        `json:"topN,omitempty"`
+}
+
+type RulesBotDebugCandidate struct {
+	IsExchange    bool   `json:"isExchange,omitempty"`
+	ExchangeTiles string `json:"exchangeTiles,omitempty"`
+	Word          string `json:"word,omitempty"`
+	Position      string `json:"position,omitempty"`
+	Score         int    `json:"score,omitempty"`
+	Leave         string `json:"leave"`
+	// RawTotal is score + plain leave value - what a rule-free bot at this
+	// rack would be ranking by, i.e. RulesBotImpact's "baseline".
+	RawTotal float64 `json:"rawTotal"`
+
+	OpeningVowelPenalty float64 `json:"openingVowelPenalty,omitempty"`
+	OpeningStarPenalty  float64 `json:"openingStarPenalty,omitempty"`
+	ClosenessPenalty    float64 `json:"closenessPenalty,omitempty"`
+	VowelPremiumPenalty float64 `json:"vowelPremiumPenalty,omitempty"`
+	HookPremiumPenalty  float64 `json:"hookPremiumPenalty,omitempty"`
+	LaneCountPenalty    float64 `json:"laneCountPenalty,omitempty"`
+	TotalPenalty        float64 `json:"totalPenalty"`
+
+	// AdjustedTotal is what RulesBot actually ranks candidates by -
+	// RawTotal minus TotalPenalty (exchanges are exempt from every penalty,
+	// so their AdjustedTotal always equals RawTotal).
+	AdjustedTotal float64 `json:"adjustedTotal"`
+	// BoxArea/LaneCount are rules 3/6's raw inputs before ECL scaling -
+	// included so it's clear WHY one candidate's closeness/lane-count
+	// penalty came out higher than another's, not just by how much.
+	BoxArea   int `json:"boxArea,omitempty"`
+	LaneCount int `json:"laneCount,omitempty"`
+}
+
+type RulesBotDebugResponse struct {
+	IsOpeningPlay bool                      `json:"isOpeningPlay"`
+	Candidates    []RulesBotDebugCandidate  `json:"candidates"`
+}
+
+func rulesBotDebugHandler(w http.ResponseWriter, r *http.Request) {
+	setCORSHeaders(w, r)
+	if r.Method == http.MethodOptions {
+		w.WriteHeader(http.StatusOK)
+		return
+	}
+	if r.Method != http.MethodPost {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	var req RulesBotDebugRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, "Invalid JSON", http.StatusBadRequest)
+		return
+	}
+	if req.Rack == "" {
+		http.Error(w, "Rack is required", http.StatusBadRequest)
+		return
+	}
+	if len(req.Board) != 15 {
+		http.Error(w, "Board must have 15 rows", http.StatusBadRequest)
+		return
+	}
+	for i := range req.Board {
+		if len(req.Board[i]) != 15 {
+			http.Error(w, "Each board row must have 15 columns", http.StatusBadRequest)
+			return
+		}
+	}
+	if req.TopN <= 0 {
+		req.TopN = 20
+	}
+
+	// Standard board only - RulesBot's own geometry (twsSquares etc.) is
+	// hardcoded to it, so a custom-premium-square board would silently
+	// mismatch those maps. Not a real limitation in practice: RulesBot
+	// itself makes the same assumption everywhere else in this file.
+	bd := board.MakeBoard(board.CrosswordGameBoard)
+	tilesPlayed := 0
+	for row := 0; row < 15; row++ {
+		for col := 0; col < 15; col++ {
+			tile := req.Board[row][col]
+			if tile != "" {
+				if ml, err := alph.Val(tile); err == nil {
+					bd.SetLetter(row, col, ml)
+					tilesPlayed++
+				}
+			}
+		}
+	}
+	bd.TestSetTilesPlayed(tilesPlayed)
+	cross_set.GenAllCrossSets(bd, gd, ld)
+	bd.UpdateAllAnchors()
+
+	isOpeningPlay := isBoardEmpty(bd)
+
+	rack := tilemapping.RackFromString(req.Rack, alph)
+	generator := movegen.NewGordonGenerator(gd, bd, ld)
+	rawMoves := generator.GenAll(rack, false)
+
+	// Plain score+leave, no LeaveRules - this endpoint is for isolating
+	// RulesBot's own six rules, independent of whatever a live game's bot
+	// config might otherwise be composing them with.
+	var candidates []scoredCandidate
+	for _, m := range rawMoves {
+		if !strings.Contains(m.String(), "play word:") {
+			continue
+		}
+		detailed := toDetailedMove(m, bd, alph)
+		var used []string
+		for _, t := range detailed.Tiles {
+			if t.IsNew {
+				if t.IsBlank {
+					used = append(used, "?")
+				} else {
+					used = append(used, t.Letter)
+				}
+			}
+		}
+		leave := sortLeaveString(removeRackFromPool(req.Rack, strings.Join(used, "")))
+		total := float64(detailed.Score) + getLeaveValue(leave)
+		candidates = append(candidates, scoredCandidate{
+			move: m, detailed: detailed, leave: leave, total: total,
+			isBingo: len(used) == 7,
+		})
+	}
+	candidates = append(candidates, allExchangeCandidates(req.Rack)...)
+
+	breakdowns := computeRulesBotBreakdowns(candidates, bd, isOpeningPlay)
+	sort.SliceStable(breakdowns, func(i, j int) bool { return breakdowns[i].adjustedTotal() > breakdowns[j].adjustedTotal() })
+	if len(breakdowns) > req.TopN {
+		breakdowns = breakdowns[:req.TopN]
+	}
+
+	respCandidates := make([]RulesBotDebugCandidate, 0, len(breakdowns))
+	for _, b := range breakdowns {
+		c := b.candidate
+		rc := RulesBotDebugCandidate{
+			Leave: c.leave, RawTotal: c.total,
+			OpeningVowelPenalty: b.openingVowelPenalty, OpeningStarPenalty: b.openingStarPenalty,
+			ClosenessPenalty: b.closenessPenalty, VowelPremiumPenalty: b.vowelPremiumPenalty,
+			HookPremiumPenalty: b.hookPremiumPenalty, LaneCountPenalty: b.laneCountPenalty,
+			TotalPenalty: b.totalPenalty(), AdjustedTotal: b.adjustedTotal(),
+			BoxArea: b.boxArea, LaneCount: b.laneCount,
+		}
+		if c.isExchange {
+			rc.IsExchange = true
+			rc.ExchangeTiles = c.exchangeTiles
+		} else {
+			rc.Word = c.detailed.Word
+			rc.Position = c.move.BoardCoords()
+			rc.Score = c.detailed.Score
+		}
+		respCandidates = append(respCandidates, rc)
+	}
+
+	resp := RulesBotDebugResponse{IsOpeningPlay: isOpeningPlay, Candidates: respCandidates}
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(resp)
 }
