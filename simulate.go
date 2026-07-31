@@ -305,15 +305,17 @@ type BingoAversionRule struct {
 }
 
 // tessCandidateCount/tessSimIterations mirror sandboxBotFunctions.js's Tess
-// algorithm (top-15 candidates, N simulated opponent replies each) but with
-// far fewer iterations per candidate - the client's 100 was calibrated for
-// a single live HTTP decision; here the same decision gets made on every
-// turn of every game in a series, so 100 would make a multi-game Tess
-// series impractically slow. 20 is a starting guess, not a measured value -
-// worth revisiting once this can actually be timed against a deployment.
+// algorithm (top-15 candidates, N simulated opponent replies each). The
+// client's 100 was calibrated for a single live HTTP decision; this used to
+// run at a fraction of that (20) since the same decision gets made on every
+// turn of every game in a series - now that the inner iteration loop below
+// is itself parallelized (not just whole games, via simulateSeriesHandler's
+// worker pool), 100 is back in reach without a multi-game series becoming
+// impractically slow. Still worth re-measuring against a real deployment,
+// same as the original 20 was never more than a starting guess either.
 const (
 	tessCandidateCount = 15
-	tessSimIterations  = 20
+	tessSimIterations  = 100
 )
 
 // pickTessCandidate mirrors sandboxBotFunctions.js's pickBotMove Tess
@@ -370,25 +372,7 @@ func pickTessCandidate(candidates []scoredCandidate, bd *board.GameBoard, alph *
 			cross_set.UpdateCrossSetsForMove(candidateBd, candidate.move, gd, ld)
 		}
 
-		totalOpponentScore := 0
-		validIterations := 0
-		for j := 0; j < tessSimIterations; j++ {
-			opponentRackStr, opponentRack := generateRandomRack(pool, 7, alph)
-			if opponentRack == nil {
-				continue
-			}
-			remainingPool := removeRackFromPool(pool, opponentRackStr)
-			opponentGen := movegen.NewGordonGenerator(gd, candidateBd, ld)
-			opponentRawMoves := opponentGen.GenAll(opponentRack, false)
-			opponentChosen := pickBestCandidate(opponentRawMoves, candidateBd, alph, opponentRackStr, remainingPool)
-
-			score := 0
-			if opponentChosen != nil && !opponentChosen.isExchange {
-				score = opponentChosen.detailed.Score
-			}
-			totalOpponentScore += score
-			validIterations++
-		}
+		totalOpponentScore, validIterations := simulateOpponentReplies(candidateBd, pool, alph)
 
 		avgOpponentScore := 0.0
 		if validIterations > 0 {
@@ -403,6 +387,67 @@ func pickTessCandidate(candidates []scoredCandidate, bd *board.GameBoard, alph *
 	}
 
 	return best
+}
+
+// simulateOpponentReplies runs tessSimIterations independent opponent-reply
+// simulations against candidateBd across a bounded worker pool, same
+// jobs-channel/WaitGroup shape simulateSeriesHandler's game-level pool
+// already uses (see its comment for the reasoning on why bounded rather
+// than one-goroutine-per-iteration). Each worker gets its OWN copy of
+// candidateBd made once up front, rather than every goroutine reading the
+// one passed in - movegen.GenAll isn't documented as mutation-free on the
+// board it's handed, and confirming that empirically isn't possible without
+// a local Go toolchain, so this sidesteps the question entirely rather than
+// assuming an answer. totalScore/validIterations are only ever written by
+// their own worker's goroutine and read after wg.Wait() returns, so no
+// mutex is needed despite being shared across all of them.
+func simulateOpponentReplies(candidateBd *board.GameBoard, pool string, alph *tilemapping.TileMapping) (totalScore int, validIterations int) {
+	numWorkers := runtime.GOMAXPROCS(0)
+	if numWorkers > tessSimIterations {
+		numWorkers = tessSimIterations
+	}
+
+	jobs := make(chan struct{}, tessSimIterations)
+	for j := 0; j < tessSimIterations; j++ {
+		jobs <- struct{}{}
+	}
+	close(jobs)
+
+	scores := make([]int, numWorkers)
+	counts := make([]int, numWorkers)
+
+	var wg sync.WaitGroup
+	for w := 0; w < numWorkers; w++ {
+		wg.Add(1)
+		go func(workerIndex int) {
+			defer wg.Done()
+			workerBd := candidateBd.Copy()
+			for range jobs {
+				opponentRackStr, opponentRack := generateRandomRack(pool, 7, alph)
+				if opponentRack == nil {
+					continue
+				}
+				remainingPool := removeRackFromPool(pool, opponentRackStr)
+				opponentGen := movegen.NewGordonGenerator(gd, workerBd, ld)
+				opponentRawMoves := opponentGen.GenAll(opponentRack, false)
+				opponentChosen := pickBestCandidate(opponentRawMoves, workerBd, alph, opponentRackStr, remainingPool)
+
+				score := 0
+				if opponentChosen != nil && !opponentChosen.isExchange {
+					score = opponentChosen.detailed.Score
+				}
+				scores[workerIndex] += score
+				counts[workerIndex]++
+			}
+		}(w)
+	}
+	wg.Wait()
+
+	for w := 0; w < numWorkers; w++ {
+		totalScore += scores[w]
+		validIterations += counts[w]
+	}
+	return totalScore, validIterations
 }
 
 // pickLongestOrMostTilesCandidate implements the "Longest word" / "Most
