@@ -32,8 +32,10 @@ import (
 	"encoding/json"
 	"math/rand"
 	"net/http"
+	"runtime"
 	"sort"
 	"strings"
+	"sync"
 
 	"github.com/domino14/macondo/board"
 	"github.com/domino14/macondo/cross_set"
@@ -934,10 +936,41 @@ func simulateSeriesHandler(w http.ResponseWriter, r *http.Request) {
 		player2Bot.Rank = 1
 	}
 
-	results := make([]SimGameResult, 0, games)
-	for i := 0; i < games; i++ {
-		results = append(results, simulateOneGame(player1Bot, player2Bot))
+	// Every game is fully independent (simulateOneGame touches no shared
+	// mutable state - see the package-level vars' comments; gd/alph/ld/
+	// leaveValues/bingoProbabilityRank are all write-once-at-startup,
+	// read-only from here on), so games run concurrently across a bounded
+	// worker pool instead of one at a time. Each worker owns a distinct
+	// index into results (handed out via the jobs channel, never shared
+	// between workers), so no two goroutines ever touch the same slot -
+	// safe without a mutex on the results slice itself. Bounded rather
+	// than one-goroutine-per-game so a 500-game series doesn't spin up 500
+	// concurrent goroutines all competing for the same handful of CPU
+	// cores - more workers than cores just adds scheduling overhead here,
+	// it doesn't run more of them at once than the hardware actually has.
+	results := make([]SimGameResult, games)
+	numWorkers := runtime.GOMAXPROCS(0)
+	if numWorkers > games {
+		numWorkers = games
 	}
+
+	jobs := make(chan int, games)
+	for i := 0; i < games; i++ {
+		jobs <- i
+	}
+	close(jobs)
+
+	var wg sync.WaitGroup
+	for w := 0; w < numWorkers; w++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for gameIndex := range jobs {
+				results[gameIndex] = simulateOneGame(player1Bot, player2Bot)
+			}
+		}()
+	}
+	wg.Wait()
 
 	resp := SimulateSeriesResponse{Games: results}
 	w.Header().Set("Content-Type", "application/json")
