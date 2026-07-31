@@ -255,6 +255,15 @@ type BotConfig struct {
 	// selection mechanism is in play (rank-based or Tess), since it
 	// filters the shared candidate pool before either one sees it.
 	BingoAversion *BingoAversionRule `json:"bingoAversion,omitempty"`
+	// SpecialSelection, if set to "longestWord" or "mostTiles", overrides
+	// every other selection mechanism entirely - see
+	// pickLongestOrMostTilesCandidate. Takes absolute precedence: Rank,
+	// IsTess, LeaveRules, and BingoAversion are all ignored when this is
+	// set (checked first in simulateOneGame's turn loop, and
+	// BingoAversion's pool filtering is skipped outright) - deliberately
+	// no conjunction with any other mode, so there's nothing to reconcile
+	// between "play the longest word" and e.g. "but also avoid bingos."
+	SpecialSelection string `json:"specialSelection,omitempty"` // "" | "longestWord" | "mostTiles"
 }
 
 // BingoAversionRule excludes bingo candidates (word plays using all 7 rack
@@ -387,6 +396,71 @@ func pickTessCandidate(candidates []scoredCandidate, bd *board.GameBoard, alph *
 	}
 
 	return best
+}
+
+// pickLongestOrMostTilesCandidate implements the "Longest word" / "Most
+// tiles played" Speedy override modes: a pure static tiebreak chain, no
+// leave-value ranking and no simulation. mode "mostTiles" ranks by count of
+// new (rack) tiles placed; anything else ranks by the resulting word's
+// letter count (which can exceed 7 via a hook - a different thing than
+// tiles placed from the rack). Either way, ties break by score, then by
+// plain leaves.json leave value (deliberately getLeaveValue directly, never
+// applyLeaveRules - these modes ignore LeaveRules entirely, not just
+// de-prioritize them), then randomly among whatever's still tied.
+// Exchanges are never considered (0 length, 0 tiles placed, so they could
+// never win this comparison anyway) - if there's no legal word play at
+// all, this returns nil, the same "pass" fallback every other selection
+// mode uses.
+func pickLongestOrMostTilesCandidate(candidates []scoredCandidate, mode string) *scoredCandidate {
+	var wordPlays []scoredCandidate
+	for _, c := range candidates {
+		if !c.isExchange {
+			wordPlays = append(wordPlays, c)
+		}
+	}
+	if len(wordPlays) == 0 {
+		return nil
+	}
+
+	metric := func(c *scoredCandidate) int {
+		if mode == "mostTiles" {
+			n := 0
+			for _, t := range c.detailed.Tiles {
+				if t.IsNew {
+					n++
+				}
+			}
+			return n
+		}
+		return len([]rune(c.detailed.Word))
+	}
+
+	sort.SliceStable(wordPlays, func(i, j int) bool {
+		if mi, mj := metric(&wordPlays[i]), metric(&wordPlays[j]); mi != mj {
+			return mi > mj
+		}
+		if wordPlays[i].detailed.Score != wordPlays[j].detailed.Score {
+			return wordPlays[i].detailed.Score > wordPlays[j].detailed.Score
+		}
+		return getLeaveValue(wordPlays[i].leave) > getLeaveValue(wordPlays[j].leave)
+	})
+
+	// Ties are contiguous at the front after that stable descending sort -
+	// collect every candidate matching the top of the sort on all three
+	// criteria, then break the final tie randomly rather than silently
+	// taking GenAll's arbitrary internal ordering.
+	best := wordPlays[0]
+	bestMetric, bestScore, bestLeave := metric(&best), best.detailed.Score, getLeaveValue(best.leave)
+	tied := []scoredCandidate{best}
+	for i := 1; i < len(wordPlays); i++ {
+		c := wordPlays[i]
+		if metric(&c) != bestMetric || c.detailed.Score != bestScore || getLeaveValue(c.leave) != bestLeave {
+			break
+		}
+		tied = append(tied, c)
+	}
+	chosen := tied[rand.Intn(len(tied))]
+	return &chosen
 }
 
 // allExchangeCandidates enumerates every non-empty subset of rack (up to
@@ -622,7 +696,7 @@ func simulateOneGame(player1Bot, player2Bot BotConfig) SimGameResult {
 		// later ask "what would this bot have picked with no aversion at
 		// all" - cheap to copy, skipped entirely when it'd never be used.
 		var unfilteredForBingoCompare []scoredCandidate
-		if currentBot.BingoAversion != nil && !currentBot.IsTess {
+		if currentBot.SpecialSelection == "" && currentBot.BingoAversion != nil && !currentBot.IsTess {
 			unfilteredForBingoCompare = make([]scoredCandidate, len(candidates))
 			copy(unfilteredForBingoCompare, candidates)
 		}
@@ -631,7 +705,10 @@ func simulateOneGame(player1Bot, player2Bot BotConfig) SimGameResult {
 		// both the rank-based total sort below and Tess's own re-sort by
 		// baselineTotal are already working from the same reduced list -
 		// no special-casing needed downstream for either selection mode.
-		if ba := currentBot.BingoAversion; ba != nil {
+		// Skipped entirely under SpecialSelection - those modes exist to
+		// actively seek out bingos, the opposite of what aversion is for,
+		// so there's no conjunction to reconcile between the two.
+		if ba := currentBot.BingoAversion; ba != nil && currentBot.SpecialSelection == "" {
 			// Per-candidate: deterministically drop any individual bingo
 			// whose word isn't well-known enough. Words with no rank at
 			// all (9+ letters via a hook, or absent from the NWL23 lists)
@@ -672,12 +749,19 @@ func simulateOneGame(player1Bot, player2Bot BotConfig) SimGameResult {
 		sort.SliceStable(candidates, func(i, j int) bool { return candidates[i].total > candidates[j].total })
 
 		var chosen *scoredCandidate
-		// rank stays 0 for Tess (meaningless for her selection mechanism) -
-		// only used below for the rank-based rule-impact baseline.
+		// rank stays 0 for Tess and SpecialSelection (meaningless for
+		// either) - only used below for the rank-based rule-impact
+		// baseline.
 		var rank int
-		if currentBot.IsTess {
+		switch {
+		case currentBot.SpecialSelection != "":
+			// Absolute override - takes precedence over everything else,
+			// by construction rather than by checking flags in combination
+			// (see BotConfig.SpecialSelection's comment).
+			chosen = pickLongestOrMostTilesCandidate(candidates, currentBot.SpecialSelection)
+		case currentBot.IsTess:
 			chosen = pickTessCandidate(candidates, bd, alph, pool)
-		} else {
+		default:
 			rank = currentBot.Rank
 			if rank < 1 {
 				rank = 1
@@ -702,10 +786,11 @@ func simulateOneGame(player1Bot, player2Bot BotConfig) SimGameResult {
 		// selection isn't rank-based (it's a 15-candidate x N-iteration
 		// opponent simulation), so a fair baseline would mean re-running
 		// that whole simulation a second time; left out of scope here to
-		// keep her already-heavier per-turn cost in check.
+		// keep her already-heavier per-turn cost in check. Also skipped
+		// under SpecialSelection, which ignores LeaveRules entirely.
 		var ruleImpacted bool
 		var baselineChosen *scoredCandidate
-		if !currentBot.IsTess && len(currentBot.LeaveRules) > 0 && len(candidates) > 0 {
+		if currentBot.SpecialSelection == "" && !currentBot.IsTess && len(currentBot.LeaveRules) > 0 && len(candidates) > 0 {
 			baseline := make([]scoredCandidate, len(candidates))
 			copy(baseline, candidates)
 			sort.SliceStable(baseline, func(i, j int) bool { return baseline[i].baselineTotal > baseline[j].baselineTotal })
