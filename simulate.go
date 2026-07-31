@@ -264,6 +264,13 @@ type BotConfig struct {
 	// no conjunction with any other mode, so there's nothing to reconcile
 	// between "play the longest word" and e.g. "but also avoid bingos."
 	SpecialSelection string `json:"specialSelection,omitempty"` // "" | "longestWord" | "mostTiles"
+	// IsRulesBot selects a third selection algorithm alongside Rank/IsTess -
+	// see pickRulesBotCandidate in rulesbot.go for the six hardcoded defense
+	// rules it applies on top of the normal score+leave total. Unlike
+	// SpecialSelection, this is compatible with LeaveRules and
+	// BingoAversion (both still apply normally beforehand) - only Rank is
+	// meaningless here, the same way it's meaningless for Tess.
+	IsRulesBot bool `json:"isRulesBot,omitempty"`
 }
 
 // BingoAversionRule excludes bingo candidates (word plays using all 7 rack
@@ -535,6 +542,27 @@ type SimTurn struct {
 	WithoutAversionWord           string `json:"withoutAversionWord,omitempty"`
 	WithoutAversionScore          int    `json:"withoutAversionScore,omitempty"`
 	WithoutAversionTilesExchanged string `json:"withoutAversionTilesExchanged,omitempty"`
+
+	// Only set when this player's bot is RulesBot (rulesbot.go) - reports
+	// whether its six hardcoded defense rules, collectively and
+	// individually, changed what got played this turn versus a plain
+	// score+leave bot working from the same candidate list. See
+	// RulesBotImpact in rulesbot.go for exactly what each field means -
+	// these are a direct field-for-field copy of that struct, generalizing
+	// RuleImpacted/Baseline* above from one aggregate flag to RulesBot's
+	// six named rules.
+	RulesBotImpacted               bool   `json:"rulesBotImpacted,omitempty"`
+	RulesBotBaselineType           string `json:"rulesBotBaselineType,omitempty"` // "play" | "exchange"
+	RulesBotBaselineWord           string `json:"rulesBotBaselineWord,omitempty"`
+	RulesBotBaselineScore          int    `json:"rulesBotBaselineScore,omitempty"`
+	RulesBotBaselineTilesExchanged string `json:"rulesBotBaselineTilesExchanged,omitempty"`
+
+	RulesBotOpeningVowelImpacted bool `json:"rulesBotOpeningVowelImpacted,omitempty"`
+	RulesBotOpeningStarImpacted  bool `json:"rulesBotOpeningStarImpacted,omitempty"`
+	RulesBotClosenessImpacted    bool `json:"rulesBotClosenessImpacted,omitempty"`
+	RulesBotVowelPremiumImpacted bool `json:"rulesBotVowelPremiumImpacted,omitempty"`
+	RulesBotHookImpacted         bool `json:"rulesBotHookImpacted,omitempty"`
+	RulesBotLaneCountImpacted    bool `json:"rulesBotLaneCountImpacted,omitempty"`
 }
 
 type SimGameResult struct {
@@ -696,7 +724,7 @@ func simulateOneGame(player1Bot, player2Bot BotConfig) SimGameResult {
 		// later ask "what would this bot have picked with no aversion at
 		// all" - cheap to copy, skipped entirely when it'd never be used.
 		var unfilteredForBingoCompare []scoredCandidate
-		if currentBot.SpecialSelection == "" && currentBot.BingoAversion != nil && !currentBot.IsTess {
+		if currentBot.SpecialSelection == "" && currentBot.BingoAversion != nil && !currentBot.IsTess && !currentBot.IsRulesBot {
 			unfilteredForBingoCompare = make([]scoredCandidate, len(candidates))
 			copy(unfilteredForBingoCompare, candidates)
 		}
@@ -749,10 +777,11 @@ func simulateOneGame(player1Bot, player2Bot BotConfig) SimGameResult {
 		sort.SliceStable(candidates, func(i, j int) bool { return candidates[i].total > candidates[j].total })
 
 		var chosen *scoredCandidate
-		// rank stays 0 for Tess and SpecialSelection (meaningless for
-		// either) - only used below for the rank-based rule-impact
+		// rank stays 0 for Tess, SpecialSelection, and RulesBot (meaningless
+		// for any of them) - only used below for the rank-based rule-impact
 		// baseline.
 		var rank int
+		var rulesBotImpact *RulesBotImpact
 		switch {
 		case currentBot.SpecialSelection != "":
 			// Absolute override - takes precedence over everything else,
@@ -761,6 +790,8 @@ func simulateOneGame(player1Bot, player2Bot BotConfig) SimGameResult {
 			chosen = pickLongestOrMostTilesCandidate(candidates, currentBot.SpecialSelection)
 		case currentBot.IsTess:
 			chosen = pickTessCandidate(candidates, bd, alph, pool)
+		case currentBot.IsRulesBot:
+			chosen, rulesBotImpact = pickRulesBotCandidate(candidates, bd, len(turns) == 0)
 		default:
 			rank = currentBot.Rank
 			if rank < 1 {
@@ -790,7 +821,7 @@ func simulateOneGame(player1Bot, player2Bot BotConfig) SimGameResult {
 		// under SpecialSelection, which ignores LeaveRules entirely.
 		var ruleImpacted bool
 		var baselineChosen *scoredCandidate
-		if currentBot.SpecialSelection == "" && !currentBot.IsTess && len(currentBot.LeaveRules) > 0 && len(candidates) > 0 {
+		if currentBot.SpecialSelection == "" && !currentBot.IsTess && !currentBot.IsRulesBot && len(currentBot.LeaveRules) > 0 && len(candidates) > 0 {
 			baseline := make([]scoredCandidate, len(candidates))
 			copy(baseline, candidates)
 			sort.SliceStable(baseline, func(i, j int) bool { return baseline[i].baselineTotal > baseline[j].baselineTotal })
@@ -848,6 +879,25 @@ func simulateOneGame(player1Bot, player2Bot BotConfig) SimGameResult {
 				turn.WithoutAversionType = "play"
 				turn.WithoutAversionWord = withoutAversionChosen.detailed.Word
 				turn.WithoutAversionScore = withoutAversionChosen.detailed.Score
+			}
+		}
+		if rulesBotImpact != nil {
+			turn.RulesBotImpacted = rulesBotImpact.Impacted
+			turn.RulesBotOpeningVowelImpacted = rulesBotImpact.OpeningVowelImpacted
+			turn.RulesBotOpeningStarImpacted = rulesBotImpact.OpeningStarImpacted
+			turn.RulesBotClosenessImpacted = rulesBotImpact.ClosenessImpacted
+			turn.RulesBotVowelPremiumImpacted = rulesBotImpact.VowelPremiumImpacted
+			turn.RulesBotHookImpacted = rulesBotImpact.HookPremiumImpacted
+			turn.RulesBotLaneCountImpacted = rulesBotImpact.LaneCountImpacted
+			if rulesBotImpact.Impacted {
+				if rulesBotImpact.BaselineIsExchange {
+					turn.RulesBotBaselineType = "exchange"
+					turn.RulesBotBaselineTilesExchanged = rulesBotImpact.BaselineExchangeTiles
+				} else {
+					turn.RulesBotBaselineType = "play"
+					turn.RulesBotBaselineWord = rulesBotImpact.BaselineWord
+					turn.RulesBotBaselineScore = rulesBotImpact.BaselineScore
+				}
 			}
 		}
 		var newRack string
