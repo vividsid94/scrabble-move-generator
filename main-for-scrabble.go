@@ -7,6 +7,7 @@ import (
 	"math/rand"
 	"net/http"
 	"os"
+	"regexp"
 	"sort"
 	"strings"
 	"time"
@@ -24,15 +25,17 @@ import (
 // Request/Response structures
 // Board is a 15x15 array of strings ("" for empty, or a single letter)
 
+var localhostOriginRe = regexp.MustCompile(`^http://localhost:\d+$`)
+
 func setCORSHeaders(w http.ResponseWriter, r *http.Request) {
 	origin := r.Header.Get("Origin")
 	allowedOrigins := map[string]bool{
-		"http://localhost:8888": true, // old Netlify Dev
-		"http://localhost:5173": true, // Vite dev server
 		"https://tileturnover.com": true,
 		"https://whiffers230.com":  true,
 	}
-	if allowedOrigins[origin] {
+	// Vite (and old Netlify Dev) don't stick to one port, so any localhost
+	// port is allowed in dev rather than chasing whichever one got picked.
+	if allowedOrigins[origin] || localhostOriginRe.MatchString(origin) {
 		w.Header().Set("Access-Control-Allow-Origin", origin)
 		w.Header().Set("Vary", "Origin")
 	}
