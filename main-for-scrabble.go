@@ -364,6 +364,7 @@ func generateMovesHandler(w http.ResponseWriter, r *http.Request) {
 		score                                int
 		leaveValue, total                    float64
 		isExchange                           bool
+		detailed                             *DetailedMove
 	}
 
 	ranked := make([]rankedMove, 0, len(moves))
@@ -416,6 +417,7 @@ func generateMovesHandler(w http.ResponseWriter, r *http.Request) {
 		ranked = append(ranked, rankedMove{
 			position: m.BoardCoords(), word: word, score: m.Score(),
 			leave: leave, leaveValue: leaveValue, total: float64(m.Score()) + leaveValue,
+			detailed: detailed,
 		})
 	}
 
@@ -447,6 +449,8 @@ func generateMovesHandler(w http.ResponseWriter, r *http.Request) {
 		responseMoves = append(responseMoves, Move{
 			Position: rm.position, Word: rm.word, Score: rm.score,
 			Leave: rm.leave, LeaveValue: rm.leaveValue, TotalValue: rm.total,
+			Direction: rm.detailed.Direction, StartPosition: rm.detailed.StartPosition,
+			Tiles: rm.detailed.Tiles,
 		})
 	}
 	resp := GenerateMovesResponse{
