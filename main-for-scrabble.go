@@ -26,11 +26,17 @@ import (
 
 func setCORSHeaders(w http.ResponseWriter, r *http.Request) {
 	origin := r.Header.Get("Origin")
-	if origin == "http://localhost:8888" || origin == "https://tileturnover.com" {
+	allowedOrigins := map[string]bool{
+		"http://localhost:8888": true, // old Netlify Dev
+		"http://localhost:5173": true, // Vite dev server
+		"https://tileturnover.com": true,
+		"https://whiffers230.com":  true,
+	}
+	if allowedOrigins[origin] {
 		w.Header().Set("Access-Control-Allow-Origin", origin)
 		w.Header().Set("Vary", "Origin")
 	}
-	w.Header().Set("Access-Control-Allow-Methods", "POST, OPTIONS")
+	w.Header().Set("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
 	w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization")
 	w.Header().Set("Access-Control-Max-Age", "86400") // 24 hours
 }
@@ -249,6 +255,7 @@ func main() {
 	http.HandleFunc("/bulk-move-gen", bulkMoveGenHandler)
 	http.HandleFunc("/simulate-series", simulateSeriesHandler)
 	http.HandleFunc("/rulesbot-debug", rulesBotDebugHandler)
+	http.HandleFunc("/proxy", proxyHandler)
 
 	port := os.Getenv("PORT")
 	if port == "" {
