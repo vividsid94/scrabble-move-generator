@@ -280,12 +280,25 @@ func main() {
 	// TotalMemory() - the HOST machine's full RAM, not this container's actual
 	// quota - whenever no soft limit has been set. That fallback caused a single
 	// eager make([]TableEntry, ...) to blow way past Railway's real memory limit
-	// and get the process OOM-killed on every /solve-endgame call. Give the
-	// runtime a real, container-safe ceiling up front (unless one's already been
-	// supplied via the GOMEMLIMIT env var) so the transposition table sizes
-	// itself sanely instead.
+	// and get the process OOM-killed on every /solve-endgame call.
+	//
+	// The table also has a hard floor of 2**24 entries * 16 bytes = 256 MiB
+	// no matter how small the computed fraction is (Reset()'s own comment:
+	// "anything less and our 5-byte hash proxy won't work") - so on Railway's
+	// 512 MiB plan for this service, the table alone claims half the
+	// container before the lexicon, game state, or search even get a look.
+	// 400 MiB left almost no headroom above that floor, which didn't crash
+	// outright but made the GC thrash (spend nearly all CPU time collecting
+	// to stay under budget) instead of letting the solve make progress -
+	// looks like a hang, not a crash. ~90% of the real 512 MiB ceiling
+	// (leaving margin for non-Go/OS overhead, per Go's own GOMEMLIMIT
+	// guidance) is the most headroom available without exceeding Railway's
+	// actual limit; if the service still crashes or hangs on this plan, the
+	// 256 MiB floor genuinely doesn't fit alongside everything else and the
+	// only remaining lever is bumping this service's Railway memory
+	// allocation, not further tuning here.
 	if debug.SetMemoryLimit(-1) == math.MaxInt64 {
-		debug.SetMemoryLimit(400 << 20) // 400 MiB; raise via GOMEMLIMIT if Railway's plan allows more.
+		debug.SetMemoryLimit(460 << 20) // 460 MiB of Railway's 512 MiB; raise via GOMEMLIMIT if the plan changes.
 	}
 
 	if err := initService(); err != nil {
@@ -1184,6 +1197,8 @@ func bulkMoveGenHandler(w http.ResponseWriter, r *http.Request) {
 // degrades to a partial (or empty) PV with Incomplete:true instead of
 // hanging or failing the request.
 func solveEndgameHandler(w http.ResponseWriter, r *http.Request) {
+	handlerStart := time.Now()
+	log.Printf("solve-endgame: request received")
 	setCORSHeaders(w, r)
 	if r.Method == http.MethodOptions {
 		w.WriteHeader(http.StatusOK)
@@ -1247,6 +1262,8 @@ func solveEndgameHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	log.Printf("solve-endgame: board validated (tilesPlayed=%d), elapsed=%v", tilesPlayed, time.Since(handlerStart))
+
 	players := []*pb.PlayerInfo{
 		{Nickname: "Mover", RealName: "Mover"},
 		{Nickname: "Opponent", RealName: "Opponent"},
@@ -1259,11 +1276,13 @@ func solveEndgameHandler(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "Failed to construct game state: "+err.Error(), http.StatusInternalServerError)
 		return
 	}
+	log.Printf("solve-endgame: game constructed via NewFromSnapshot, elapsed=%v", time.Since(handlerStart))
 
 	// Defensive - cheap and harmless even if NewFromSnapshot already does
 	// this internally.
 	cross_set.GenAllCrossSets(g.Board(), gd, ld)
 	g.Board().UpdateAllAnchors()
+	log.Printf("solve-endgame: cross-sets/anchors regenerated, elapsed=%v", time.Since(handlerStart))
 
 	generator := movegen.NewGordonGenerator(gd, g.Board(), ld)
 	solver := &negamax.Solver{}
@@ -1271,6 +1290,7 @@ func solveEndgameHandler(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "Failed to initialize solver: "+err.Error(), http.StatusInternalServerError)
 		return
 	}
+	log.Printf("solve-endgame: solver initialized, elapsed=%v", time.Since(handlerStart))
 
 	// Transposition table optim stays on (Solver's default) - now that
 	// main() gives the runtime a real soft memory limit, Reset() sizes the
@@ -1303,7 +1323,9 @@ func solveEndgameHandler(w http.ResponseWriter, r *http.Request) {
 		plies = 25
 	}
 
+	log.Printf("solve-endgame: calling Solve() with plies=%d, elapsed=%v", plies, time.Since(handlerStart))
 	value, pv, solveErr := solver.Solve(ctx, plies)
+	log.Printf("solve-endgame: Solve() returned (moves=%d, ctxErr=%v, solveErr=%v), elapsed=%v", len(pv), ctx.Err(), solveErr, time.Since(handlerStart))
 	incomplete := ctx.Err() != nil
 	if solveErr != nil && len(pv) == 0 {
 		http.Error(w, "Endgame solve failed: "+solveErr.Error(), http.StatusInternalServerError)
