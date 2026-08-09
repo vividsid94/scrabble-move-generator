@@ -44,7 +44,7 @@ import (
 
 // endgameBranchWidth caps how many candidates get real recursive
 // consideration at each of endgameDepthBudget plies - total explored nodes
-// is roughly endgameBranchWidth^endgameDepthBudget (30^3 = 27000), not
+// is roughly endgameBranchWidth^endgameDepthBudget (50^3 = 125000), not
 // exponential in however long the actual endgame runs. Past that depth,
 // only the single best-scoring move is considered (flat greedy) for the
 // rest of the line, which is what keeps total cost bounded no matter how
@@ -54,7 +54,7 @@ import (
 // rather than an actual truncation; it only starts clipping in unusually
 // open positions, trading some speed for not silently discarding the
 // actual best move the way a tight cap did.
-const endgameBranchWidth = 30
+const endgameBranchWidth = 50
 
 // endgameDepthBudget is how many plies get real branching (mover, their
 // reply, mover again) before falling back to flat greedy for the remainder
