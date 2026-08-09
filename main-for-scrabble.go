@@ -1,19 +1,15 @@
 package main
 
 import (
-	"context"
 	"encoding/json"
 	"fmt"
 	"log"
-	"math"
 	"math/rand"
 	"net/http"
 	"os"
 	"regexp"
-	"runtime/debug"
 	"sort"
 	"strings"
-	"sync"
 	"time"
 
 	"github.com/domino14/word-golib/kwg"
@@ -22,9 +18,6 @@ import (
 	"github.com/domino14/macondo/board"
 	"github.com/domino14/macondo/config"
 	"github.com/domino14/macondo/cross_set"
-	"github.com/domino14/macondo/endgame/negamax"
-	"github.com/domino14/macondo/game"
-	pb "github.com/domino14/macondo/gen/api/proto/macondo"
 	macondomove "github.com/domino14/macondo/move"
 	"github.com/domino14/macondo/movegen"
 )
@@ -166,27 +159,6 @@ type BulkMoveGenResponse struct {
 	IterationDetails []BulkIterationDetail `json:"iterationDetails,omitempty"`
 }
 
-// SolveEndgameRequest asks for the real (negamax-searched) best line to the
-// end of the game, not a heuristic candidate list - only valid once the bag
-// is empty (both racks are then fully known by elimination, which is what
-// makes an exhaustive endgame solve possible at all). No PremiumSquares
-// support (unlike GenerateMovesRequest/BulkMoveGenRequest) - GameRules is
-// built once at startup for this endpoint, not per-request.
-type SolveEndgameRequest struct {
-	Board         [][]string `json:"board"`
-	MoverRack     string     `json:"moverRack"`
-	OpponentRack  string     `json:"opponentRack"`
-	MoverScore    int        `json:"moverScore"`
-	OpponentScore int        `json:"opponentScore"`
-}
-
-type SolveEndgameResponse struct {
-	Moves      []DetailedMove `json:"moves"`      // solved principal variation, mover's move first, alternating
-	Spread     int            `json:"spread"`
-	Plies      int            `json:"plies"`
-	Incomplete bool           `json:"incomplete"` // true if the 10s cap was hit before Solve() finished
-}
-
 type ValidateWordsRequest struct {
 	Words []string `json:"words"`
 }
@@ -206,27 +178,10 @@ type ValidateWordsResponse struct {
 
 // Global state (safe for demo, not for production concurrency)
 var (
-	gd        *kwg.KWG
-	alph      *tilemapping.TileMapping
-	ld        *tilemapping.LetterDistribution
-	cfg       *config.Config
-	gameRules *game.GameRules // used only by /solve-endgame - built once, fixed standard board/NWL23/English
+	gd   *kwg.KWG
+	alph *tilemapping.TileMapping
+	ld   *tilemapping.LetterDistribution
 )
-
-// negamax.Solver reads/writes endgame/negamax.GlobalTranspositionTable - a
-// single package-level table shared by every solve this process ever runs,
-// not scoped per-request. Two /solve-endgame calls in flight at once (a
-// second browser tab, a stale request from a previous "New Game" click that
-// was never aborted, StrictMode edge cases, etc.) would both read and write
-// that same table concurrently, letting one request's stored "best move"
-// get served up for a completely different request's board/rack - exactly
-// what produced the "Trying to convert small move to move did not succeed"
-// panic (a hash-move whose tiles didn't match the position it was being
-// applied to). That panic happens inside a goroutine Solve() spawns
-// internally, which Go's http server can't recover from, so it took down
-// the whole process rather than just that one request. Serializing access
-// here is the fix - one endgame solve at a time, process-wide.
-var endgameSolveMu sync.Mutex
 
 // createCustomBoardLayout creates a board layout from premium square definitions
 // If premiumSquares is nil or empty, returns the default CrosswordGameBoard
@@ -290,33 +245,6 @@ func createCustomBoardLayout(premiumSquares []PremiumSquare) []string {
 }
 
 func main() {
-	// Macondo's negamax transposition table (endgame/negamax/transposition_table.go
-	// Reset()) sizes itself as a fraction of Go's soft memory limit
-	// (runtime/debug.SetMemoryLimit), falling back to github.com/pbnjay/memory's
-	// TotalMemory() - the HOST machine's full RAM, not this container's actual
-	// quota - whenever no soft limit has been set. That fallback caused a single
-	// eager make([]TableEntry, ...) to blow way past Railway's real memory limit
-	// and get the process OOM-killed on every /solve-endgame call.
-	//
-	// The table also has a hard floor of 2**24 entries * 16 bytes = 256 MiB
-	// no matter how small the computed fraction is (Reset()'s own comment:
-	// "anything less and our 5-byte hash proxy won't work") - so on Railway's
-	// 512 MiB plan for this service, the table alone claims half the
-	// container before the lexicon, game state, or search even get a look.
-	// 400 MiB left almost no headroom above that floor, which didn't crash
-	// outright but made the GC thrash (spend nearly all CPU time collecting
-	// to stay under budget) instead of letting the solve make progress -
-	// looks like a hang, not a crash. ~90% of the real 512 MiB ceiling
-	// (leaving margin for non-Go/OS overhead, per Go's own GOMEMLIMIT
-	// guidance) is the most headroom available without exceeding Railway's
-	// actual limit; if the service still crashes or hangs on this plan, the
-	// 256 MiB floor genuinely doesn't fit alongside everything else and the
-	// only remaining lever is bumping this service's Railway memory
-	// allocation, not further tuning here.
-	if debug.SetMemoryLimit(-1) == math.MaxInt64 {
-		debug.SetMemoryLimit(460 << 20) // 460 MiB of Railway's 512 MiB; raise via GOMEMLIMIT if the plan changes.
-	}
-
 	if err := initService(); err != nil {
 		log.Fatalf("Failed to initialize service: %v", err)
 	}
@@ -328,7 +256,6 @@ func main() {
 	http.HandleFunc("/find-subanagrams", findSubanagramsHandler)
 	http.HandleFunc("/find-anagrams", findAnagramsHandler)
 	http.HandleFunc("/bulk-move-gen", bulkMoveGenHandler)
-	http.HandleFunc("/solve-endgame", solveEndgameHandler)
 	http.HandleFunc("/simulate-series", simulateSeriesHandler)
 	http.HandleFunc("/rulesbot-debug", rulesBotDebugHandler)
 	http.HandleFunc("/proxy", proxyHandler)
@@ -343,7 +270,7 @@ func main() {
 
 func initService() error {
 	fmt.Println("=== Initializing Macondo Move Generation Service ===")
-	cfg = config.DefaultConfig()
+	cfg := config.DefaultConfig()
 	cfg.Set("data-path", ".")
 	var err error
 	gd, err = kwg.GetKWG(cfg.WGLConfig(), "NWL23")
@@ -354,10 +281,6 @@ func initService() error {
 	ld, err = tilemapping.EnglishLetterDistribution(cfg.WGLConfig())
 	if err != nil {
 		return fmt.Errorf("failed to load letter distribution: %v", err)
-	}
-	gameRules, err = game.NewBasicGameRules(cfg, "NWL23", board.CrosswordGameLayout, "english", game.CrossScoreAndSet, game.VarClassic)
-	if err != nil {
-		return fmt.Errorf("failed to build game rules: %v", err)
 	}
 	fmt.Println("✓ Loaded lexicon and letter distribution")
 	return nil
@@ -985,18 +908,6 @@ func detailedMoveForExchange(exchangeTiles string) *DetailedMove {
 	}
 }
 
-// detailedMoveForPass builds the client-facing DetailedMove shape for a pass
-// - the only non-word-play a solved endgame sequence can contain (exchanges
-// are never legal once the bag is empty, unlike bulk-move-gen's simulated
-// mid-game turns).
-func detailedMoveForPass() *DetailedMove {
-	return &DetailedMove{
-		Word:      "Pass",
-		Direction: "pass",
-		Tiles:     []MoveTile{},
-	}
-}
-
 func bulkMoveGenHandler(w http.ResponseWriter, r *http.Request) {
 	setCORSHeaders(w, r)
 	if r.Method == http.MethodOptions {
@@ -1203,185 +1114,6 @@ func bulkMoveGenHandler(w http.ResponseWriter, r *http.Request) {
 
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(response)
-}
-
-// solveEndgameHandler runs Macondo's real negamax endgame solver - an exact
-// game-tree search, not a heuristic - and is only valid once the bag is
-// empty (both racks then fully knowable by elimination). Capped at 10s via
-// context; Solve() checks ctx.Err() internally and returns whatever it has
-// found so far rather than erroring on timeout, so a slow/complex position
-// degrades to a partial (or empty) PV with Incomplete:true instead of
-// hanging or failing the request.
-func solveEndgameHandler(w http.ResponseWriter, r *http.Request) {
-	handlerStart := time.Now()
-	log.Printf("solve-endgame: request received")
-	setCORSHeaders(w, r)
-	if r.Method == http.MethodOptions {
-		w.WriteHeader(http.StatusOK)
-		return
-	}
-	if r.Method != http.MethodPost {
-		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
-		return
-	}
-
-	var req SolveEndgameRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		http.Error(w, "Invalid JSON", http.StatusBadRequest)
-		return
-	}
-
-	if req.MoverRack == "" || req.OpponentRack == "" {
-		// An empty opponent rack means they already went out - the game is
-		// already over, not an endgame left to solve.
-		http.Error(w, "Both racks are required", http.StatusBadRequest)
-		return
-	}
-	if len([]rune(req.MoverRack)) > 7 || len([]rune(req.OpponentRack)) > 7 {
-		http.Error(w, "Racks cannot exceed 7 tiles", http.StatusBadRequest)
-		return
-	}
-	if len(req.Board) != 15 {
-		http.Error(w, "Board must have 15 rows", http.StatusBadRequest)
-		return
-	}
-	for i := range req.Board {
-		if len(req.Board[i]) != 15 {
-			http.Error(w, "Each board row must have 15 columns", http.StatusBadRequest)
-			return
-		}
-	}
-
-	boardRows := make([][]tilemapping.MachineLetter, 15)
-	tilesPlayed := 0
-	for row := 0; row < 15; row++ {
-		boardRows[row] = make([]tilemapping.MachineLetter, 15)
-		for col := 0; col < 15; col++ {
-			tile := req.Board[row][col]
-			if tile == "" {
-				continue
-			}
-			if ml, err := alph.Val(tile); err == nil {
-				boardRows[row][col] = ml
-				tilesPlayed++
-			}
-		}
-	}
-
-	// No poolSize field is sent - bag-empty is inferred server-side from the
-	// known 100-tile English set (the only distribution this service loads)
-	// minus what's on the board and in both racks. Blanks count as 1 tile
-	// each via rune length, same as everywhere else in this file.
-	tilesUnaccountedFor := 100 - tilesPlayed - len([]rune(req.MoverRack)) - len([]rune(req.OpponentRack))
-	if tilesUnaccountedFor != 0 {
-		http.Error(w, "Bag is not empty - the endgame solver only applies once every tile is on the board or in a rack", http.StatusBadRequest)
-		return
-	}
-
-	log.Printf("solve-endgame: board validated (tilesPlayed=%d), elapsed=%v", tilesPlayed, time.Since(handlerStart))
-
-	players := []*pb.PlayerInfo{
-		{Nickname: "Mover", RealName: "Mover"},
-		{Nickname: "Opponent", RealName: "Opponent"},
-	}
-	lastKnownRacks := []string{req.MoverRack, req.OpponentRack}
-	scores := []int{req.MoverScore, req.OpponentScore}
-
-	g, err := game.NewFromSnapshot(gameRules, players, lastKnownRacks, scores, boardRows)
-	if err != nil {
-		http.Error(w, "Failed to construct game state: "+err.Error(), http.StatusInternalServerError)
-		return
-	}
-	log.Printf("solve-endgame: game constructed via NewFromSnapshot, elapsed=%v", time.Since(handlerStart))
-
-	// Defensive - cheap and harmless even if NewFromSnapshot already does
-	// this internally.
-	cross_set.GenAllCrossSets(g.Board(), gd, ld)
-	g.Board().UpdateAllAnchors()
-	log.Printf("solve-endgame: cross-sets/anchors regenerated, elapsed=%v", time.Since(handlerStart))
-
-	// Only one solve at a time may touch negamax.GlobalTranspositionTable -
-	// see endgameSolveMu's own comment. This blocks (bounded by the 10s ctx
-	// below, once it exists) rather than rejecting outright, since a second
-	// request arriving mid-solve is expected, not an error condition.
-	log.Printf("solve-endgame: waiting for solver lock, elapsed=%v", time.Since(handlerStart))
-	endgameSolveMu.Lock()
-	defer endgameSolveMu.Unlock()
-	log.Printf("solve-endgame: acquired solver lock, elapsed=%v", time.Since(handlerStart))
-
-	generator := movegen.NewGordonGenerator(gd, g.Board(), ld)
-	solver := &negamax.Solver{}
-	if err := solver.Init(generator, g); err != nil {
-		http.Error(w, "Failed to initialize solver: "+err.Error(), http.StatusInternalServerError)
-		return
-	}
-	log.Printf("solve-endgame: solver initialized, elapsed=%v", time.Since(handlerStart))
-
-	// Transposition table optim stays on (Solver's default) - now that
-	// main() gives the runtime a real soft memory limit, Reset() sizes the
-	// table against that instead of the host's total RAM (see main()'s own
-	// comment). Turning it off entirely (an earlier attempt at fixing the
-	// OOM crash) was the wrong fix - without memoization, negamax without
-	// TT so rarely finishes even 2-3 plies within the 10s cap that the
-	// "best move" returned was really just a 1-ply greedy score-grab,
-	// which is a genuinely worse answer than a real search that's allowed
-	// to actually use its transposition table.
-	ctx, cancel := context.WithTimeout(r.Context(), 10*time.Second)
-	defer cancel()
-
-	// Full-length solve, not a shallow lookahead - determining the correct
-	// move for THIS turn genuinely requires searching to the end of the
-	// game, since an endgame's best move can be one that only pays off
-	// several plies later (a forced sequence a shallow search can't see).
-	// Shortening the search wouldn't make the answer arrive faster AND
-	// stay correct - it would just make it wrong faster. Every ply
-	// consumes at least one tile from one rack, so the combined rack size
-	// is a real upper bound on plies remaining; +2 covers a trailing pass
-	// on either side; capped at 25 to match Macondo's own documented
-	// true-worst-case MaxVariantLength. The client only ever guesses/shows
-	// moves[0] (see EndgamePauseBanner.jsx) - solving deep but displaying
-	// shallow, not solving shallow.
-	moverTiles := len([]rune(req.MoverRack))
-	opponentTiles := len([]rune(req.OpponentRack))
-	plies := moverTiles + opponentTiles + 2
-	if plies > 25 {
-		plies = 25
-	}
-
-	log.Printf("solve-endgame: calling Solve() with plies=%d, elapsed=%v", plies, time.Since(handlerStart))
-	value, pv, solveErr := solver.Solve(ctx, plies)
-	log.Printf("solve-endgame: Solve() returned (moves=%d, ctxErr=%v, solveErr=%v), elapsed=%v", len(pv), ctx.Err(), solveErr, time.Since(handlerStart))
-	incomplete := ctx.Err() != nil
-	if solveErr != nil && len(pv) == 0 {
-		http.Error(w, "Endgame solve failed: "+solveErr.Error(), http.StatusInternalServerError)
-		return
-	}
-
-	// toDetailedMove needs the board as it stood immediately BEFORE each PV
-	// move (for correct play-through-square rendering), so replay the PV
-	// onto a working copy as we go - same pattern bulkMoveGenHandler's own
-	// two-ply path already uses for the identical reason.
-	workingBd := g.Board().Copy()
-	moves := make([]DetailedMove, 0, len(pv))
-	for _, m := range pv {
-		if strings.Contains(m.String(), "play word:") {
-			dm := toDetailedMove(m, workingBd, alph)
-			moves = append(moves, *dm)
-			workingBd.PlayMove(m)
-			cross_set.UpdateCrossSetsForMove(workingBd, m, gd, ld)
-		} else {
-			moves = append(moves, *detailedMoveForPass())
-		}
-	}
-
-	resp := SolveEndgameResponse{
-		Moves:      moves,
-		Spread:     int(value),
-		Plies:      plies,
-		Incomplete: incomplete,
-	}
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(resp)
 }
 
 // toDetailedMove converts a Macondo move into the client-facing renderable shape.
