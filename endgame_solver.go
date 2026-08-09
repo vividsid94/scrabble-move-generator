@@ -44,12 +44,17 @@ import (
 
 // endgameBranchWidth caps how many candidates get real recursive
 // consideration at each of endgameDepthBudget plies - total explored nodes
-// is roughly endgameBranchWidth^endgameDepthBudget (15^3 = 3375), not
+// is roughly endgameBranchWidth^endgameDepthBudget (30^3 = 27000), not
 // exponential in however long the actual endgame runs. Past that depth,
 // only the single best-scoring move is considered (flat greedy) for the
 // rest of the line, which is what keeps total cost bounded no matter how
-// many tiles are left on either rack.
-const endgameBranchWidth = 15
+// many tiles are left on either rack. Set generously on purpose - a real
+// endgame position (small racks, mostly-full board) rarely has anywhere
+// near this many legal moves, so in practice this is "consider everything"
+// rather than an actual truncation; it only starts clipping in unusually
+// open positions, trading some speed for not silently discarding the
+// actual best move the way a tight cap did.
+const endgameBranchWidth = 30
 
 // endgameDepthBudget is how many plies get real branching (mover, their
 // reply, mover again) before falling back to flat greedy for the remainder
@@ -192,10 +197,17 @@ func detailedMoveForPass() *DetailedMove {
 }
 
 // rankEndgameCandidates scores every legal word play for currentRack on bd
-// (score + static leave value - same ranking pickBestCandidate/
-// simulateOneGame already use elsewhere in this service) and returns them
-// sorted best-first. No exchange candidates - the bag is always empty by
-// the time this solver runs, so exchanging is never legal.
+// and returns them sorted best-first, for picking the top endgameBranchWidth
+// to actually recurse on. Deliberately ranked by raw score alone, NOT
+// score+leaveValue the way pickBestCandidate/simulateOneGame rank mid-game
+// candidates - leaveValue estimates how good your remaining tiles are for
+// FUTURE DRAWS FROM THE BAG, which is meaningless once the bag is empty
+// (there's nothing left to draw). Using it here was actively
+// counterproductive: it could rank the actual best endgame move below the
+// branch-width cutoff and get it discarded before the recursion - the part
+// that actually determines a move's real endgame value, by simulating what
+// happens to the rest of the rack - ever got to see it. No exchange
+// candidates either - exchanging is never legal once the bag is empty.
 func rankEndgameCandidates(bd *board.GameBoard, currentRack string) []scoredCandidate {
 	rack := tilemapping.RackFromString(currentRack, alph)
 	generator := movegen.NewGordonGenerator(gd, bd, ld)
@@ -218,8 +230,12 @@ func rankEndgameCandidates(bd *board.GameBoard, currentRack string) []scoredCand
 				}
 			}
 		}
+		// leave is still computed (cheap, and part of the shared
+		// scoredCandidate shape) but deliberately left out of total - see
+		// this function's own comment for why leaveValue doesn't apply once
+		// the bag is empty.
 		leave := sortLeaveString(removeRackFromPool(currentRack, strings.Join(used, "")))
-		total := float64(detailed.Score) + getLeaveValue(leave)
+		total := float64(detailed.Score)
 
 		candidates = append(candidates, scoredCandidate{move: m, detailed: detailed, leave: leave, total: total})
 	}
