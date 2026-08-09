@@ -310,7 +310,7 @@ func initService() error {
 	if err != nil {
 		return fmt.Errorf("failed to load letter distribution: %v", err)
 	}
-	gameRules, err = game.NewBasicGameRules(cfg, "NWL23", board.CrosswordGameLayout, "english", cross_set.CrossScoreAndSet, game.VarClassic)
+	gameRules, err = game.NewBasicGameRules(cfg, "NWL23", board.CrosswordGameLayout, "english", game.CrossScoreAndSet, game.VarClassic)
 	if err != nil {
 		return fmt.Errorf("failed to build game rules: %v", err)
 	}
