@@ -13,6 +13,7 @@ import (
 	"runtime/debug"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/domino14/word-golib/kwg"
@@ -211,6 +212,21 @@ var (
 	cfg       *config.Config
 	gameRules *game.GameRules // used only by /solve-endgame - built once, fixed standard board/NWL23/English
 )
+
+// negamax.Solver reads/writes endgame/negamax.GlobalTranspositionTable - a
+// single package-level table shared by every solve this process ever runs,
+// not scoped per-request. Two /solve-endgame calls in flight at once (a
+// second browser tab, a stale request from a previous "New Game" click that
+// was never aborted, StrictMode edge cases, etc.) would both read and write
+// that same table concurrently, letting one request's stored "best move"
+// get served up for a completely different request's board/rack - exactly
+// what produced the "Trying to convert small move to move did not succeed"
+// panic (a hash-move whose tiles didn't match the position it was being
+// applied to). That panic happens inside a goroutine Solve() spawns
+// internally, which Go's http server can't recover from, so it took down
+// the whole process rather than just that one request. Serializing access
+// here is the fix - one endgame solve at a time, process-wide.
+var endgameSolveMu sync.Mutex
 
 // createCustomBoardLayout creates a board layout from premium square definitions
 // If premiumSquares is nil or empty, returns the default CrosswordGameBoard
@@ -1283,6 +1299,15 @@ func solveEndgameHandler(w http.ResponseWriter, r *http.Request) {
 	cross_set.GenAllCrossSets(g.Board(), gd, ld)
 	g.Board().UpdateAllAnchors()
 	log.Printf("solve-endgame: cross-sets/anchors regenerated, elapsed=%v", time.Since(handlerStart))
+
+	// Only one solve at a time may touch negamax.GlobalTranspositionTable -
+	// see endgameSolveMu's own comment. This blocks (bounded by the 10s ctx
+	// below, once it exists) rather than rejecting outright, since a second
+	// request arriving mid-solve is expected, not an error condition.
+	log.Printf("solve-endgame: waiting for solver lock, elapsed=%v", time.Since(handlerStart))
+	endgameSolveMu.Lock()
+	defer endgameSolveMu.Unlock()
+	log.Printf("solve-endgame: acquired solver lock, elapsed=%v", time.Since(handlerStart))
 
 	generator := movegen.NewGordonGenerator(gd, g.Board(), ld)
 	solver := &negamax.Solver{}
