@@ -1256,13 +1256,32 @@ func solveEndgameHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// The transposition table optim defaults to on, and Solve() sizes it as
+	// a fraction of what github.com/pbnjay/memory reports as "total system
+	// memory" - which reads the HOST machine's RAM, not this container's
+	// actual limit. On Railway that single eager make([]TableEntry, ...)
+	// can dwarf the container's real quota and get OOM-killed before any
+	// search even starts, independent of plies. Our plies are already
+	// small (real racks cap it at 16, not the theoretical 25), so the
+	// search tree doesn't need the memoization to stay fast - just turn it
+	// off rather than fight the host-vs-container memory mismatch.
+	solver.SetTranspositionTableOptim(false)
+
 	ctx, cancel := context.WithTimeout(r.Context(), 10*time.Second)
 	defer cancel()
 
-	// Every ply consumes at least one tile from one rack, so the combined
-	// rack size is a real upper bound on plies remaining - not an arbitrary
-	// small number. +2 covers a trailing pass on either side; capped at 25
-	// to match Macondo's own documented true-worst-case MaxVariantLength.
+	// Full-length solve, not a shallow lookahead - determining the correct
+	// move for THIS turn genuinely requires searching to the end of the
+	// game, since an endgame's best move can be one that only pays off
+	// several plies later (a forced sequence a shallow search can't see).
+	// Shortening the search wouldn't make the answer arrive faster AND
+	// stay correct - it would just make it wrong faster. Every ply
+	// consumes at least one tile from one rack, so the combined rack size
+	// is a real upper bound on plies remaining; +2 covers a trailing pass
+	// on either side; capped at 25 to match Macondo's own documented
+	// true-worst-case MaxVariantLength. The client only ever guesses/shows
+	// moves[0] (see EndgamePauseBanner.jsx) - solving deep but displaying
+	// shallow, not solving shallow.
 	moverTiles := len([]rune(req.MoverRack))
 	opponentTiles := len([]rune(req.OpponentRack))
 	plies := moverTiles + opponentTiles + 2
