@@ -76,6 +76,22 @@ type SolveEndgameResponse struct {
 	Incomplete bool           `json:"incomplete"`
 }
 
+// The two line shapes streamed on /solve-endgame's response - see
+// solveEndgameHandler's own comment on why this is a stream, not a single
+// JSON blob. Embedding SolveEndgameResponse in the result line keeps its
+// fields exactly what the frontend already expected from the old
+// single-response shape, just with "type":"result" alongside them.
+type solveEndgameProgressLine struct {
+	Type    string `json:"type"`
+	Current int    `json:"current"`
+	Total   int    `json:"total"`
+}
+
+type solveEndgameResultLine struct {
+	Type string `json:"type"`
+	SolveEndgameResponse
+}
+
 // endgameLineEntry is one turn in a solved line - move is nil for a pass.
 // player is 1 for the mover (the player this solver is finding the best
 // move for) or 2 for the opponent, regardless of the app's own global
@@ -156,12 +172,42 @@ func solveEndgameHandler(w http.ResponseWriter, r *http.Request) {
 	// Bounded by design (depth x branch width), not by racing this clock -
 	// this is a safety net, not the primary mechanism. A blown deadline
 	// mid-search just forces flat greedy for whatever's left rather than
-	// erroring out.
-	ctx, cancel := context.WithTimeout(r.Context(), 10*time.Second)
+	// erroring out. 30s (not 10s) gives real headroom to tell "the search
+	// is genuinely still running and will finish" apart from "it's actually
+	// stuck" while testing/tuning endgameBranchWidth - the bounded design
+	// means a healthy solve essentially never needs this long, so raising
+	// it doesn't change typical latency, just the safety margin.
+	ctx, cancel := context.WithTimeout(r.Context(), 30*time.Second)
 	defer cancel()
 
+	// Streamed as newline-delimited JSON rather than one final blob -
+	// {"type":"progress",...} lines as each top-level candidate (the move
+	// actually being solved for) finishes, then one {"type":"result",...}
+	// line with the real SolveEndgameResponse fields. This is what makes a
+	// REAL progress bar possible client-side - the frontend has no way to
+	// know how far along an opaque server-side search is without the
+	// server actually telling it as it goes, and a single buffered
+	// request/response can't do that. Root-level progress specifically
+	// (not per-node) - each of the root's endgameBranchWidth candidates
+	// triggers a roughly similarly-sized subtree, so "candidate N of M
+	// explored" is a reasonable, cheap-to-compute proxy for overall
+	// progress without needing to know the exact total node count up
+	// front.
+	w.Header().Set("Content-Type", "application/x-ndjson")
+	flusher, canFlush := w.(http.Flusher)
+	encoder := json.NewEncoder(w)
+	writeLine := func(v any) {
+		encoder.Encode(v) // Encode already appends its own trailing newline
+		if canFlush {
+			flusher.Flush()
+		}
+	}
+	onProgress := func(current, total int) {
+		writeLine(solveEndgameProgressLine{Type: "progress", Current: current, Total: total})
+	}
+
 	line, finalMoverScore, finalOpponentScore := endgameSearch(
-		ctx, bd, req.MoverRack, req.OpponentRack, req.MoverScore, req.OpponentScore, 1, 0, endgameDepthBudget)
+		ctx, bd, req.MoverRack, req.OpponentRack, req.MoverScore, req.OpponentScore, 1, 0, endgameDepthBudget, onProgress)
 	incomplete := ctx.Err() != nil
 
 	// Replay the line onto a working board copy to convert each entry to
@@ -181,15 +227,15 @@ func solveEndgameHandler(w http.ResponseWriter, r *http.Request) {
 		cross_set.UpdateCrossSetsForMove(workingBd, entry.move, gd, ld)
 	}
 
-	response := SolveEndgameResponse{
-		Moves:      moves,
-		Spread:     finalMoverScore - finalOpponentScore,
-		Plies:      len(moves),
-		Incomplete: incomplete,
-	}
-
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(response)
+	writeLine(solveEndgameResultLine{
+		Type: "result",
+		SolveEndgameResponse: SolveEndgameResponse{
+			Moves:      moves,
+			Spread:     finalMoverScore - finalOpponentScore,
+			Plies:      len(moves),
+			Incomplete: incomplete,
+		},
+	})
 }
 
 func detailedMoveForPass() *DetailedMove {
@@ -259,7 +305,16 @@ func rankEndgameCandidates(bd *board.GameBoard, currentRack string) []scoredCand
 // rack becomes empty is via the move just played in the PARENT call, which
 // is checked immediately (see below) rather than by recursing into an
 // already-ended position.
-func endgameSearch(ctx context.Context, bd *board.GameBoard, moverRack, opponentRack string, moverScore, opponentScore, onTurn, consecutiveScoreless, depthBudget int) ([]endgameLineEntry, int, int) {
+//
+// onProgress, if non-nil, is called once per candidate explored at THIS
+// call only - every recursive call this function makes always passes nil
+// onward, regardless of depth, so in practice only the root call (the one
+// solveEndgameHandler makes directly) ever reports progress. Reporting from
+// every nested node would mean thousands of tiny, expensive-to-flush writes
+// for no real benefit; each of the root's candidates triggers a roughly
+// similarly-sized subtree, so root-level "candidate N of M" is already a
+// reasonable proxy for overall progress.
+func endgameSearch(ctx context.Context, bd *board.GameBoard, moverRack, opponentRack string, moverScore, opponentScore, onTurn, consecutiveScoreless, depthBudget int, onProgress func(current, total int)) ([]endgameLineEntry, int, int) {
 	// A blown deadline forces flat greedy for the rest of the line rather
 	// than aborting outright - always a complete, valid answer, just
 	// possibly lower-quality past this point. See solveEndgameHandler's
@@ -300,7 +355,7 @@ func endgameSearch(ctx context.Context, bd *board.GameBoard, moverRack, opponent
 		if childDepth < 0 {
 			childDepth = 0
 		}
-		restLine, fs1, fs2 := endgameSearch(ctx, bd, moverRack, opponentRack, moverScore, opponentScore, 3-onTurn, newConsecutive, childDepth)
+		restLine, fs1, fs2 := endgameSearch(ctx, bd, moverRack, opponentRack, moverScore, opponentScore, 3-onTurn, newConsecutive, childDepth, nil)
 		return append([]endgameLineEntry{entry}, restLine...), fs1, fs2
 	}
 
@@ -310,6 +365,10 @@ func endgameSearch(ctx context.Context, bd *board.GameBoard, moverRack, opponent
 	haveBest := false
 
 	for i := 0; i < branchWidth; i++ {
+		if onProgress != nil {
+			onProgress(i+1, branchWidth)
+		}
+
 		cand := candidates[i]
 
 		childBd := bd.Copy()
@@ -353,7 +412,7 @@ func endgameSearch(ctx context.Context, bd *board.GameBoard, moverRack, opponent
 				childDepth = 0
 			}
 			restLine, restFs1, restFs2 := endgameSearch(
-				ctx, childBd, newMoverRack, newOpponentRack, newMoverScore, newOpponentScore, 3-onTurn, 0, childDepth)
+				ctx, childBd, newMoverRack, newOpponentRack, newMoverScore, newOpponentScore, 3-onTurn, 0, childDepth, nil)
 			line = append([]endgameLineEntry{entry}, restLine...)
 			fs1, fs2 = restFs1, restFs2
 		}
