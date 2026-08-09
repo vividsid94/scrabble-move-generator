@@ -5,10 +5,12 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
+	"math"
 	"math/rand"
 	"net/http"
 	"os"
 	"regexp"
+	"runtime/debug"
 	"sort"
 	"strings"
 	"time"
@@ -272,6 +274,20 @@ func createCustomBoardLayout(premiumSquares []PremiumSquare) []string {
 }
 
 func main() {
+	// Macondo's negamax transposition table (endgame/negamax/transposition_table.go
+	// Reset()) sizes itself as a fraction of Go's soft memory limit
+	// (runtime/debug.SetMemoryLimit), falling back to github.com/pbnjay/memory's
+	// TotalMemory() - the HOST machine's full RAM, not this container's actual
+	// quota - whenever no soft limit has been set. That fallback caused a single
+	// eager make([]TableEntry, ...) to blow way past Railway's real memory limit
+	// and get the process OOM-killed on every /solve-endgame call. Give the
+	// runtime a real, container-safe ceiling up front (unless one's already been
+	// supplied via the GOMEMLIMIT env var) so the transposition table sizes
+	// itself sanely instead.
+	if debug.SetMemoryLimit(-1) == math.MaxInt64 {
+		debug.SetMemoryLimit(400 << 20) // 400 MiB; raise via GOMEMLIMIT if Railway's plan allows more.
+	}
+
 	if err := initService(); err != nil {
 		log.Fatalf("Failed to initialize service: %v", err)
 	}
@@ -1256,17 +1272,15 @@ func solveEndgameHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// The transposition table optim defaults to on, and Solve() sizes it as
-	// a fraction of what github.com/pbnjay/memory reports as "total system
-	// memory" - which reads the HOST machine's RAM, not this container's
-	// actual limit. On Railway that single eager make([]TableEntry, ...)
-	// can dwarf the container's real quota and get OOM-killed before any
-	// search even starts, independent of plies. Our plies are already
-	// small (real racks cap it at 16, not the theoretical 25), so the
-	// search tree doesn't need the memoization to stay fast - just turn it
-	// off rather than fight the host-vs-container memory mismatch.
-	solver.SetTranspositionTableOptim(false)
-
+	// Transposition table optim stays on (Solver's default) - now that
+	// main() gives the runtime a real soft memory limit, Reset() sizes the
+	// table against that instead of the host's total RAM (see main()'s own
+	// comment). Turning it off entirely (an earlier attempt at fixing the
+	// OOM crash) was the wrong fix - without memoization, negamax without
+	// TT so rarely finishes even 2-3 plies within the 10s cap that the
+	// "best move" returned was really just a 1-ply greedy score-grab,
+	// which is a genuinely worse answer than a real search that's allowed
+	// to actually use its transposition table.
 	ctx, cancel := context.WithTimeout(r.Context(), 10*time.Second)
 	defer cancel()
 
