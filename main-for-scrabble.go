@@ -56,6 +56,15 @@ type GenerateMovesRequest struct {
 	PremiumSquares []PremiumSquare `json:"premiumSquares,omitempty"` // Optional custom premium squares
 	TopN          int             `json:"topN,omitempty"`
 	PoolSize      int             `json:"poolSize,omitempty"` // Tiles remaining in the bag; exchange candidates are only generated when this is >= 7
+	// PauseMode, when set, asks this endpoint to also compute Puzzle Mode's
+	// own "should we pause here" decision (see decideGeneratePauseReason) in
+	// this same request/response round-trip, rather than that decision
+	// happening as a separate step against the frontend's own local state
+	// afterward. Omitted entirely by every other caller (Play mode's bot
+	// move, Endgame mode, "ask for best moves") - PauseReason then stays
+	// unset too, so their response shape is byte-identical to before this
+	// field existed.
+	PauseMode string `json:"pauseMode,omitempty"`
 }
 
 // Move is a single ranked candidate: a word play, or (when IsExchange is
@@ -78,6 +87,10 @@ type Move struct {
 type GenerateMovesResponse struct {
 	Moves []Move `json:"moves"`
 	Total int    `json:"total"`
+	// PauseReason is only ever set when the request included PauseMode -
+	// see decideGeneratePauseReason. omitempty keeps every other caller's
+	// response identical to before this field existed.
+	PauseReason string `json:"pauseReason,omitempty"`
 }
 
 type ValidateWordRequest struct {
@@ -300,6 +313,68 @@ func healthHandler(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+// isBingoWord mirrors moveHistoryFunctions.js's isBingoMove exactly - a
+// bingo is defined by how many NEW (rack) tiles a play uses, not the
+// resulting word's length, so a play that hooks through an existing letter
+// (e.g. an 8-letter word made from 7 new tiles) still counts.
+func isBingoWord(m Move) bool {
+	if m.IsExchange {
+		return false
+	}
+	newTiles := 0
+	for _, t := range m.Tiles {
+		if t.IsNew {
+			newTiles++
+		}
+	}
+	return newTiles == 7
+}
+
+func combinedMoveValue(m Move) float64 {
+	return float64(m.Score) + m.LeaveValue
+}
+
+// decideGeneratePauseReason ports puzzleFunctions.js's decidePauseReason
+// exactly (same four pauseMode values, same >=10 significant-gap
+// threshold), moved server-side so Puzzle Mode's "should we pause here"
+// decision happens in the SAME request/response round-trip as the
+// candidate list itself, rather than as a separate step the frontend used
+// to perform afterward against its own local state. moves must already be
+// sorted best-first (generateMovesHandler's own ranked/responseMoves
+// already are) - moves[0] is trusted as "the best move" without
+// re-sorting, same convention the original frontend version relied on.
+func decideGeneratePauseReason(moves []Move, pauseMode string) string {
+	if pauseMode == "" || len(moves) == 0 {
+		return ""
+	}
+	best := moves[0]
+	if best.IsExchange {
+		return ""
+	}
+
+	isBestBingo := isBingoWord(best)
+	otherBingo := false
+	for _, m := range moves[1:] {
+		if isBingoWord(m) {
+			otherBingo = true
+			break
+		}
+	}
+	hasSignificantGap := len(moves) > 1 && (combinedMoveValue(best)-combinedMoveValue(moves[1])) >= 10
+
+	switch {
+	case pauseMode == "bingo" && isBestBingo:
+		return "bingo"
+	case pauseMode == "only-bingo" && isBestBingo && !otherBingo:
+		return "only-bingo"
+	case pauseMode == "significant-best" && hasSignificantGap:
+		return "significant-best"
+	case pauseMode == "non-bingo-significant" && hasSignificantGap && !isBestBingo:
+		return "non-bingo-significant"
+	}
+	return ""
+}
+
 func generateMovesHandler(w http.ResponseWriter, r *http.Request) {
 	setCORSHeaders(w, r)
 	if r.Method == http.MethodOptions {
@@ -463,8 +538,9 @@ func generateMovesHandler(w http.ResponseWriter, r *http.Request) {
 		})
 	}
 	resp := GenerateMovesResponse{
-		Moves: responseMoves,
-		Total: len(moves),
+		Moves:       responseMoves,
+		Total:       len(moves),
+		PauseReason: decideGeneratePauseReason(responseMoves, req.PauseMode),
 	}
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(resp)
