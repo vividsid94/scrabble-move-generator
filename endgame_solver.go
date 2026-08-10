@@ -31,8 +31,10 @@ import (
 	"context"
 	"encoding/json"
 	"net/http"
+	"runtime"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/domino14/macondo/board"
@@ -325,6 +327,62 @@ func rankEndgameCandidates(bd *board.GameBoard, currentRack, otherRack string) [
 // for no real benefit; each of the root's candidates triggers a roughly
 // similarly-sized subtree, so root-level "candidate N of M" is already a
 // reasonable proxy for overall progress.
+//
+// evalEndgameCandidate plays cand onto a fresh copy of bd and either ends
+// the game immediately (it emptied a rack) or recurses one ply further -
+// the per-candidate work endgameSearch's own toExplore loop always did
+// inline. Extracted so the sequential path (every recursive call) and the
+// root's parallel worker pool below share one implementation instead of
+// two copies that could quietly drift apart. childBd is only ever touched
+// by the goroutine that owns this one candidate (bd.Copy() makes it so),
+// and gd/ld/alph are read-only package globals after startup - the same
+// safety property simulateSeriesHandler's own worker pool (simulate.go)
+// already relies on for concurrent per-game board copies.
+func evalEndgameCandidate(ctx context.Context, bd *board.GameBoard, moverRack, opponentRack string, moverScore, opponentScore, onTurn, depthBudget int, cand scoredCandidate) ([]endgameLineEntry, int, int) {
+	childBd := bd.Copy()
+	childBd.PlayMove(cand.move)
+	cross_set.UpdateCrossSetsForMove(childBd, cand.move, gd, ld)
+
+	var used []string
+	for _, t := range cand.detailed.Tiles {
+		if t.IsNew {
+			if t.IsBlank {
+				used = append(used, "?")
+			} else {
+				used = append(used, t.Letter)
+			}
+		}
+	}
+	usedStr := strings.Join(used, "")
+
+	newMoverRack, newOpponentRack := moverRack, opponentRack
+	newMoverScore, newOpponentScore := moverScore, opponentScore
+	if onTurn == 1 {
+		newMoverRack = removeRackFromPool(moverRack, usedStr)
+		newMoverScore = moverScore + cand.detailed.Score
+	} else {
+		newOpponentRack = removeRackFromPool(opponentRack, usedStr)
+		newOpponentScore = opponentScore + cand.detailed.Score
+	}
+
+	entry := endgameLineEntry{player: onTurn, move: cand.move}
+
+	if newMoverRack == "" || newOpponentRack == "" {
+		// Whoever just moved went out - game over immediately, no more
+		// recursion needed.
+		fs1, fs2 := applyEmptiedAdjustment(newMoverScore, newOpponentScore, newMoverRack, newOpponentRack)
+		return []endgameLineEntry{entry}, fs1, fs2
+	}
+
+	childDepth := depthBudget - 1
+	if childDepth < 0 {
+		childDepth = 0
+	}
+	restLine, fs1, fs2 := endgameSearch(
+		ctx, childBd, newMoverRack, newOpponentRack, newMoverScore, newOpponentScore, 3-onTurn, 0, childDepth, nil)
+	return append([]endgameLineEntry{entry}, restLine...), fs1, fs2
+}
+
 func endgameSearch(ctx context.Context, bd *board.GameBoard, moverRack, opponentRack string, moverScore, opponentScore, onTurn, consecutiveScoreless, depthBudget int, onProgress func(current, total int)) ([]endgameLineEntry, int, int) {
 	// A blown deadline forces flat greedy for the rest of the line rather
 	// than aborting outright - always a complete, valid answer, just
@@ -396,55 +454,85 @@ func endgameSearch(ctx context.Context, bd *board.GameBoard, moverRack, opponent
 	var bestMoverScore, bestOpponentScore int
 	haveBest := false
 
-	for i, cand := range toExplore {
-		childBd := bd.Copy()
-		childBd.PlayMove(cand.move)
-		cross_set.UpdateCrossSetsForMove(childBd, cand.move, gd, ld)
-
-		var used []string
-		for _, t := range cand.detailed.Tiles {
-			if t.IsNew {
-				if t.IsBlank {
-					used = append(used, "?")
-				} else {
-					used = append(used, t.Letter)
-				}
-			}
-		}
-		usedStr := strings.Join(used, "")
-
-		newMoverRack, newOpponentRack := moverRack, opponentRack
-		newMoverScore, newOpponentScore := moverScore, opponentScore
-		if onTurn == 1 {
-			newMoverRack = removeRackFromPool(moverRack, usedStr)
-			newMoverScore = moverScore + cand.detailed.Score
-		} else {
-			newOpponentRack = removeRackFromPool(opponentRack, usedStr)
-			newOpponentScore = opponentScore + cand.detailed.Score
-		}
-
-		entry := endgameLineEntry{player: onTurn, move: cand.move}
-
-		var line []endgameLineEntry
-		var fs1, fs2 int
-		if newMoverRack == "" || newOpponentRack == "" {
-			// Whoever just moved went out - game over immediately, no more
-			// recursion needed.
-			fs1, fs2 = applyEmptiedAdjustment(newMoverScore, newOpponentScore, newMoverRack, newOpponentRack)
-			line = []endgameLineEntry{entry}
-		} else {
-			childDepth := depthBudget - 1
-			if childDepth < 0 {
-				childDepth = 0
-			}
-			restLine, restFs1, restFs2 := endgameSearch(
-				ctx, childBd, newMoverRack, newOpponentRack, newMoverScore, newOpponentScore, 3-onTurn, 0, childDepth, nil)
-			line = append([]endgameLineEntry{entry}, restLine...)
-			fs1, fs2 = restFs1, restFs2
-		}
-
+	// betterThanBest applies endgameSearch's own maximize/minimize rule -
+	// factored out so both the sequential path below and the parallel
+	// root's own reduction pass (after wg.Wait()) apply the exact same
+	// comparison, in the exact same left-to-right order over toExplore, so
+	// tie-breaking (first candidate at a given spread wins) stays identical
+	// regardless of which path ran.
+	betterThanBest := func(fs1, fs2 int) bool {
 		spread := fs1 - fs2
-		if !haveBest || (isMaximizing && spread > bestMoverScore-bestOpponentScore) || (!isMaximizing && spread < bestMoverScore-bestOpponentScore) {
+		return !haveBest || (isMaximizing && spread > bestMoverScore-bestOpponentScore) || (!isMaximizing && spread < bestMoverScore-bestOpponentScore)
+	}
+
+	// onProgress is non-nil only on the root call (see this function's own
+	// comment above) - every recursive call passes nil, so only THIS loop,
+	// for THIS position's candidates, ever runs concurrently. Parallelizing
+	// every depth instead (recursively) would multiply goroutine count by
+	// endgameBranchWidth at each level for no real benefit - one bounded
+	// pool at the root is already enough work to fill however many cores
+	// the deployment actually has.
+	if onProgress != nil && len(toExplore) > 1 {
+		type candResult struct {
+			line     []endgameLineEntry
+			fs1, fs2 int
+		}
+		results := make([]candResult, len(toExplore))
+
+		numWorkers := runtime.GOMAXPROCS(0)
+		if numWorkers > len(toExplore) {
+			numWorkers = len(toExplore)
+		}
+
+		jobs := make(chan int, len(toExplore))
+		for i := range toExplore {
+			jobs <- i
+		}
+		close(jobs)
+
+		// onProgress itself isn't safe to call from multiple goroutines
+		// (solveEndgameHandler's version writes straight to the shared
+		// http.ResponseWriter) - guarded here rather than pushing that
+		// requirement onto every current and future caller.
+		var progressMu sync.Mutex
+		completed := 0
+
+		var wg sync.WaitGroup
+		for range numWorkers {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				for i := range jobs {
+					line, fs1, fs2 := evalEndgameCandidate(ctx, bd, moverRack, opponentRack, moverScore, opponentScore, onTurn, depthBudget, toExplore[i])
+					results[i] = candResult{line: line, fs1: fs1, fs2: fs2}
+
+					progressMu.Lock()
+					completed++
+					onProgress(completed, len(toExplore))
+					progressMu.Unlock()
+				}
+			}()
+		}
+		wg.Wait()
+
+		// Single-threaded reduction, in original toExplore order - not done
+		// racily inside each goroutine above, so this is the exact same
+		// left-to-right comparison (and tie-break) the sequential path
+		// below performs, just deferred until every candidate is in.
+		for _, r := range results {
+			if betterThanBest(r.fs1, r.fs2) {
+				haveBest = true
+				bestLine = r.line
+				bestMoverScore, bestOpponentScore = r.fs1, r.fs2
+			}
+		}
+		return bestLine, bestMoverScore, bestOpponentScore
+	}
+
+	for i, cand := range toExplore {
+		line, fs1, fs2 := evalEndgameCandidate(ctx, bd, moverRack, opponentRack, moverScore, opponentScore, onTurn, depthBudget, cand)
+
+		if betterThanBest(fs1, fs2) {
 			haveBest = true
 			bestLine = line
 			bestMoverScore, bestOpponentScore = fs1, fs2
