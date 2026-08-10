@@ -30,6 +30,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"math/rand"
 	"net/http"
 	"runtime"
 	"sort"
@@ -46,7 +47,7 @@ import (
 
 // endgameBranchWidth caps how many candidates get real recursive
 // consideration at each of endgameDepthBudget plies - total explored nodes
-// is roughly endgameBranchWidth^endgameDepthBudget (50^3 = 125000), not
+// is roughly endgameBranchWidth^endgameDepthBudget (75^3 = 421875), not
 // exponential in however long the actual endgame runs. Past that depth,
 // only the single best-scoring move is considered (flat greedy) for the
 // rest of the line, which is what keeps total cost bounded no matter how
@@ -55,8 +56,13 @@ import (
 // near this many legal moves, so in practice this is "consider everything"
 // rather than an actual truncation; it only starts clipping in unusually
 // open positions, trading some speed for not silently discarding the
-// actual best move the way a tight cap did.
-const endgameBranchWidth = 50
+// actual best move the way a tight cap did. Raised from 50 - the root's
+// candidate loop now runs through a bounded worker pool (see
+// endgameSearch's own comment), which bought a little headroom, though
+// confirmed NOT a lot on this deployment's real core count - push this
+// higher only after confirming the 30s timeout still has margin, since
+// cost scales as the cube of this value.
+const endgameBranchWidth = 75
 
 // endgameDepthBudget is how many plies get real branching (mover, their
 // reply, mover again) before falling back to flat greedy for the remainder
@@ -484,8 +490,21 @@ func endgameSearch(ctx context.Context, bd *board.GameBoard, moverRack, opponent
 			numWorkers = len(toExplore)
 		}
 
+		// Dispatched in shuffled order, not toExplore's original score-sorted
+		// order - job order has zero effect on correctness (results[] is
+		// always written to each candidate's ORIGINAL index below, and the
+		// final reduction always walks results in that same original order,
+		// same as the sequential path), but score-sorted order does appear
+		// to correlate with subtree cost (higher-scoring/more aggressive
+		// moves plausibly open up bigger follow-up positions), which left
+		// the small worker pool grinding through several expensive
+		// candidates at once early on, then flying through a long tail of
+		// cheap ones - progress looked "stuck" then jumped. Shuffling
+		// spreads expensive and cheap candidates evenly across the
+		// timeline instead.
+		order := rand.Perm(len(toExplore))
 		jobs := make(chan int, len(toExplore))
-		for i := range toExplore {
+		for _, i := range order {
 			jobs <- i
 		}
 		close(jobs)
