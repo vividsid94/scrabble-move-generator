@@ -397,10 +397,6 @@ func endgameSearch(ctx context.Context, bd *board.GameBoard, moverRack, opponent
 	haveBest := false
 
 	for i, cand := range toExplore {
-		if onProgress != nil {
-			onProgress(i+1, len(toExplore))
-		}
-
 		childBd := bd.Copy()
 		childBd.PlayMove(cand.move)
 		cross_set.UpdateCrossSetsForMove(childBd, cand.move, gd, ld)
@@ -452,6 +448,16 @@ func endgameSearch(ctx context.Context, bd *board.GameBoard, moverRack, opponent
 			haveBest = true
 			bestLine = line
 			bestMoverScore, bestOpponentScore = fs1, fs2
+		}
+
+		// Reported AFTER this candidate's whole subtree is actually
+		// evaluated, not before it starts - firing "N of Total" up front
+		// would hit 100% the instant the LAST candidate begins exploring,
+		// well before that exploration (a full nested search, not
+		// instantaneous) is actually done, misleadingly showing a
+		// "finished" bar while the request is still genuinely running.
+		if onProgress != nil {
+			onProgress(i+1, len(toExplore))
 		}
 	}
 
