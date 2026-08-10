@@ -244,20 +244,28 @@ func detailedMoveForPass() *DetailedMove {
 
 // rankEndgameCandidates scores every legal word play for currentRack on bd
 // and returns them sorted best-first, for picking the top endgameBranchWidth
-// to actually recurse on. Deliberately ranked by raw score alone, NOT
+// to actually recurse on. Deliberately ranked by raw score alone (NOT
 // score+leaveValue the way pickBestCandidate/simulateOneGame rank mid-game
 // candidates - leaveValue estimates how good your remaining tiles are for
-// FUTURE DRAWS FROM THE BAG, which is meaningless once the bag is empty
-// (there's nothing left to draw). Using it here was actively
-// counterproductive: it could rank the actual best endgame move below the
-// branch-width cutoff and get it discarded before the recursion - the part
-// that actually determines a move's real endgame value, by simulating what
-// happens to the rest of the rack - ever got to see it. No exchange
-// candidates either - exchanging is never legal once the bag is empty.
-func rankEndgameCandidates(bd *board.GameBoard, currentRack string) []scoredCandidate {
+// FUTURE DRAWS FROM THE BAG, which is meaningless once the bag is empty),
+// PLUS an exact outplay bonus: a move that empties currentRack ends the
+// game immediately and is worth its score plus 2x otherRack's value (same
+// "emptied" rule applyEmptiedAdjustment uses below) - not a fuzzy estimate,
+// since both racks are fully known in an endgame. This bonus alone isn't a
+// hard guarantee, though - when otherRack (the bonus's basis) happens to be
+// small, a low-immediate-score outplay can still rank below
+// endgameBranchWidth other, merely higher-scoring candidates; endgameSearch
+// itself adds a second, unconditional guarantee on top of this ranking
+// (see its own comment) for exactly that reason - together they're what
+// stops a real game-ending reply from silently never reaching the
+// recursion at all. No exchange candidates either - exchanging is never
+// legal once the bag is empty.
+func rankEndgameCandidates(bd *board.GameBoard, currentRack, otherRack string) []scoredCandidate {
 	rack := tilemapping.RackFromString(currentRack, alph)
 	generator := movegen.NewGordonGenerator(gd, bd, ld)
 	rawMoves := generator.GenAll(rack, false)
+
+	otherRackValue := rackPointValue(otherRack)
 
 	candidates := make([]scoredCandidate, 0, len(rawMoves))
 	for _, m := range rawMoves {
@@ -277,11 +285,14 @@ func rankEndgameCandidates(bd *board.GameBoard, currentRack string) []scoredCand
 			}
 		}
 		// leave is still computed (cheap, and part of the shared
-		// scoredCandidate shape) but deliberately left out of total - see
-		// this function's own comment for why leaveValue doesn't apply once
-		// the bag is empty.
+		// scoredCandidate shape) but deliberately left out of total beyond
+		// the outplay check below - see this function's own comment for why
+		// leaveValue doesn't apply once the bag is empty.
 		leave := sortLeaveString(removeRackFromPool(currentRack, strings.Join(used, "")))
 		total := float64(detailed.Score)
+		if leave == "" {
+			total += float64(otherRackValue) * 2
+		}
 
 		candidates = append(candidates, scoredCandidate{move: m, detailed: detailed, leave: leave, total: total})
 	}
@@ -329,10 +340,12 @@ func endgameSearch(ctx context.Context, bd *board.GameBoard, moverRack, opponent
 	}
 
 	currentRack := moverRack
+	otherRack := opponentRack
 	if onTurn == 2 {
 		currentRack = opponentRack
+		otherRack = moverRack
 	}
-	candidates := rankEndgameCandidates(bd, currentRack)
+	candidates := rankEndgameCandidates(bd, currentRack, otherRack)
 
 	branchWidth := 1
 	if depthBudget > 0 {
@@ -359,17 +372,34 @@ func endgameSearch(ctx context.Context, bd *board.GameBoard, moverRack, opponent
 		return append([]endgameLineEntry{entry}, restLine...), fs1, fs2
 	}
 
+	// toExplore is the score-ranked top branchWidth slice, PLUS any outplay
+	// candidate (empties currentRack, ending the game right now) that
+	// didn't already make that cut. The additive outplay bonus in
+	// rankEndgameCandidates helps but isn't a hard guarantee - when the
+	// OTHER player's remaining rack (the bonus's basis) happens to be
+	// small, a real game-ending reply can still rank below branchWidth
+	// other, merely higher-scoring options and never reach the recursion
+	// at all. Copied into a fresh slice rather than appended onto
+	// candidates[:branchWidth] directly, which would alias the same
+	// backing array as the candidates[branchWidth:] loop below and
+	// silently corrupt it mid-iteration.
+	toExplore := make([]scoredCandidate, 0, branchWidth+1)
+	toExplore = append(toExplore, candidates[:branchWidth]...)
+	for i := branchWidth; i < len(candidates); i++ {
+		if candidates[i].leave == "" {
+			toExplore = append(toExplore, candidates[i])
+		}
+	}
+
 	isMaximizing := onTurn == 1
 	var bestLine []endgameLineEntry
 	var bestMoverScore, bestOpponentScore int
 	haveBest := false
 
-	for i := 0; i < branchWidth; i++ {
+	for i, cand := range toExplore {
 		if onProgress != nil {
-			onProgress(i+1, branchWidth)
+			onProgress(i+1, len(toExplore))
 		}
-
-		cand := candidates[i]
 
 		childBd := bd.Copy()
 		childBd.PlayMove(cand.move)
