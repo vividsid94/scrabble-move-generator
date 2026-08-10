@@ -142,6 +142,11 @@ type DetailedMove struct {
 	StartPosition string     `json:"startPosition"`
 	Tiles         []MoveTile `json:"tiles"`
 	IsExchange    bool       `json:"isExchange,omitempty"`
+	// IsOutplay is only ever set by /solve-endgame (endgame_solver.go) -
+	// true for the one move in a solved line that empties its player's
+	// rack and ends the game right then. omitempty keeps every other
+	// endpoint's response byte-identical to before this field existed.
+	IsOutplay bool `json:"isOutplay,omitempty"`
 }
 
 type BulkIterationDetail struct {

@@ -109,6 +109,12 @@ type solveEndgameResultLine struct {
 type endgameLineEntry struct {
 	player int
 	move   *macondomove.Move
+	// isOutplay is true only for the entry that actually empties its
+	// player's rack (set in evalEndgameCandidate, exactly where that's
+	// already checked to decide whether to end the line right there) -
+	// propagated onto DetailedMove.IsOutplay in solveEndgameHandler's own
+	// replay loop below.
+	isOutplay bool
 }
 
 func solveEndgameHandler(w http.ResponseWriter, r *http.Request) {
@@ -230,6 +236,7 @@ func solveEndgameHandler(w http.ResponseWriter, r *http.Request) {
 			continue
 		}
 		detailed := toDetailedMove(entry.move, workingBd, alph)
+		detailed.IsOutplay = entry.isOutplay
 		moves = append(moves, *detailed)
 		workingBd.PlayMove(entry.move)
 		cross_set.UpdateCrossSetsForMove(workingBd, entry.move, gd, ld)
@@ -376,6 +383,7 @@ func evalEndgameCandidate(ctx context.Context, bd *board.GameBoard, moverRack, o
 	if newMoverRack == "" || newOpponentRack == "" {
 		// Whoever just moved went out - game over immediately, no more
 		// recursion needed.
+		entry.isOutplay = true
 		fs1, fs2 := applyEmptiedAdjustment(newMoverScore, newOpponentScore, newMoverRack, newOpponentRack)
 		return []endgameLineEntry{entry}, fs1, fs2
 	}
