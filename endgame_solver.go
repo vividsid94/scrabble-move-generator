@@ -30,12 +30,9 @@ package main
 import (
 	"context"
 	"encoding/json"
-	"math/rand"
 	"net/http"
-	"runtime"
 	"sort"
 	"strings"
-	"sync"
 	"time"
 
 	"github.com/domino14/macondo/board"
@@ -47,7 +44,7 @@ import (
 
 // endgameBranchWidth caps how many candidates get real recursive
 // consideration at each of endgameDepthBudget plies - total explored nodes
-// is roughly endgameBranchWidth^endgameDepthBudget (75^3 = 421875), not
+// is roughly endgameBranchWidth^endgameDepthBudget (50^3 = 125000), not
 // exponential in however long the actual endgame runs. Past that depth,
 // only the single best-scoring move is considered (flat greedy) for the
 // rest of the line, which is what keeps total cost bounded no matter how
@@ -56,13 +53,22 @@ import (
 // near this many legal moves, so in practice this is "consider everything"
 // rather than an actual truncation; it only starts clipping in unusually
 // open positions, trading some speed for not silently discarding the
-// actual best move the way a tight cap did. Raised from 50 - the root's
-// candidate loop now runs through a bounded worker pool (see
-// endgameSearch's own comment), which bought a little headroom, though
-// confirmed NOT a lot on this deployment's real core count - push this
-// higher only after confirming the 30s timeout still has margin, since
-// cost scales as the cube of this value.
-const endgameBranchWidth = 75
+// actual best move the way a tight cap did.
+//
+// Was briefly raised to 75 (see git history) on the theory that the root's
+// candidate loop running through a bounded worker pool (endgameSearch's
+// own comment) bought enough headroom to afford it - reverted back to 50
+// after that led to routine 30s timeouts in practice. The math makes it
+// obvious in hindsight: 75 vs 50 is (75/50)³ ≈ 3.4x more total nodes, cost
+// scaling as the CUBE of this value, while the worker pool's own measured
+// speedup on this deployment was confirmed "a little, not a lot" (limited
+// real CPU cores) - nowhere near enough to offset a 3.4x increase in raw
+// work. The concurrency itself is still worth keeping (same correctness,
+// same tie-breaking, never slower, sometimes a bit faster) - this constant
+// was the actual regression, not the parallelism. Push it back up only
+// after confirming real timeout margin at the new value, not on the same
+// optimistic assumption that broke it last time.
+const endgameBranchWidth = 50
 
 // endgameDepthBudget is how many plies get real branching (mover, their
 // reply, mover again) before falling back to flat greedy for the remainder
@@ -468,98 +474,27 @@ func endgameSearch(ctx context.Context, bd *board.GameBoard, moverRack, opponent
 	var bestMoverScore, bestOpponentScore int
 	haveBest := false
 
-	// betterThanBest applies endgameSearch's own maximize/minimize rule -
-	// factored out so both the sequential path below and the parallel
-	// root's own reduction pass (after wg.Wait()) apply the exact same
-	// comparison, in the exact same left-to-right order over toExplore, so
-	// tie-breaking (first candidate at a given spread wins) stays identical
-	// regardless of which path ran.
-	betterThanBest := func(fs1, fs2 int) bool {
-		spread := fs1 - fs2
-		return !haveBest || (isMaximizing && spread > bestMoverScore-bestOpponentScore) || (!isMaximizing && spread < bestMoverScore-bestOpponentScore)
-	}
-
-	// onProgress is non-nil only on the root call (see this function's own
-	// comment above) - every recursive call passes nil, so only THIS loop,
-	// for THIS position's candidates, ever runs concurrently. Parallelizing
-	// every depth instead (recursively) would multiply goroutine count by
-	// endgameBranchWidth at each level for no real benefit - one bounded
-	// pool at the root is already enough work to fill however many cores
-	// the deployment actually has.
-	if onProgress != nil && len(toExplore) > 1 {
-		type candResult struct {
-			line     []endgameLineEntry
-			fs1, fs2 int
-		}
-		results := make([]candResult, len(toExplore))
-
-		numWorkers := runtime.GOMAXPROCS(0)
-		if numWorkers > len(toExplore) {
-			numWorkers = len(toExplore)
-		}
-
-		// Dispatched in shuffled order, not toExplore's original score-sorted
-		// order - job order has zero effect on correctness (results[] is
-		// always written to each candidate's ORIGINAL index below, and the
-		// final reduction always walks results in that same original order,
-		// same as the sequential path), but score-sorted order does appear
-		// to correlate with subtree cost (higher-scoring/more aggressive
-		// moves plausibly open up bigger follow-up positions), which left
-		// the small worker pool grinding through several expensive
-		// candidates at once early on, then flying through a long tail of
-		// cheap ones - progress looked "stuck" then jumped. Shuffling
-		// spreads expensive and cheap candidates evenly across the
-		// timeline instead.
-		order := rand.Perm(len(toExplore))
-		jobs := make(chan int, len(toExplore))
-		for _, i := range order {
-			jobs <- i
-		}
-		close(jobs)
-
-		// onProgress itself isn't safe to call from multiple goroutines
-		// (solveEndgameHandler's version writes straight to the shared
-		// http.ResponseWriter) - guarded here rather than pushing that
-		// requirement onto every current and future caller.
-		var progressMu sync.Mutex
-		completed := 0
-
-		var wg sync.WaitGroup
-		for range numWorkers {
-			wg.Add(1)
-			go func() {
-				defer wg.Done()
-				for i := range jobs {
-					line, fs1, fs2 := evalEndgameCandidate(ctx, bd, moverRack, opponentRack, moverScore, opponentScore, onTurn, depthBudget, toExplore[i])
-					results[i] = candResult{line: line, fs1: fs1, fs2: fs2}
-
-					progressMu.Lock()
-					completed++
-					onProgress(completed, len(toExplore))
-					progressMu.Unlock()
-				}
-			}()
-		}
-		wg.Wait()
-
-		// Single-threaded reduction, in original toExplore order - not done
-		// racily inside each goroutine above, so this is the exact same
-		// left-to-right comparison (and tie-break) the sequential path
-		// below performs, just deferred until every candidate is in.
-		for _, r := range results {
-			if betterThanBest(r.fs1, r.fs2) {
-				haveBest = true
-				bestLine = r.line
-				bestMoverScore, bestOpponentScore = r.fs1, r.fs2
-			}
-		}
-		return bestLine, bestMoverScore, bestOpponentScore
-	}
-
+	// Sequential, deliberately - a bounded worker pool was tried here (see
+	// git history) on the theory that toExplore's candidates are fully
+	// independent (each gets its own bd.Copy()) and this deployment has
+	// spare cores to run them concurrently. In practice it produced long
+	// stalls at 0% progress followed by routine 30s timeouts - the classic
+	// signature of running more CPU-bound goroutines than the container
+	// actually has real cores for (they thrash against each other instead
+	// of running in parallel, so NOTHING finishes quickly, rather than
+	// everything finishing a bit slower). This exact deployment already
+	// has one documented instance of this same failure mode - see
+	// simulate.go's own tessCandidateCount comment, where parallelizing a
+	// similarly CPU-bound per-candidate loop measurably backfired (1.8s to
+	// 7.4s/game) for the same reason. Reverted rather than re-tuned, since
+	// there's no live profiling access here to size a worker pool
+	// correctly, and the lesson from that earlier attempt is "don't" more
+	// than it is "tune the number."
 	for i, cand := range toExplore {
 		line, fs1, fs2 := evalEndgameCandidate(ctx, bd, moverRack, opponentRack, moverScore, opponentScore, onTurn, depthBudget, cand)
 
-		if betterThanBest(fs1, fs2) {
+		spread := fs1 - fs2
+		if !haveBest || (isMaximizing && spread > bestMoverScore-bestOpponentScore) || (!isMaximizing && spread < bestMoverScore-bestOpponentScore) {
 			haveBest = true
 			bestLine = line
 			bestMoverScore, bestOpponentScore = fs1, fs2
