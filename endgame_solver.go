@@ -47,32 +47,32 @@ import (
 
 // endgameBranchWidth caps how many candidates get real recursive
 // consideration at each of endgameDepthBudget plies - total explored nodes
-// is roughly endgameBranchWidth^endgameDepthBudget (50^3 = 125000), not
-// exponential in however long the actual endgame runs. Past that depth,
-// only the single best-scoring move is considered (flat greedy) for the
-// rest of the line, which is what keeps total cost bounded no matter how
-// many tiles are left on either rack. Set generously on purpose - a real
-// endgame position (small racks, mostly-full board) rarely has anywhere
-// near this many legal moves, so in practice this is "consider everything"
-// rather than an actual truncation; it only starts clipping in unusually
-// open positions, trading some speed for not silently discarding the
-// actual best move the way a tight cap did.
+// is bounded by roughly endgameBranchWidth^endgameDepthBudget before
+// alpha-beta pruning (endgameSearch's own comment) cuts a real chunk of
+// that away at runtime, not exponential in however long the actual endgame
+// runs. Past that depth, only the single best-scoring move is considered
+// (flat greedy) for the rest of the line, which is what keeps total cost
+// bounded no matter how many tiles are left on either rack. Set generously
+// on purpose - a real endgame position (small racks, mostly-full board)
+// rarely has anywhere near this many legal moves, so in practice this is
+// "consider everything" rather than an actual truncation; it only starts
+// clipping in unusually open positions, trading some speed for not
+// silently discarding the actual best move the way a tight cap did.
 //
-// Was briefly raised to 75 (see git history) on the theory that a bounded
-// worker pool running the root's candidate loop concurrently (also since
-// reverted - see endgameSearch's own comment) bought enough headroom to
-// afford it - reverted back to 50 after that combination led to routine
-// 30s timeouts in practice. The math makes it obvious in hindsight: 75 vs
-// 50 is (75/50)³ ≈ 3.4x more total nodes, cost scaling as the CUBE of this
-// value, while the worker pool's own measured speedup on this deployment
-// was confirmed "a little, not a lot" (limited real CPU cores) - nowhere
-// near enough to offset a 3.4x increase in raw work. Push it back up only
-// after confirming real timeout margin at the new value, not on the same
-// optimistic assumption that broke it last time - alpha-beta pruning
-// (endgameSearch's own comment) buys real headroom too now, but its actual
-// effectiveness depends entirely on the position, so don't assume it's
-// safe to spend that headroom here without checking.
-const endgameBranchWidth = 50
+// History: raised 50->75 alongside a since-fully-reverted concurrent
+// worker pool on the root's candidate loop - that combination caused
+// routine 30s timeouts, but the two changes were never tested in
+// isolation, so which one actually caused it was never confirmed either
+// way (concurrency's own "stuck at 0%" symptom pointed at goroutine
+// oversubscription being the real culprit, not necessarily this constant).
+// Reverted to 50 out of caution at the time. Raised again to 100 to test
+// under a genuinely different configuration - concurrency fully gone,
+// alpha-beta now doing real pruning - since that's a real, not assumed,
+// speedup this time. Confirm actual timeout margin in practice before
+// trusting this value; alpha-beta's effectiveness varies by position
+// (endgameSearch's own comment), so it isn't a fixed multiplier to bank on
+// blindly either.
+const endgameBranchWidth = 100
 
 // endgameDepthBudget is how many plies get real branching (mover, their
 // reply, mover again) before falling back to flat greedy for the remainder
