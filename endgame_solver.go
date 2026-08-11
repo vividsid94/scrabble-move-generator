@@ -12,13 +12,16 @@ package main
 // package.
 //
 // Instead: generate the top-K legal candidates for whoever's on turn and
-// recurse on each (real branching, plain minimax, no alpha-beta needed at
-// this scale) for a small fixed number of plies; beyond that depth, fall
-// back to a single best-move-only line (no branching) straight to game
-// over. Cost is bounded by depth x branch width regardless of how long the
-// underlying endgame actually runs - matching Quackle's own "a few
-// seconds, not perfect but good enough" endgame solver rather than an
-// exhaustive one.
+// recurse on each (real branching, minimax with alpha-beta pruning - see
+// endgameSearch's own comment) for a small fixed number of plies; beyond
+// that depth, fall back to a single best-move-only line (no branching)
+// straight to game over. Cost is bounded by depth x branch width
+// regardless of how long the underlying endgame actually runs - matching
+// Quackle's own "a few seconds, not perfect but good enough" endgame
+// solver rather than an exhaustive one (Quackle's real solver is B*, a
+// purpose-built endgame algorithm well beyond what this file implements -
+// alpha-beta here is a much smaller, mechanical speedup on top of plain
+// minimax, not an attempt at parity with that).
 //
 // Every primitive used here (movegen.NewGordonGenerator, board.Copy/
 // PlayMove/UpdateCrossSetsForMove, scoredCandidate/getLeaveValue/
@@ -55,25 +58,31 @@ import (
 // open positions, trading some speed for not silently discarding the
 // actual best move the way a tight cap did.
 //
-// Was briefly raised to 75 (see git history) on the theory that the root's
-// candidate loop running through a bounded worker pool (endgameSearch's
-// own comment) bought enough headroom to afford it - reverted back to 50
-// after that led to routine 30s timeouts in practice. The math makes it
-// obvious in hindsight: 75 vs 50 is (75/50)³ ≈ 3.4x more total nodes, cost
-// scaling as the CUBE of this value, while the worker pool's own measured
-// speedup on this deployment was confirmed "a little, not a lot" (limited
-// real CPU cores) - nowhere near enough to offset a 3.4x increase in raw
-// work. The concurrency itself is still worth keeping (same correctness,
-// same tie-breaking, never slower, sometimes a bit faster) - this constant
-// was the actual regression, not the parallelism. Push it back up only
+// Was briefly raised to 75 (see git history) on the theory that a bounded
+// worker pool running the root's candidate loop concurrently (also since
+// reverted - see endgameSearch's own comment) bought enough headroom to
+// afford it - reverted back to 50 after that combination led to routine
+// 30s timeouts in practice. The math makes it obvious in hindsight: 75 vs
+// 50 is (75/50)³ ≈ 3.4x more total nodes, cost scaling as the CUBE of this
+// value, while the worker pool's own measured speedup on this deployment
+// was confirmed "a little, not a lot" (limited real CPU cores) - nowhere
+// near enough to offset a 3.4x increase in raw work. Push it back up only
 // after confirming real timeout margin at the new value, not on the same
-// optimistic assumption that broke it last time.
+// optimistic assumption that broke it last time - alpha-beta pruning
+// (endgameSearch's own comment) buys real headroom too now, but its actual
+// effectiveness depends entirely on the position, so don't assume it's
+// safe to spend that headroom here without checking.
 const endgameBranchWidth = 50
 
 // endgameDepthBudget is how many plies get real branching (mover, their
 // reply, mover again) before falling back to flat greedy for the remainder
 // of the line.
 const endgameDepthBudget = 3
+
+// endgameAlphaBetaInfinity is a bound far outside any realistic Scrabble
+// spread (no real game swings anywhere near this many points) - used as
+// alpha-beta's unbounded starting window at the root, not a tuned value.
+const endgameAlphaBetaInfinity = 1_000_000
 
 type SolveEndgameRequest struct {
 	Board         [][]string `json:"board"`
@@ -227,7 +236,8 @@ func solveEndgameHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	line, finalMoverScore, finalOpponentScore := endgameSearch(
-		ctx, bd, req.MoverRack, req.OpponentRack, req.MoverScore, req.OpponentScore, 1, 0, endgameDepthBudget, onProgress)
+		ctx, bd, req.MoverRack, req.OpponentRack, req.MoverScore, req.OpponentScore, 1, 0, endgameDepthBudget,
+		-endgameAlphaBetaInfinity, endgameAlphaBetaInfinity, onProgress)
 	incomplete := ctx.Err() != nil
 
 	// Replay the line onto a working board copy to convert each entry to
@@ -325,9 +335,21 @@ func rankEndgameCandidates(bd *board.GameBoard, currentRack, otherRack string) [
 // endgameSearch returns the sequence of moves played from this position to
 // game over, plus final scores for both sides. onTurn is 1 (mover) or 2
 // (opponent); player 1 maximizes moverScore-opponentScore at every
-// branching decision, player 2 minimizes it - a plain minimax, no
-// alpha-beta pruning, since endgameDepthBudget/endgameBranchWidth already
-// keep the tree small enough not to need it.
+// branching decision, player 2 minimizes it - minimax with alpha-beta
+// pruning. alpha is the best (highest) spread the maximizing side (mover)
+// can already guarantee somewhere on the path to the root; beta is the
+// best (lowest) spread the minimizing side (opponent) can already
+// guarantee. Both only ever tighten (alpha up, beta down) as sibling
+// candidates at a node get evaluated, and get handed unchanged into each
+// child's own subtree (evalEndgameCandidate just passes them straight
+// through - the branching decision happens in THIS function's own loop
+// below, not there). Once alpha >= beta at a node, every remaining sibling
+// there is provably irrelevant to what an ancestor will ultimately pick,
+// so the loop stops early without evaluating them - same final answer as
+// plain minimax, fewer nodes visited. toExplore's own best-score-first
+// order (rankEndgameCandidates' sort) is what makes these cutoffs trigger
+// early rather than late: a strong bound found on the first candidate
+// prunes far more of the rest than finding it last would.
 //
 // depthBudget plies get real branching (top endgameBranchWidth candidates,
 // recurse on each); once it reaches 0, only the single best-scoring
@@ -350,14 +372,12 @@ func rankEndgameCandidates(bd *board.GameBoard, currentRack, otherRack string) [
 // evalEndgameCandidate plays cand onto a fresh copy of bd and either ends
 // the game immediately (it emptied a rack) or recurses one ply further -
 // the per-candidate work endgameSearch's own toExplore loop always did
-// inline. Extracted so the sequential path (every recursive call) and the
-// root's parallel worker pool below share one implementation instead of
-// two copies that could quietly drift apart. childBd is only ever touched
-// by the goroutine that owns this one candidate (bd.Copy() makes it so),
-// and gd/ld/alph are read-only package globals after startup - the same
-// safety property simulateSeriesHandler's own worker pool (simulate.go)
-// already relies on for concurrent per-game board copies.
-func evalEndgameCandidate(ctx context.Context, bd *board.GameBoard, moverRack, opponentRack string, moverScore, opponentScore, onTurn, depthBudget int, cand scoredCandidate) ([]endgameLineEntry, int, int) {
+// inline; extracted so there's one implementation instead of a copy that
+// could drift. alpha/beta are threaded straight through to the recursive
+// endgameSearch call unchanged - this function makes no branching decision
+// of its own (that happens in the CALLER's loop over sibling candidates),
+// it just needs to hand the current window down to the next ply.
+func evalEndgameCandidate(ctx context.Context, bd *board.GameBoard, moverRack, opponentRack string, moverScore, opponentScore, onTurn, depthBudget, alpha, beta int, cand scoredCandidate) ([]endgameLineEntry, int, int) {
 	childBd := bd.Copy()
 	childBd.PlayMove(cand.move)
 	cross_set.UpdateCrossSetsForMove(childBd, cand.move, gd, ld)
@@ -399,11 +419,11 @@ func evalEndgameCandidate(ctx context.Context, bd *board.GameBoard, moverRack, o
 		childDepth = 0
 	}
 	restLine, fs1, fs2 := endgameSearch(
-		ctx, childBd, newMoverRack, newOpponentRack, newMoverScore, newOpponentScore, 3-onTurn, 0, childDepth, nil)
+		ctx, childBd, newMoverRack, newOpponentRack, newMoverScore, newOpponentScore, 3-onTurn, 0, childDepth, alpha, beta, nil)
 	return append([]endgameLineEntry{entry}, restLine...), fs1, fs2
 }
 
-func endgameSearch(ctx context.Context, bd *board.GameBoard, moverRack, opponentRack string, moverScore, opponentScore, onTurn, consecutiveScoreless, depthBudget int, onProgress func(current, total int)) ([]endgameLineEntry, int, int) {
+func endgameSearch(ctx context.Context, bd *board.GameBoard, moverRack, opponentRack string, moverScore, opponentScore, onTurn, consecutiveScoreless, depthBudget, alpha, beta int, onProgress func(current, total int)) ([]endgameLineEntry, int, int) {
 	// A blown deadline forces flat greedy for the rest of the line rather
 	// than aborting outright - always a complete, valid answer, just
 	// possibly lower-quality past this point. See solveEndgameHandler's
@@ -446,7 +466,7 @@ func endgameSearch(ctx context.Context, bd *board.GameBoard, moverRack, opponent
 		if childDepth < 0 {
 			childDepth = 0
 		}
-		restLine, fs1, fs2 := endgameSearch(ctx, bd, moverRack, opponentRack, moverScore, opponentScore, 3-onTurn, newConsecutive, childDepth, nil)
+		restLine, fs1, fs2 := endgameSearch(ctx, bd, moverRack, opponentRack, moverScore, opponentScore, 3-onTurn, newConsecutive, childDepth, alpha, beta, nil)
 		return append([]endgameLineEntry{entry}, restLine...), fs1, fs2
 	}
 
@@ -489,9 +509,11 @@ func endgameSearch(ctx context.Context, bd *board.GameBoard, moverRack, opponent
 	// 7.4s/game) for the same reason. Reverted rather than re-tuned, since
 	// there's no live profiling access here to size a worker pool
 	// correctly, and the lesson from that earlier attempt is "don't" more
-	// than it is "tune the number."
+	// than it is "tune the number." Sequential iteration is also what makes
+	// alpha-beta below correct in the first place - each sibling needs to
+	// see the bound(s) tightened by the ones evaluated before it.
 	for i, cand := range toExplore {
-		line, fs1, fs2 := evalEndgameCandidate(ctx, bd, moverRack, opponentRack, moverScore, opponentScore, onTurn, depthBudget, cand)
+		line, fs1, fs2 := evalEndgameCandidate(ctx, bd, moverRack, opponentRack, moverScore, opponentScore, onTurn, depthBudget, alpha, beta, cand)
 
 		spread := fs1 - fs2
 		if !haveBest || (isMaximizing && spread > bestMoverScore-bestOpponentScore) || (!isMaximizing && spread < bestMoverScore-bestOpponentScore) {
@@ -508,6 +530,31 @@ func endgameSearch(ctx context.Context, bd *board.GameBoard, moverRack, opponent
 		// "finished" bar while the request is still genuinely running.
 		if onProgress != nil {
 			onProgress(i+1, len(toExplore))
+		}
+
+		// Alpha-beta cutoff - tighten whichever bound this node owns using
+		// the best result found so far (NOT just this one candidate's own
+		// spread; a weaker candidate must never loosen a bound an earlier,
+		// stronger sibling already established), then stop entirely once
+		// the window has collapsed. A remaining sibling at that point can't
+		// change what an ancestor ultimately does with this node's result,
+		// regardless of what it turns out to be - see this function's own
+		// comment for the full reasoning. onProgress already fired above,
+		// so a truncated loop never reports a shrunken "total" partway
+		// through - whatever candidate count was reported stays accurate,
+		// the bar just stops advancing once the cutoff hits.
+		bestSpread := bestMoverScore - bestOpponentScore
+		if isMaximizing {
+			if bestSpread > alpha {
+				alpha = bestSpread
+			}
+		} else {
+			if bestSpread < beta {
+				beta = bestSpread
+			}
+		}
+		if alpha >= beta {
+			break
 		}
 	}
 
