@@ -42,6 +42,7 @@ import (
 	"github.com/domino14/macondo/cross_set"
 	macondomove "github.com/domino14/macondo/move"
 	"github.com/domino14/macondo/movegen"
+	"github.com/domino14/word-golib/kwg"
 	"github.com/domino14/word-golib/tilemapping"
 )
 
@@ -90,6 +91,7 @@ type SolveEndgameRequest struct {
 	OpponentRack  string     `json:"opponentRack"`
 	MoverScore    int        `json:"moverScore"`
 	OpponentScore int        `json:"opponentScore"`
+	Lexicon       string     `json:"lexicon,omitempty"`
 }
 
 type SolveEndgameResponse struct {
@@ -97,6 +99,11 @@ type SolveEndgameResponse struct {
 	Spread     int            `json:"spread"`
 	Plies      int            `json:"plies"`
 	Incomplete bool           `json:"incomplete"`
+	// Lexicon echoes back which lexicon actually solved this (matching the
+	// convention every other endpoint's response already follows) - added
+	// alongside this endpoint's own Lexicon request field rather than
+	// resurrecting a dead one, since this response never had one before.
+	Lexicon string `json:"lexicon,omitempty"`
 }
 
 // The two line shapes streamed on /solve-endgame's response - see
@@ -170,6 +177,12 @@ func solveEndgameHandler(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	gd, lexiconName, err := resolveLexicon(req.Lexicon)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+
 	bd := board.MakeBoard(board.CrosswordGameBoard)
 	tilesPlayed := 0
 	for row := 0; row < 15; row++ {
@@ -236,7 +249,7 @@ func solveEndgameHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	line, finalMoverScore, finalOpponentScore := endgameSearch(
-		ctx, bd, req.MoverRack, req.OpponentRack, req.MoverScore, req.OpponentScore, 1, 0, endgameDepthBudget,
+		ctx, gd, bd, req.MoverRack, req.OpponentRack, req.MoverScore, req.OpponentScore, 1, 0, endgameDepthBudget,
 		-endgameAlphaBetaInfinity, endgameAlphaBetaInfinity, onProgress)
 	incomplete := ctx.Err() != nil
 
@@ -265,6 +278,7 @@ func solveEndgameHandler(w http.ResponseWriter, r *http.Request) {
 			Spread:     finalMoverScore - finalOpponentScore,
 			Plies:      len(moves),
 			Incomplete: incomplete,
+			Lexicon:    lexiconName,
 		},
 	})
 }
@@ -291,7 +305,7 @@ func detailedMoveForPass() *DetailedMove {
 // stops a real game-ending reply from silently never reaching the
 // recursion at all. No exchange candidates either - exchanging is never
 // legal once the bag is empty.
-func rankEndgameCandidates(bd *board.GameBoard, currentRack, otherRack string) []scoredCandidate {
+func rankEndgameCandidates(gd *kwg.KWG, bd *board.GameBoard, currentRack, otherRack string) []scoredCandidate {
 	rack := tilemapping.RackFromString(currentRack, alph)
 	generator := movegen.NewGordonGenerator(gd, bd, ld)
 	rawMoves := generator.GenAll(rack, false)
@@ -377,7 +391,7 @@ func rankEndgameCandidates(bd *board.GameBoard, currentRack, otherRack string) [
 // endgameSearch call unchanged - this function makes no branching decision
 // of its own (that happens in the CALLER's loop over sibling candidates),
 // it just needs to hand the current window down to the next ply.
-func evalEndgameCandidate(ctx context.Context, bd *board.GameBoard, moverRack, opponentRack string, moverScore, opponentScore, onTurn, depthBudget, alpha, beta int, cand scoredCandidate) ([]endgameLineEntry, int, int) {
+func evalEndgameCandidate(ctx context.Context, gd *kwg.KWG, bd *board.GameBoard, moverRack, opponentRack string, moverScore, opponentScore, onTurn, depthBudget, alpha, beta int, cand scoredCandidate) ([]endgameLineEntry, int, int) {
 	childBd := bd.Copy()
 	childBd.PlayMove(cand.move)
 	cross_set.UpdateCrossSetsForMove(childBd, cand.move, gd, ld)
@@ -419,11 +433,11 @@ func evalEndgameCandidate(ctx context.Context, bd *board.GameBoard, moverRack, o
 		childDepth = 0
 	}
 	restLine, fs1, fs2 := endgameSearch(
-		ctx, childBd, newMoverRack, newOpponentRack, newMoverScore, newOpponentScore, 3-onTurn, 0, childDepth, alpha, beta, nil)
+		ctx, gd, childBd, newMoverRack, newOpponentRack, newMoverScore, newOpponentScore, 3-onTurn, 0, childDepth, alpha, beta, nil)
 	return append([]endgameLineEntry{entry}, restLine...), fs1, fs2
 }
 
-func endgameSearch(ctx context.Context, bd *board.GameBoard, moverRack, opponentRack string, moverScore, opponentScore, onTurn, consecutiveScoreless, depthBudget, alpha, beta int, onProgress func(current, total int)) ([]endgameLineEntry, int, int) {
+func endgameSearch(ctx context.Context, gd *kwg.KWG, bd *board.GameBoard, moverRack, opponentRack string, moverScore, opponentScore, onTurn, consecutiveScoreless, depthBudget, alpha, beta int, onProgress func(current, total int)) ([]endgameLineEntry, int, int) {
 	// A blown deadline forces flat greedy for the rest of the line rather
 	// than aborting outright - always a complete, valid answer, just
 	// possibly lower-quality past this point. See solveEndgameHandler's
@@ -443,7 +457,7 @@ func endgameSearch(ctx context.Context, bd *board.GameBoard, moverRack, opponent
 		currentRack = opponentRack
 		otherRack = moverRack
 	}
-	candidates := rankEndgameCandidates(bd, currentRack, otherRack)
+	candidates := rankEndgameCandidates(gd, bd, currentRack, otherRack)
 
 	branchWidth := 1
 	if depthBudget > 0 {
@@ -466,7 +480,7 @@ func endgameSearch(ctx context.Context, bd *board.GameBoard, moverRack, opponent
 		if childDepth < 0 {
 			childDepth = 0
 		}
-		restLine, fs1, fs2 := endgameSearch(ctx, bd, moverRack, opponentRack, moverScore, opponentScore, 3-onTurn, newConsecutive, childDepth, alpha, beta, nil)
+		restLine, fs1, fs2 := endgameSearch(ctx, gd, bd, moverRack, opponentRack, moverScore, opponentScore, 3-onTurn, newConsecutive, childDepth, alpha, beta, nil)
 		return append([]endgameLineEntry{entry}, restLine...), fs1, fs2
 	}
 
@@ -513,7 +527,7 @@ func endgameSearch(ctx context.Context, bd *board.GameBoard, moverRack, opponent
 	// alpha-beta below correct in the first place - each sibling needs to
 	// see the bound(s) tightened by the ones evaluated before it.
 	for i, cand := range toExplore {
-		line, fs1, fs2 := evalEndgameCandidate(ctx, bd, moverRack, opponentRack, moverScore, opponentScore, onTurn, depthBudget, alpha, beta, cand)
+		line, fs1, fs2 := evalEndgameCandidate(ctx, gd, bd, moverRack, opponentRack, moverScore, opponentScore, onTurn, depthBudget, alpha, beta, cand)
 
 		spread := fs1 - fs2
 		if !haveBest || (isMaximizing && spread > bestMoverScore-bestOpponentScore) || (!isMaximizing && spread < bestMoverScore-bestOpponentScore) {

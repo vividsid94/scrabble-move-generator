@@ -152,7 +152,7 @@ func (b *candidatePenaltyBreakdown) adjustedTotal() float64 {
 // place the per-candidate board-copy work happens - everything downstream
 // (the actual pick, its RulesBotImpact, or a /rulesbot-debug response) just
 // reads numbers back out of the result.
-func computeRulesBotBreakdowns(candidates []scoredCandidate, bd *board.GameBoard, isOpeningPlay bool) []candidatePenaltyBreakdown {
+func computeRulesBotBreakdowns(gd *kwg.KWG, candidates []scoredCandidate, bd *board.GameBoard, isOpeningPlay bool) []candidatePenaltyBreakdown {
 	breakdowns := make([]candidatePenaltyBreakdown, len(candidates))
 	minBoxArea, maxBoxArea := -1, -1
 	minLanes, maxLanes := -1, -1
@@ -173,7 +173,7 @@ func computeRulesBotBreakdowns(candidates []scoredCandidate, bd *board.GameBoard
 			b.openingStarPenalty = openingStarSPenalty(c.detailed)
 		}
 		b.vowelPremiumPenalty = tlsTwsVowelPenalty(c.detailed, candidateBd)
-		b.hookPremiumPenalty = hookOnPremiumPenalty(c.detailed, candidateBd)
+		b.hookPremiumPenalty = hookOnPremiumPenalty(gd, c.detailed, candidateBd)
 		b.boxArea = boardBoundingBoxArea(candidateBd)
 		b.laneCount = countCurrentBingoLanes(candidateBd)
 
@@ -250,12 +250,12 @@ type RulesBotImpact struct {
 // of numbers already on hand, so all eight selection objectives (the real
 // one, the no-rules-at-all baseline, and six single-rule-dropped variants)
 // are tracked in one extra pass with no additional board copies.
-func pickRulesBotCandidate(candidates []scoredCandidate, bd *board.GameBoard, isOpeningPlay bool) (*scoredCandidate, *RulesBotImpact) {
+func pickRulesBotCandidate(gd *kwg.KWG, candidates []scoredCandidate, bd *board.GameBoard, isOpeningPlay bool) (*scoredCandidate, *RulesBotImpact) {
 	if len(candidates) == 0 {
 		return nil, nil
 	}
 
-	breakdowns := computeRulesBotBreakdowns(candidates, bd, isOpeningPlay)
+	breakdowns := computeRulesBotBreakdowns(gd, candidates, bd, isOpeningPlay)
 
 	// Each tracker holds the running best candidate for one selection
 	// objective. score>t.score (strict) on ties keeps whichever candidate
@@ -389,7 +389,7 @@ func tlsTwsVowelPenalty(detailed *DetailedMove, candidateBd *board.GameBoard) fl
 // (not every cross-word this play also touches) - a reasonable first pass,
 // not exhaustive.
 
-func hookOnPremiumPenalty(detailed *DetailedMove, candidateBd *board.GameBoard) float64 {
+func hookOnPremiumPenalty(gd *kwg.KWG, detailed *DetailedMove, candidateBd *board.GameBoard) float64 {
 	if len(detailed.Tiles) == 0 {
 		return 0
 	}
@@ -590,9 +590,10 @@ func laneWindowIsLive(bd *board.GameBoard, startRow, startCol, length int, horiz
 // exported behavior for why the logic itself lives here instead.
 
 type RulesBotDebugRequest struct {
-	Rack  string     `json:"rack"`
-	Board [][]string `json:"board"` // 15x15, empty cells as ""
-	TopN  int        `json:"topN,omitempty"`
+	Rack    string     `json:"rack"`
+	Board   [][]string `json:"board"` // 15x15, empty cells as ""
+	TopN    int        `json:"topN,omitempty"`
+	Lexicon string     `json:"lexicon,omitempty"`
 }
 
 type RulesBotDebugCandidate struct {
@@ -626,8 +627,9 @@ type RulesBotDebugCandidate struct {
 }
 
 type RulesBotDebugResponse struct {
-	IsOpeningPlay bool                      `json:"isOpeningPlay"`
-	Candidates    []RulesBotDebugCandidate  `json:"candidates"`
+	IsOpeningPlay bool                     `json:"isOpeningPlay"`
+	Candidates    []RulesBotDebugCandidate `json:"candidates"`
+	Lexicon       string                   `json:"lexicon,omitempty"`
 }
 
 func rulesBotDebugHandler(w http.ResponseWriter, r *http.Request) {
@@ -662,6 +664,12 @@ func rulesBotDebugHandler(w http.ResponseWriter, r *http.Request) {
 	}
 	if req.TopN <= 0 {
 		req.TopN = 20
+	}
+
+	gd, lexiconName, err := resolveLexicon(req.Lexicon)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
 	}
 
 	// Standard board only - RulesBot's own geometry (twsSquares etc.) is
@@ -719,7 +727,7 @@ func rulesBotDebugHandler(w http.ResponseWriter, r *http.Request) {
 	}
 	candidates = append(candidates, allExchangeCandidates(req.Rack)...)
 
-	breakdowns := computeRulesBotBreakdowns(candidates, bd, isOpeningPlay)
+	breakdowns := computeRulesBotBreakdowns(gd, candidates, bd, isOpeningPlay)
 	sort.SliceStable(breakdowns, func(i, j int) bool { return breakdowns[i].adjustedTotal() > breakdowns[j].adjustedTotal() })
 	if len(breakdowns) > req.TopN {
 		breakdowns = breakdowns[:req.TopN]
@@ -747,7 +755,7 @@ func rulesBotDebugHandler(w http.ResponseWriter, r *http.Request) {
 		respCandidates = append(respCandidates, rc)
 	}
 
-	resp := RulesBotDebugResponse{IsOpeningPlay: isOpeningPlay, Candidates: respCandidates}
+	resp := RulesBotDebugResponse{IsOpeningPlay: isOpeningPlay, Candidates: respCandidates, Lexicon: lexiconName}
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(resp)
 }

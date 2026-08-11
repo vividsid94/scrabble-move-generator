@@ -5,10 +5,12 @@ package main
 // no per-move opponent simulation (that's Tess, which stays client-side).
 // Theo is just rank 1; "Nth static" is any other rank 1-15 the app's UI
 // offers. Additive to main-for-scrabble.go: reuses its package-level
-// gd/alph/ld, its DetailedMove/MoveTile types, and its
-// toDetailedMove/drawRandomTiles/removeRackFromPool helpers rather than
-// duplicating them. generateMovesHandler and bulkMoveGenHandler now use this
-// same score+leaveValue infrastructure too (getLeaveValue/sortLeaveString/
+// alph/ld and resolveLexicon/lexica (gd itself is request-scoped, not a
+// package global - see resolveLexicon's own comment), its DetailedMove/
+// MoveTile types, and its toDetailedMove/drawRandomTiles/
+// removeRackFromPool helpers rather than duplicating them.
+// generateMovesHandler and bulkMoveGenHandler now use this same
+// score+leaveValue infrastructure too (getLeaveValue/sortLeaveString/
 // allExchangeCandidates below), so this file is no longer the only place
 // leave-aware ranking happens - it remains the only one that plays full games.
 //
@@ -41,6 +43,7 @@ import (
 	"github.com/domino14/macondo/cross_set"
 	macondomove "github.com/domino14/macondo/move"
 	"github.com/domino14/macondo/movegen"
+	"github.com/domino14/word-golib/kwg"
 	"github.com/domino14/word-golib/tilemapping"
 )
 
@@ -347,7 +350,7 @@ const (
 // entirely in-process against the board/pool state simulateOneGame already
 // holds in memory - it never mutates bd or pool, only reads them (board
 // copies for word-play candidates are made and discarded internally).
-func pickTessCandidate(candidates []scoredCandidate, bd *board.GameBoard, alph *tilemapping.TileMapping, pool string) *scoredCandidate {
+func pickTessCandidate(gd *kwg.KWG, candidates []scoredCandidate, bd *board.GameBoard, alph *tilemapping.TileMapping, pool string) *scoredCandidate {
 	if len(candidates) == 0 {
 		return nil
 	}
@@ -597,10 +600,12 @@ type SimulateSeriesRequest struct {
 	Player2Rank int        `json:"player2Rank,omitempty"`
 	Player1Bot  *BotConfig `json:"player1Bot,omitempty"` // rank + optional leave rules; takes precedence over Player1Rank
 	Player2Bot  *BotConfig `json:"player2Bot,omitempty"`
+	Lexicon     string     `json:"lexicon,omitempty"`
 }
 
 type SimulateSeriesResponse struct {
-	Games []SimGameResult `json:"games"`
+	Games   []SimGameResult `json:"games"`
+	Lexicon string          `json:"lexicon,omitempty"`
 }
 
 // scoredCandidate is one ranked option for a turn - either a word play
@@ -658,7 +663,7 @@ func sameCandidate(a, b *scoredCandidate) bool {
 // (IsTess true) instead runs pickTessCandidate's opponent-simulation
 // selection, which ignores LeaveRules entirely and always uses the plain
 // baselineTotal - see that function's comment for why.
-func simulateOneGame(player1Bot, player2Bot BotConfig) SimGameResult {
+func simulateOneGame(gd *kwg.KWG, player1Bot, player2Bot BotConfig) SimGameResult {
 	bd := board.MakeBoard(board.CrosswordGameBoard)
 	cross_set.GenAllCrossSets(bd, gd, ld)
 	bd.UpdateAllAnchors()
@@ -804,9 +809,9 @@ func simulateOneGame(player1Bot, player2Bot BotConfig) SimGameResult {
 			// (see BotConfig.SpecialSelection's comment).
 			chosen = pickLongestOrMostTilesCandidate(candidates, currentBot.SpecialSelection)
 		case currentBot.IsTess:
-			chosen = pickTessCandidate(candidates, bd, alph, pool)
+			chosen = pickTessCandidate(gd, candidates, bd, alph, pool)
 		case currentBot.IsRulesBot:
-			chosen, rulesBotImpact = pickRulesBotCandidate(candidates, bd, len(turns) == 0)
+			chosen, rulesBotImpact = pickRulesBotCandidate(gd, candidates, bd, len(turns) == 0)
 		default:
 			rank = currentBot.Rank
 			if rank < 1 {
@@ -1047,6 +1052,12 @@ func simulateSeriesHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	gd, lexiconName, err := resolveLexicon(req.Lexicon)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+
 	games := req.Games
 	if games <= 0 {
 		games = 1
@@ -1087,9 +1098,11 @@ func simulateSeriesHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Every game is fully independent (simulateOneGame touches no shared
-	// mutable state - see the package-level vars' comments; gd/alph/ld/
-	// leaveValues/bingoProbabilityRank are all write-once-at-startup,
-	// read-only from here on), so games run concurrently across a bounded
+	// mutable state - alph/ld/leaveValues/bingoProbabilityRank are
+	// write-once-at-startup, read-only from here on; gd is resolved once
+	// just above, right before this loop, then only ever read by every
+	// goroutine below - never reassigned once the loop starts), so games
+	// run concurrently across a bounded
 	// worker pool instead of one at a time. Each worker owns a distinct
 	// index into results (handed out via the jobs channel, never shared
 	// between workers), so no two goroutines ever touch the same slot -
@@ -1116,13 +1129,13 @@ func simulateSeriesHandler(w http.ResponseWriter, r *http.Request) {
 		go func() {
 			defer wg.Done()
 			for gameIndex := range jobs {
-				results[gameIndex] = simulateOneGame(player1Bot, player2Bot)
+				results[gameIndex] = simulateOneGame(gd, player1Bot, player2Bot)
 			}
 		}()
 	}
 	wg.Wait()
 
-	resp := SimulateSeriesResponse{Games: results}
+	resp := SimulateSeriesResponse{Games: results, Lexicon: lexiconName}
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(resp)
 }

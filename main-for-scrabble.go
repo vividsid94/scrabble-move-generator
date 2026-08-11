@@ -65,6 +65,10 @@ type GenerateMovesRequest struct {
 	// unset too, so their response shape is byte-identical to before this
 	// field existed.
 	PauseMode string `json:"pauseMode,omitempty"`
+	// Lexicon selects which loaded KWG to use ("NWL23" or "CSW24") -
+	// resolveLexicon defaults to defaultLexicon when omitted, so existing
+	// callers that don't send this yet are unaffected.
+	Lexicon string `json:"lexicon,omitempty"`
 }
 
 // Move is a single ranked candidate: a word play, or (when IsExchange is
@@ -91,10 +95,14 @@ type GenerateMovesResponse struct {
 	// see decideGeneratePauseReason. omitempty keeps every other caller's
 	// response identical to before this field existed.
 	PauseReason string `json:"pauseReason,omitempty"`
+	// Lexicon echoes back which lexicon actually generated these moves,
+	// matching every other endpoint's response.
+	Lexicon string `json:"lexicon,omitempty"`
 }
 
 type ValidateWordRequest struct {
-	Word string `json:"word"`
+	Word    string `json:"word"`
+	Lexicon string `json:"lexicon,omitempty"`
 }
 
 type ValidateWordResponse struct {
@@ -105,6 +113,7 @@ type ValidateWordResponse struct {
 
 type SubanagramSearchRequest struct {
 	Letters string `json:"letters"`
+	Lexicon string `json:"lexicon,omitempty"`
 }
 
 type SubanagramSearchResponse struct {
@@ -116,6 +125,7 @@ type SubanagramSearchResponse struct {
 
 type AnagramSearchRequest struct {
 	Letters string `json:"letters"`
+	Lexicon string `json:"lexicon,omitempty"`
 }
 
 type AnagramSearchResponse struct {
@@ -132,6 +142,7 @@ type BulkMoveGenRequest struct {
 	Iterations         int             `json:"iterations,omitempty"`         // Number of iterations (default 1000)
 	IncludeMoveDetails bool            `json:"includeMoveDetails,omitempty"` // When true, include per-iteration move details
 	OurLeave           string          `json:"ourLeave,omitempty"`           // Optional fixed tiles for ourReply rack (rest drawn randomly)
+	Lexicon            string          `json:"lexicon,omitempty"`
 }
 
 // MoveTile describes one square in a played word (new tiles and play-throughs).
@@ -178,7 +189,8 @@ type BulkMoveGenResponse struct {
 }
 
 type ValidateWordsRequest struct {
-	Words []string `json:"words"`
+	Words   []string `json:"words"`
+	Lexicon string   `json:"lexicon,omitempty"`
 }
 
 type WordValidation struct {
@@ -194,12 +206,40 @@ type ValidateWordsResponse struct {
 	Lexicon  string           `json:"lexicon"`
 }
 
-// Global state (safe for demo, not for production concurrency)
+// Global state (safe for demo, not for production concurrency). lexica is
+// the one exception to "not for production concurrency" - it's populated
+// once in initService() and only ever READ afterward (never mutated per
+// request), so concurrent requests resolving different lexicons out of it
+// via resolveLexicon is safe. alph/ld stay single, shared values rather
+// than per-lexicon maps: NWL and CSW both use the same English tile set
+// (26 letters + 2 blanks, same distribution/point values), so there's
+// nothing lexicon-specific about either one.
 var (
-	gd   *kwg.KWG
-	alph *tilemapping.TileMapping
-	ld   *tilemapping.LetterDistribution
+	lexica map[string]*kwg.KWG
+	alph   *tilemapping.TileMapping
+	ld     *tilemapping.LetterDistribution
 )
+
+// defaultLexicon is what every existing caller gets when a request omits
+// Lexicon entirely - keeps every pre-existing integration (frontend calls
+// that don't send the field yet, this file's own comments before this
+// feature existed) working unchanged.
+const defaultLexicon = "NWL23"
+
+// resolveLexicon looks up the requested lexicon's KWG, defaulting to
+// defaultLexicon when name is empty. Returns the resolved name alongside
+// the KWG so callers can echo back which lexicon actually applied (several
+// response structs already have their own Lexicon field for this).
+func resolveLexicon(name string) (*kwg.KWG, string, error) {
+	if name == "" {
+		name = defaultLexicon
+	}
+	g, ok := lexica[name]
+	if !ok {
+		return nil, "", fmt.Errorf("unknown lexicon %q", name)
+	}
+	return g, name, nil
+}
 
 // createCustomBoardLayout creates a board layout from premium square definitions
 // If premiumSquares is nil or empty, returns the default CrosswordGameBoard
@@ -291,17 +331,27 @@ func initService() error {
 	fmt.Println("=== Initializing Macondo Move Generation Service ===")
 	cfg := config.DefaultConfig()
 	cfg.Set("data-path", ".")
-	var err error
-	gd, err = kwg.GetKWG(cfg.WGLConfig(), "NWL23")
-	if err != nil {
-		return fmt.Errorf("failed to load lexicon: %v", err)
+
+	lexica = make(map[string]*kwg.KWG)
+	for _, name := range []string{"NWL23", "CSW24"} {
+		g, err := kwg.GetKWG(cfg.WGLConfig(), name)
+		if err != nil {
+			return fmt.Errorf("failed to load lexicon %s: %v", name, err)
+		}
+		lexica[name] = g
+		fmt.Printf("✓ Loaded lexicon %s\n", name)
 	}
-	alph = gd.GetAlphabet()
+	// Alphabet is lexicon-independent (see the lexica var's own comment) -
+	// any loaded KWG's GetAlphabet() gives the same result, so this just
+	// picks the default rather than needing its own per-lexicon slot.
+	alph = lexica[defaultLexicon].GetAlphabet()
+
+	var err error
 	ld, err = tilemapping.EnglishLetterDistribution(cfg.WGLConfig())
 	if err != nil {
 		return fmt.Errorf("failed to load letter distribution: %v", err)
 	}
-	fmt.Println("✓ Loaded lexicon and letter distribution")
+	fmt.Println("✓ Loaded letter distribution")
 	return nil
 }
 
@@ -408,11 +458,20 @@ func generateMovesHandler(w http.ResponseWriter, r *http.Request) {
 	if req.TopN <= 0 {
 		req.TopN = 10
 	}
-	
+
+	// Shadows the removed package-level gd - every gd reference below this
+	// point in the function resolves to this request-scoped local instead,
+	// so nothing past this line needed to change.
+	gd, lexiconName, err := resolveLexicon(req.Lexicon)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+
 	// Create and initialize the board with custom premium squares if provided
 	boardLayout := createCustomBoardLayout(req.PremiumSquares)
 	bd := board.MakeBoard(boardLayout)
-	
+
 	// Set letters on the board
 	tilesPlayed := 0
 	for row := 0; row < 15; row++ {
@@ -426,10 +485,10 @@ func generateMovesHandler(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 	}
-	
+
 	// Manually set the tiles played count since SetLetter doesn't do this
 	bd.TestSetTilesPlayed(tilesPlayed)
-	
+
 	// Generate cross-sets and update anchors
 	cross_set.GenAllCrossSets(bd, gd, ld)
 	bd.UpdateAllAnchors()
@@ -541,6 +600,7 @@ func generateMovesHandler(w http.ResponseWriter, r *http.Request) {
 		Moves:       responseMoves,
 		Total:       len(moves),
 		PauseReason: decideGeneratePauseReason(responseMoves, req.PauseMode),
+		Lexicon:     lexiconName,
 	}
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(resp)
@@ -568,16 +628,22 @@ func validateWordHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	gd, lexiconName, err := resolveLexicon(req.Lexicon)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+
 	// Convert word to uppercase for consistency with lexicon
 	word := strings.ToUpper(strings.TrimSpace(req.Word))
-	
+
 	// Check if word exists in the loaded lexicon using existing logic
 	// We'll use the move generator to validate - if we can generate moves for this word, it's valid
 	var isValid bool
-	
+
 	// Create an empty board
 	bd := board.MakeBoard(board.CrosswordGameBoard)
-	
+
 	// Try to create a rack with the letters from the word
 	// This will fail if the word contains invalid characters
 	rack := tilemapping.RackFromString(word, alph)
@@ -628,11 +694,11 @@ func validateWordHandler(w http.ResponseWriter, r *http.Request) {
 	}
 	
 	response := ValidateWordResponse{
-		Word:      word,
-		IsValid:   isValid,
-		Lexicon:   "NWL23", // Using the same lexicon that's already loaded
+		Word:    word,
+		IsValid: isValid,
+		Lexicon: lexiconName,
 	}
-	
+
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(response)
 }
@@ -658,7 +724,13 @@ func validateWordsHandler(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "Words array is required", http.StatusBadRequest)
 		return
 	}
-	
+
+	gd, lexiconName, err := resolveLexicon(req.Lexicon)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+
 	// Validate each word using the same logic as validateWordHandler
 	validations := make([]WordValidation, 0, len(req.Words))
 	validCount := 0
@@ -737,7 +809,7 @@ func validateWordsHandler(w http.ResponseWriter, r *http.Request) {
 		Count:   len(req.Words),
 		Valid:   validCount,
 		Invalid: invalidCount,
-		Lexicon: "NWL23",
+		Lexicon: lexiconName,
 	}
 	
 	w.Header().Set("Content-Type", "application/json")
@@ -766,27 +838,33 @@ func findSubanagramsHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	gd, lexiconName, err := resolveLexicon(req.Lexicon)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+
 	// Convert letters to uppercase and remove spaces
 	letters := strings.ToUpper(strings.ReplaceAll(req.Letters, " ", ""))
-	
+
 	// Create an empty board
 	bd := board.MakeBoard(board.CrosswordGameBoard)
-	
+
 	// Try to create a rack with the letters
 	rack := tilemapping.RackFromString(letters, alph)
 	if rack == nil {
 		http.Error(w, "Invalid letters provided", http.StatusBadRequest)
 		return
 	}
-	
+
 	// Generate cross-sets for the empty board
 	cross_set.GenAllCrossSets(bd, gd, ld)
 	bd.UpdateAllAnchors()
-	
+
 	// Generate all possible moves
 	generator := movegen.NewGordonGenerator(gd, bd, ld)
 	moves := generator.GenAll(rack, false)
-	
+
 	// Extract unique words from the moves
 	subanagrams := make(map[string]bool)
 	for _, m := range moves {
@@ -821,10 +899,10 @@ func findSubanagramsHandler(w http.ResponseWriter, r *http.Request) {
 	sort.Strings(subanagramList)
 	
 	response := SubanagramSearchResponse{
-		Letters:      letters,
-		Subanagrams:  subanagramList,
-		Count:        len(subanagramList),
-		Lexicon:      "NWL23",
+		Letters:     letters,
+		Subanagrams: subanagramList,
+		Count:       len(subanagramList),
+		Lexicon:     lexiconName,
 	}
 	
 	w.Header().Set("Content-Type", "application/json")
@@ -853,28 +931,34 @@ func findAnagramsHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	gd, lexiconName, err := resolveLexicon(req.Lexicon)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+
 	// Convert letters to uppercase and remove spaces
 	letters := strings.ToUpper(strings.ReplaceAll(req.Letters, " ", ""))
 	inputLength := len(letters)
-	
+
 	// Create an empty board
 	bd := board.MakeBoard(board.CrosswordGameBoard)
-	
+
 	// Try to create a rack with the letters
 	rack := tilemapping.RackFromString(letters, alph)
 	if rack == nil {
 		http.Error(w, "Invalid letters provided", http.StatusBadRequest)
 		return
 	}
-	
+
 	// Generate cross-sets for the empty board
 	cross_set.GenAllCrossSets(bd, gd, ld)
 	bd.UpdateAllAnchors()
-	
+
 	// Generate all possible moves
 	generator := movegen.NewGordonGenerator(gd, bd, ld)
 	moves := generator.GenAll(rack, false)
-	
+
 	// Extract unique words from the moves that are the exact same length
 	anagrams := make(map[string]bool)
 	for _, m := range moves {
@@ -915,7 +999,7 @@ func findAnagramsHandler(w http.ResponseWriter, r *http.Request) {
 		Letters:  letters,
 		Anagrams: anagramList,
 		Count:    len(anagramList),
-		Lexicon:  "NWL23",
+		Lexicon:  lexiconName,
 	}
 	
 	w.Header().Set("Content-Type", "application/json")
@@ -1025,6 +1109,12 @@ func bulkMoveGenHandler(w http.ResponseWriter, r *http.Request) {
 
 	if req.Iterations <= 0 {
 		req.Iterations = 1000
+	}
+
+	gd, lexiconName, err := resolveLexicon(req.Lexicon)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
 	}
 
 	// Convert tile pool to uppercase and remove spaces
@@ -1187,7 +1277,7 @@ func bulkMoveGenHandler(w http.ResponseWriter, r *http.Request) {
 		BingoPercent:     bingoPercent,
 		TotalBingos:      totalBingos,
 		TotalScore:       totalScore,
-		Lexicon:          "NWL23",
+		Lexicon:          lexiconName,
 		IterationDetails: iterationDetails,
 	}
 
