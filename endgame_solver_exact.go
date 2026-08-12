@@ -21,13 +21,22 @@ package main
 // called UNCHANGED, reused straight from endgame_solver.go). It adds a
 // SEPARATE, bounded second pass, done exactly once per real-branching ply
 // of the FINAL answer (at most endgameDepthBudget of them - see that
-// constant, also in endgame_solver.go), that re-evaluates a capped number
-// of that position's own top candidates with a fresh, full (-inf,+inf)
-// window each - guaranteeing an exact value for every candidate actually
-// shown, at a small, constant added cost (endgameExactValueCap extra full
-// searches per ply) rather than the cost of disabling pruning across the
-// WHOLE tree the pruned search explores and discards while finding the
-// answer.
+// constant, also in endgame_solver.go), that re-evaluates that position's
+// own candidates with a fresh, full (-inf,+inf) window each - guaranteeing
+// an exact value for every candidate actually shown, never a pruned bound.
+//
+// exactCandidateTable (below) always fully searches the top
+// endgameExactValueCap candidates by the cheap static heuristic outright,
+// then SCANS whatever's left of the ranked list using a null-window probe
+// - the same PVS/NegaScout technique chess engines use to cheaply test "is
+// this at least as good as my current cutoff?" without paying for a full
+// search. A candidate that fails that probe is proven (not guessed) to be
+// no better than the current worst-shown entry, and gets skipped for free;
+// only a candidate that PASSES the probe earns the expensive full
+// re-search that finds its real exact value and (if it holds up) swaps it
+// into the shown set. This is what lets the table catch a genuinely strong
+// alternative that the static heuristic under-ranks, without paying full
+// search cost for every one of however many legal plays the position has.
 
 import (
 	"context"
@@ -270,28 +279,27 @@ func newlyUsedLettersExact(detailed *DetailedMove) string {
 }
 
 // exactCandidateTable computes a Quackle-style table of ranked alternatives
-// at ONE specific real position - every candidate returned here gets its
-// own fresh, full-window (-inf,+inf) search (evalEndgameCandidate, reused
-// unchanged from endgame_solver.go), so every Spread is genuinely exact,
-// never a pruned bound. Only called from solveEndgameExactHandler's own
-// replay loop, AFTER the main pruned search above has already found the
-// real answer, and only for the few positions actually ALONG that answer's
-// own line - not for every node the pruned search happened to visit and
-// discard while finding it. That scoping is what keeps this affordable: at
-// most endgameDepthBudget positions, endgameExactValueCap extra full
-// searches each, regardless of how wide endgameBranchWidth is.
+// at ONE specific real position - every candidate that ends up in the
+// returned table got its own fresh, full-window (-inf,+inf) search
+// (evalEndgameCandidate, reused unchanged from endgame_solver.go) at some
+// point, so every Spread is genuinely exact, never a pruned bound; the
+// null-window scan below only ever uses a search's PASS/FAIL verdict to
+// decide whether a candidate is worth that full search, never its raw
+// returned number. Only called from solveEndgameExactHandler's own replay
+// loop, AFTER the main pruned search above has already found the real
+// answer, and only for the few positions actually ALONG that answer's own
+// line - not for every node the pruned search happened to visit and
+// discard while finding it. That scoping is what keeps this affordable.
 //
 // chosenMove is the move actually played at this ply in the final line -
-// rankEndgameCandidates' own top-endgameExactValueCap slice is the natural
-// pool to re-search, but the "extra outplay candidate" it can append past
-// its own top cut (see that function's own comment) means the actual
-// winner can occasionally fall outside that slice; explicitly unioning it
-// in guarantees the table's own row 0 (EndgamePauseBanner.jsx's own
-// isChosen convention) always matches the move that was actually played -
-// its exact spread is provably >= every other candidate's here (the
-// pruned search already proved it's the true best move), so it will
-// always sort to row 0 on its own merits once every row's own value is
-// exact, this union just guarantees it's IN the list to begin with.
+// explicitly guaranteed a slot in the table regardless of where the cheap
+// heuristic or the scan below would otherwise place it, so the table's own
+// row 0 (EndgamePauseBanner.jsx's own isChosen convention) always matches
+// the move that was actually played. Its exact spread is provably >= every
+// other candidate's here (the pruned search already proved it's the true
+// best move), so once every row's own value is exact, it sorts to row 0 on
+// its own merits - this union just guarantees it's IN the table to begin
+// with.
 func exactCandidateTable(ctx context.Context, gd *kwg.KWG, bd *board.GameBoard, moverRack, opponentRack string, moverScore, opponentScore, onTurn, depthBudget int, chosenMove *macondomove.Move) []EndgameCandidateOption {
 	currentRack := moverRack
 	otherRack := opponentRack
@@ -300,43 +308,134 @@ func exactCandidateTable(ctx context.Context, gd *kwg.KWG, bd *board.GameBoard, 
 		otherRack = moverRack
 	}
 	ranked := rankEndgameCandidates(gd, bd, currentRack, otherRack)
+	isMaximizing := onTurn == 1
+	// String(), not pointer equality (==) - chosenMove came from a
+	// DIFFERENT call to move generation (the original search, several
+	// calls deep), and ranked here is a FRESH call's own output; nothing
+	// guarantees the underlying generator reuses/pools *macondomove.Move
+	// objects across separate calls rather than allocating new ones each
+	// time, so pointer identity can't be trusted to say "same move."
+	// String() is already the identity rankEndgameCandidates itself
+	// trusts elsewhere in this codebase (its own "play word:" filter).
+	chosenMoveKey := chosenMove.String()
 
-	count := endgameExactValueCap
-	if count > len(ranked) {
-		count = len(ranked)
+	fullSearch := func(cand scoredCandidate) int {
+		_, fs1, fs2 := evalEndgameCandidate(
+			ctx, gd, bd, moverRack, opponentRack, moverScore, opponentScore, onTurn, depthBudget,
+			-endgameAlphaBetaInfinity, endgameAlphaBetaInfinity, cand,
+		)
+		return fs1 - fs2
 	}
-	toRefine := ranked[:count]
 
+	type shownEntry struct {
+		cand   scoredCandidate
+		spread int
+	}
+
+	// Seed: the top endgameExactValueCap candidates by the cheap static
+	// heuristic (rankEndgameCandidates' own ranking) always get a full
+	// search outright, no probe needed - this is the table's guaranteed
+	// baseline coverage, unchanged from before this scan existed.
+	seedCount := endgameExactValueCap
+	if seedCount > len(ranked) {
+		seedCount = len(ranked)
+	}
+	shown := make([]shownEntry, 0, seedCount)
 	haveChosen := false
-	for _, c := range toRefine {
-		if c.move == chosenMove {
+	for _, cand := range ranked[:seedCount] {
+		shown = append(shown, shownEntry{cand, fullSearch(cand)})
+		if cand.move.String() == chosenMoveKey {
 			haveChosen = true
-			break
 		}
 	}
 	if !haveChosen {
-		for _, c := range ranked[count:] {
-			if c.move == chosenMove {
-				toRefine = append(append([]scoredCandidate{}, toRefine...), c)
+		for _, cand := range ranked[seedCount:] {
+			if cand.move.String() == chosenMoveKey {
+				shown = append(shown, shownEntry{cand, fullSearch(cand)})
+				haveChosen = true
 				break
 			}
 		}
 	}
 
-	result := make([]EndgameCandidateOption, 0, len(toRefine))
-	for _, cand := range toRefine {
-		_, fs1, fs2 := evalEndgameCandidate(
-			ctx, gd, bd, moverRack, opponentRack, moverScore, opponentScore, onTurn, depthBudget,
-			-endgameAlphaBetaInfinity, endgameAlphaBetaInfinity, cand,
-		)
-		result = append(result, EndgameCandidateOption{
-			Move:   *cand.detailed,
-			Leave:  cand.leave,
-			Spread: fs1 - fs2,
-		})
+	// worstShownIndex finds the current bottom of the shown set - the bar
+	// a later candidate has to clear to be worth a full search at all.
+	// Recomputed fresh each time (shown is at most endgameExactValueCap+1
+	// entries, so this is cheap) rather than tracked incrementally, since
+	// entries get REPLACED below, not just appended.
+	worstShownIndex := func() int {
+		wi := 0
+		for i := 1; i < len(shown); i++ {
+			if isMaximizing {
+				if shown[i].spread < shown[wi].spread {
+					wi = i
+				}
+			} else if shown[i].spread > shown[wi].spread {
+				wi = i
+			}
+		}
+		return wi
 	}
 
-	isMaximizing := onTurn == 1
+	// Scan whatever's left of ranked - the null-window/PVS technique (see
+	// this file's own top comment): a probe with a window exactly one
+	// point wide, just past the current cutoff, either fails (proving,
+	// via alpha-beta's own correctness guarantee, that this candidate
+	// cannot beat the cutoff, regardless of what raw number the probe
+	// itself returns) or passes (meaning it MIGHT be better, which is
+	// worth confirming with a real full search). chosenMove is skipped
+	// here - it was already handled above, unconditionally.
+	for i := seedCount; i < len(ranked); i++ {
+		cand := ranked[i]
+		if cand.move.String() == chosenMoveKey {
+			continue
+		}
+		if len(shown) == 0 {
+			shown = append(shown, shownEntry{cand, fullSearch(cand)})
+			continue
+		}
+
+		wi := worstShownIndex()
+		cutoff := shown[wi].spread
+
+		var probeAlpha, probeBeta int
+		if isMaximizing {
+			probeAlpha, probeBeta = cutoff, cutoff+1
+		} else {
+			probeAlpha, probeBeta = cutoff-1, cutoff
+		}
+		_, pfs1, pfs2 := evalEndgameCandidate(
+			ctx, gd, bd, moverRack, opponentRack, moverScore, opponentScore, onTurn, depthBudget,
+			probeAlpha, probeBeta, cand,
+		)
+		probeSpread := pfs1 - pfs2
+
+		passedProbe := probeSpread > cutoff
+		if !isMaximizing {
+			passedProbe = probeSpread < cutoff
+		}
+		if !passedProbe {
+			continue // proven no better than the current cutoff - free skip, no full search paid for
+		}
+
+		exactSpread := fullSearch(cand)
+		beatsCutoff := exactSpread > cutoff
+		if !isMaximizing {
+			beatsCutoff = exactSpread < cutoff
+		}
+		if beatsCutoff {
+			shown[wi] = shownEntry{cand, exactSpread}
+		}
+	}
+
+	result := make([]EndgameCandidateOption, 0, len(shown))
+	for _, s := range shown {
+		result = append(result, EndgameCandidateOption{
+			Move:   *s.cand.detailed,
+			Leave:  s.cand.leave,
+			Spread: s.spread,
+		})
+	}
 	sort.SliceStable(result, func(i, j int) bool {
 		if isMaximizing {
 			return result[i].Spread > result[j].Spread
