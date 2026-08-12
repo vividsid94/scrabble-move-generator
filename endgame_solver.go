@@ -104,6 +104,30 @@ type SolveEndgameResponse struct {
 	// alongside this endpoint's own Lexicon request field rather than
 	// resurrecting a dead one, since this response never had one before.
 	Lexicon string `json:"lexicon,omitempty"`
+	// Candidates[i] is the ranked sibling list actually evaluated at the
+	// node that produced Moves[i] - what the frontend needs to render a
+	// Quackle-style table not just for the first move, but for the second,
+	// third, etc., all from this one solve. Only real for the first
+	// endgameDepthBudget plies (where the search actually branches); past
+	// that it's the flat-greedy tail, so each entry there has at most one
+	// candidate (nothing worth tabling). Parallel to Moves - same length,
+	// same indexing, nil entries where nothing was recorded.
+	Candidates [][]EndgameCandidateOption `json:"candidates,omitempty"`
+}
+
+// EndgameCandidateOption is one row of that per-ply table: a candidate that
+// was actually evaluated at some node along the solved line, alongside the
+// exact final spread (mover's final score minus opponent's, always from the
+// ORIGINAL mover's perspective regardless of whose turn this node is) that
+// resulted from playing it and continuing within this search's own
+// depth/branch bounds - not an estimate, the same number endgameSearch's own
+// alpha-beta comparison already computes per candidate. Ranked best-first
+// from the perspective of whoever was on turn at that node (see
+// endgameSearch's own sort right before returning).
+type EndgameCandidateOption struct {
+	Move   DetailedMove `json:"move"`
+	Leave  string       `json:"leave"`
+	Spread int          `json:"spread"`
 }
 
 // The two line shapes streamed on /solve-endgame's response - see
@@ -137,6 +161,15 @@ type endgameLineEntry struct {
 	// propagated onto DetailedMove.IsOutplay in solveEndgameHandler's own
 	// replay loop below.
 	isOutplay bool
+	// siblings is the ranked candidate list evaluated at the node THIS
+	// entry's own move was chosen from (see endgameSearch, right before it
+	// returns bestLine) - nil for the pass/no-legal-play case (there was no
+	// candidate list, only "pass") and for the outplay-ending case (the
+	// entry that empties a rack never recurses into endgameSearch again, so
+	// there's no further node to have siblings). Propagated onto
+	// SolveEndgameResponse.Candidates in solveEndgameHandler's own replay
+	// loop below.
+	siblings []EndgameCandidateOption
 }
 
 func solveEndgameHandler(w http.ResponseWriter, r *http.Request) {
@@ -259,14 +292,17 @@ func solveEndgameHandler(w http.ResponseWriter, r *http.Request) {
 	// square rendering, same pattern bulkMoveGenHandler's own replay uses.
 	workingBd := bd.Copy()
 	moves := make([]DetailedMove, 0, len(line))
+	candidates := make([][]EndgameCandidateOption, 0, len(line))
 	for _, entry := range line {
 		if entry.move == nil {
 			moves = append(moves, *detailedMoveForPass())
+			candidates = append(candidates, entry.siblings)
 			continue
 		}
 		detailed := toDetailedMove(entry.move, workingBd, alph)
 		detailed.IsOutplay = entry.isOutplay
 		moves = append(moves, *detailed)
+		candidates = append(candidates, entry.siblings)
 		workingBd.PlayMove(entry.move)
 		cross_set.UpdateCrossSetsForMove(workingBd, entry.move, gd, ld)
 	}
@@ -279,6 +315,7 @@ func solveEndgameHandler(w http.ResponseWriter, r *http.Request) {
 			Plies:      len(moves),
 			Incomplete: incomplete,
 			Lexicon:    lexiconName,
+			Candidates: candidates,
 		},
 	})
 }
@@ -507,6 +544,13 @@ func endgameSearch(ctx context.Context, gd *kwg.KWG, bd *board.GameBoard, moverR
 	var bestLine []endgameLineEntry
 	var bestMoverScore, bestOpponentScore int
 	haveBest := false
+	// One row per candidate actually evaluated below, in evaluation order -
+	// re-sorted best-first (from this node's own on-turn player's
+	// perspective) right before returning. Attached to bestLine[0] at the
+	// very end, purely additive to the existing search/pruning logic above
+	// and below: nothing here changes which candidate wins, only records
+	// what each one's own resulting spread turned out to be.
+	siblingCandidates := make([]EndgameCandidateOption, 0, len(toExplore))
 
 	// Sequential, deliberately - a bounded worker pool was tried here (see
 	// git history) on the theory that toExplore's candidates are fully
@@ -530,6 +574,11 @@ func endgameSearch(ctx context.Context, gd *kwg.KWG, bd *board.GameBoard, moverR
 		line, fs1, fs2 := evalEndgameCandidate(ctx, gd, bd, moverRack, opponentRack, moverScore, opponentScore, onTurn, depthBudget, alpha, beta, cand)
 
 		spread := fs1 - fs2
+		siblingCandidates = append(siblingCandidates, EndgameCandidateOption{
+			Move:   *cand.detailed,
+			Leave:  cand.leave,
+			Spread: spread,
+		})
 		if !haveBest || (isMaximizing && spread > bestMoverScore-bestOpponentScore) || (!isMaximizing && spread < bestMoverScore-bestOpponentScore) {
 			haveBest = true
 			bestLine = line
@@ -570,6 +619,25 @@ func endgameSearch(ctx context.Context, gd *kwg.KWG, bd *board.GameBoard, moverR
 		if alpha >= beta {
 			break
 		}
+	}
+
+	// Best-first from this node's own on-turn player's perspective - a
+	// maximizer (mover, onTurn 1) wants the highest resulting spread,
+	// a minimizer (opponent, onTurn 2) wants the lowest, regardless of the
+	// fact that spread itself is always mover-relative. This is what makes
+	// siblingCandidates[0] line up with bestLine[0] - the same candidate the
+	// search above actually picked. An alpha-beta cutoff only ever shortens
+	// this slice (unevaluated siblings just never get appended above), it
+	// never reorders what was already evaluated, so this sort is still
+	// correct however early the loop stopped.
+	sort.SliceStable(siblingCandidates, func(i, j int) bool {
+		if isMaximizing {
+			return siblingCandidates[i].Spread > siblingCandidates[j].Spread
+		}
+		return siblingCandidates[i].Spread < siblingCandidates[j].Spread
+	})
+	if len(bestLine) > 0 {
+		bestLine[0].siblings = siblingCandidates
 	}
 
 	return bestLine, bestMoverScore, bestOpponentScore
