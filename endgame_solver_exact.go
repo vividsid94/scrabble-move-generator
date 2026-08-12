@@ -76,6 +76,23 @@ import (
 // candidates are worth a real look.
 const endgameExactValueCap = 30
 
+// endgameScanBudget caps how many candidates BEYOND endgameExactValueCap's
+// own seed the null-window scan (exactCandidateTable's own second phase)
+// will ever look at, regardless of how many of those probes pass or fail.
+// A null-window probe isn't free - at high depthBudget (root especially,
+// where a probe still recurses through 2 more full-width branching plies
+// before alpha-beta finds anything to compare against the window) it can
+// cost meaningfully more than "cheap," and a position where many
+// candidates cluster near the same value can make MOST probes pass,
+// triggering a full re-search for most of them too - without a hard
+// ceiling, the scan's own cost isn't actually bounded by anything, which
+// is what made it slow to begin with. This trades some coverage in
+// unusually open/close positions for a firm, predictable cost ceiling -
+// endgameExactValueCap+endgameScanBudget full-search-or-probe attempts
+// per real-branching ply, worst case, not "however many legal plays
+// exist."
+const endgameScanBudget = 20
+
 func solveEndgameExactHandler(w http.ResponseWriter, r *http.Request) {
 	setCORSHeaders(w, r)
 	if r.Method == http.MethodOptions {
@@ -377,19 +394,22 @@ func exactCandidateTable(ctx context.Context, gd *kwg.KWG, bd *board.GameBoard, 
 		return wi
 	}
 
-	// Scan whatever's left of ranked - the null-window/PVS technique (see
-	// this file's own top comment): a probe with a window exactly one
-	// point wide, just past the current cutoff, either fails (proving,
-	// via alpha-beta's own correctness guarantee, that this candidate
-	// cannot beat the cutoff, regardless of what raw number the probe
-	// itself returns) or passes (meaning it MIGHT be better, which is
-	// worth confirming with a real full search). chosenMove is skipped
-	// here - it was already handled above, unconditionally.
-	for i := seedCount; i < len(ranked); i++ {
+	// Scan whatever's left of ranked, up to endgameScanBudget candidates -
+	// the null-window/PVS technique (see this file's own top comment): a
+	// probe with a window exactly one point wide, just past the current
+	// cutoff, either fails (proving, via alpha-beta's own correctness
+	// guarantee, that this candidate cannot beat the cutoff, regardless of
+	// what raw number the probe itself returns) or passes (meaning it
+	// MIGHT be better, which is worth confirming with a real full search).
+	// chosenMove is skipped here - it was already handled above,
+	// unconditionally, and doesn't count against the budget.
+	scanned := 0
+	for i := seedCount; i < len(ranked) && scanned < endgameScanBudget; i++ {
 		cand := ranked[i]
 		if cand.move.String() == chosenMoveKey {
 			continue
 		}
+		scanned++
 		if len(shown) == 0 {
 			shown = append(shown, shownEntry{cand, fullSearch(cand)})
 			continue
