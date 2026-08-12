@@ -47,11 +47,25 @@ import (
 // get the expensive, fresh-window exact re-search - separate from
 // endgameBranchWidth (endgame_solver.go, 100), which bounds how many get
 // considered AT ALL for finding the correct best move in the first place.
-// Only needs to cover however many rows the frontend actually displays
-// (EndgamePauseBanner.jsx's MAX_VISIBLE_CHOICES, currently 10) plus a
-// little headroom in case exact values reorder the pruned ranking's own
-// top handful.
-const endgameExactValueCap = 15
+// Needs to cover more than just however many rows the frontend actually
+// displays (EndgamePauseBanner.jsx's MAX_VISIBLE_CHOICES, currently 10) -
+// this is a pre-filter by a CHEAP static heuristic (raw score + outplay
+// bonus, no lookahead - rankEndgameCandidates' own ranking), not by the
+// actual post-search value being computed here, so a real alternative that
+// looks mediocre by that heuristic but is genuinely strong after search
+// can rank outside the cap and never get evaluated at all - silently
+// missing from the table, not shown with a wrong number (the actual best
+// move is unaffected either way - see this file's own top comment: it's
+// unioned in explicitly even if the heuristic ranks it low).
+//
+// Raised 15->30 for more headroom against exactly that gap. Real endgame
+// positions rarely have anywhere near 100 legal plays to begin with (see
+// endgameBranchWidth's own comment in endgame_solver.go) - the cost here
+// is bounded by how many candidates actually exist, not always by this
+// constant, so this mostly matters in relatively open positions, which are
+// also where a heuristic pre-filter is most likely to misjudge which
+// candidates are worth a real look.
+const endgameExactValueCap = 30
 
 func solveEndgameExactHandler(w http.ResponseWriter, r *http.Request) {
 	setCORSHeaders(w, r)
