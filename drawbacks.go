@@ -1,0 +1,418 @@
+package main
+
+import (
+	"sort"
+	"strings"
+
+	"github.com/domino14/macondo/board"
+)
+
+// Drawback Scrabble: each player can be assigned a "drawback" - a
+// constraint on which candidates they're allowed to play. This file holds
+// the shared rule vocabulary (DrawbackRule), the registry of currently-
+// implemented drawbacks (drawbackByID, identified by the same numbering
+// the game-design doc uses - see whiffers' public/docs/drawback-ledger.html),
+// and the interpreter that filters simulateOneGame's candidate list before
+// ranking/selection, the same insertion point BingoAversion already uses.
+//
+// Only categories A (fits an existing LeaveRule-style primitive) and B (new
+// but still stateless - no memory needed beyond this one move) are
+// implemented here. Category C (forcing), D (stateful), E (scoring
+// override), and F (deferred lose-conditions) all need machinery this file
+// doesn't have yet.
+//
+// A JS mirror of this same rule vocabulary and registry lives in whiffers
+// at src/data/drawbacks.js / src/functions/drawbacks/evaluate.js, for Play
+// mode's human-move validation and bot-candidate filtering (not wired up
+// yet - Sandbox is first). The two are meant to be kept in sync by hand,
+// entry for entry - that's the trade being made instead of a slower,
+// single shared per-move JS loop for Sandbox series.
+
+// DrawbackRule is one drawback's actual constraint, in the same flat-
+// struct-with-omitempty style as LeaveRule - Type selects which other
+// fields apply. See each case in evaluateDrawback below for exactly what
+// each field means for that type.
+type DrawbackRule struct {
+	Type string `json:"type"`
+
+	Comparator string  `json:"comparator,omitempty"` // "gte" | "lte" | "eq", for any *Comparator-driven type
+	Value      float64 `json:"value,omitempty"`
+
+	Parity string `json:"parity,omitempty"` // "odd" | "even" - scoreParity, poolParityAfterMove
+	In     []int  `json:"in,omitempty"`     // tileCount: legal tile-count values
+
+	Forbid string `json:"forbid,omitempty"` // direction: "vertical" | "horizontal"
+
+	RackLetters string `json:"rackLetters,omitempty"` // rackHasAnyLimitsTileCount
+	MaxTiles    int    `json:"maxTiles,omitempty"`
+
+	Letter       string `json:"letter,omitempty"` // letterUseRequiresRackCount
+	MinRackCount int    `json:"minRackCount,omitempty"`
+
+	MinVowels int `json:"minVowels,omitempty"` // vowelGateForScoring
+
+	Types []string `json:"types,omitempty"` // forbiddenSquareTypes: "DWS" | "DLS" | "TWS" | "TLS"
+
+	MaxValue int `json:"maxValue,omitempty"` // firstTileValueLimit
+
+	ValueWhenBagEmpty float64 `json:"valueWhenBagEmpty,omitempty"` // wordsFormedCount
+
+	N int `json:"n,omitempty"` // excludeTopNCandidates
+
+	Letters  string `json:"letters,omitempty"` // restrictedTileSetScoreFloor
+	MinScore int    `json:"minScore,omitempty"`
+}
+
+// DrawbackDef pairs one drawback's identity (its game number, name, and
+// whether that name is Kevin's own or a placeholder assigned during
+// triage) with its actual rule. ID is stable and cross-references the
+// design doc's own numbering - never renumbered even though only a subset
+// of IDs exist in this registry yet.
+type DrawbackDef struct {
+	ID   int    `json:"id"`
+	Name string `json:"name"`
+	// Description is the player-facing instruction text - not consulted by
+	// evaluateDrawback (the Rule field is what's actually enforced), kept
+	// here only so this file and whiffers' src/data/drawbacks.js stay
+	// structurally identical entry for entry.
+	Description string       `json:"description"`
+	NameSource  string       `json:"nameSource"` // "kevin" | "claude"
+	Rule        DrawbackRule `json:"rule"`
+}
+
+// drawbacks is the current registry - category A (fits an existing
+// primitive) and category B (new stateless primitive) only. Kept in the
+// same order as the design doc for easy comparison.
+var drawbacks = []DrawbackDef{
+	// -- Category A --
+	{ID: 3, Name: "Hippopotomonstrosesquipedaliophobia", NameSource: "kevin",
+		Description: "Can't play words longer than 5 letters.",
+		Rule:        DrawbackRule{Type: "wordLength", Comparator: "lte", Value: 5}},
+	{ID: 15, Name: "Modesty", NameSource: "claude",
+		Description: "Can't score more than 35 points on a turn.",
+		Rule:        DrawbackRule{Type: "score", Comparator: "lte", Value: 35}},
+	{ID: 16, Name: "UV Gotta Be Kidding", NameSource: "kevin",
+		Description: "Must keep a leave with negative valuation every turn.",
+		Rule:        DrawbackRule{Type: "leaveValue", Comparator: "lt", Value: 0}},
+	{ID: 31, Name: "Oddball", NameSource: "claude",
+		Description: "Can't score an even amount of points on a turn.",
+		Rule:        DrawbackRule{Type: "scoreParity", Parity: "odd"}},
+	{ID: 35, Name: "Kingly Sum", NameSource: "kevin",
+		Description: "Main word's tiles must add up to at least 10.",
+		Rule:        DrawbackRule{Type: "tileValueSum", Comparator: "gte", Value: 10}},
+	{ID: 37, Name: "Gone Fishing", NameSource: "kevin",
+		Description: "Can only play 1, 2, or 7 tiles on a turn.",
+		Rule:        DrawbackRule{Type: "tileCount", In: []int{1, 2, 7}}},
+
+	// -- Category B --
+	{ID: 1, Name: "Fear of Heights", NameSource: "kevin",
+		Description: "Main words can't be played vertically (1-tile plays exempt).",
+		Rule:        DrawbackRule{Type: "direction", Forbid: "vertical"}},
+	{ID: 2, Name: "Vertie", NameSource: "kevin",
+		Description: "Can't play horizontally (1-tile plays exempt).",
+		Rule:        DrawbackRule{Type: "direction", Forbid: "horizontal"}},
+	{ID: 4, Name: "Plurality", NameSource: "kevin",
+		Description: "If you hold an S or blank, you can only play one tile.",
+		Rule:        DrawbackRule{Type: "rackHasAnyLimitsTileCount", RackLetters: "S?", MaxTiles: 1}},
+	{ID: 5, Name: "Strength in Numbers", NameSource: "claude",
+		Description: "Can only play an E if you have 3 or more E's on your rack.",
+		Rule:        DrawbackRule{Type: "letterUseRequiresRackCount", Letter: "E", MinRackCount: 3}},
+	{ID: 6, Name: "Well Balanced", NameSource: "kevin",
+		Description: "Can only score points if you have 3+ vowels on your rack.",
+		Rule:        DrawbackRule{Type: "vowelGateForScoring", MinVowels: 3}},
+	{ID: 11, Name: "Double Trouble", NameSource: "kevin",
+		Description: "Can't play a tile on a DWS or DLS square.",
+		Rule:        DrawbackRule{Type: "forbiddenSquareTypes", Types: []string{"DWS", "DLS"}}},
+	{ID: 22, Name: "Laureations", NameSource: "kevin",
+		Description: "Main word can't start with a tile worth more than 1 point.",
+		Rule:        DrawbackRule{Type: "firstTileValueLimit", MaxValue: 1}},
+	{ID: 26, Name: "Lone Wolf", NameSource: "claude",
+		Description: "Your plays can only make one word - no cross-words.",
+		Rule:        DrawbackRule{Type: "wordsFormedCount", Comparator: "eq", Value: 1}},
+	{ID: 27, Name: "Diamond In The Rough", NameSource: "kevin",
+		Description: "Can't play either of the top 2 equity plays.",
+		Rule:        DrawbackRule{Type: "excludeTopNCandidates", N: 2}},
+	{ID: 28, Name: "Feel My Power", NameSource: "kevin",
+		Description: "Can't play S, J, K, Q, X, Z, or a blank unless you score 50+.",
+		Rule:        DrawbackRule{Type: "restrictedTileSetScoreFloor", Letters: "SJKQXZ?", MinScore: 50}},
+	{ID: 32, Name: "Parallel Play", NameSource: "kevin",
+		Description: "Plays must form 3+ words, or 2+ once the bag is empty.",
+		Rule:        DrawbackRule{Type: "wordsFormedCount", Comparator: "gte", Value: 3, ValueWhenBagEmpty: 2}},
+	{ID: 40, Name: "Even Steven", NameSource: "claude",
+		Description: "Can't leave an odd number of tiles in the bag after your play.",
+		Rule:        DrawbackRule{Type: "poolParityAfterMove", Parity: "even"}},
+}
+
+var drawbackByID = func() map[int]DrawbackDef {
+	m := make(map[int]DrawbackDef, len(drawbacks))
+	for _, d := range drawbacks {
+		m[d.ID] = d
+	}
+	return m
+}()
+
+func compareFloat(actual float64, comparator string, threshold float64) bool {
+	switch comparator {
+	case "lte":
+		return actual <= threshold
+	case "eq":
+		return actual == threshold
+	default: // "gte"
+		return actual >= threshold
+	}
+}
+
+func newTileCount(c *scoredCandidate) int {
+	n := 0
+	for _, t := range c.detailed.Tiles {
+		if t.IsNew {
+			n++
+		}
+	}
+	return n
+}
+
+func tileLetterValue(t MoveTile) int {
+	if t.IsBlank || t.Letter == "" {
+		return 0
+	}
+	return letterPointValues[[]rune(t.Letter)[0]]
+}
+
+// firstTileOf returns the play's first tile in reading order - leftmost
+// for a horizontal play, topmost for a vertical one - which may be a
+// pre-existing tile the play merely extends from, not necessarily a new
+// one.
+func firstTileOf(c *scoredCandidate) MoveTile {
+	tiles := c.detailed.Tiles
+	first := tiles[0]
+	for _, t := range tiles[1:] {
+		if c.detailed.Direction == "down" {
+			if t.Row < first.Row {
+				first = t
+			}
+		} else if t.Col < first.Col {
+			first = t
+		}
+	}
+	return first
+}
+
+// countWordsFormed is 1 (the main word) plus one more for every NEW tile
+// that has an occupied square immediately before or after it on the
+// PERPENDICULAR axis, on the board as it stood before this move - the same
+// "does a cross word exist through here" check real Scrabble scoring
+// already has to make, recomputed here since neither scoredCandidate nor
+// DetailedMove expose a word count directly.
+func countWordsFormed(c *scoredCandidate, bd *board.GameBoard) int {
+	count := 1
+	for _, t := range c.detailed.Tiles {
+		if !t.IsNew {
+			continue
+		}
+		var before, after bool
+		if c.detailed.Direction == "down" {
+			before = t.Col > 0 && bd.GetLetter(t.Row, t.Col-1) != 0
+			after = t.Col < 14 && bd.GetLetter(t.Row, t.Col+1) != 0
+		} else {
+			before = t.Row > 0 && bd.GetLetter(t.Row-1, t.Col) != 0
+			after = t.Row < 14 && bd.GetLetter(t.Row+1, t.Col) != 0
+		}
+		if before || after {
+			count++
+		}
+	}
+	return count
+}
+
+// evaluateDrawback reports whether candidate c is still allowed under
+// rule, given the board as it stood before this move, the acting player's
+// rack before this move, and how many tiles remain in the bag before this
+// move. Only ever called for word-play candidates - exchanges are always
+// left alone by every drawback here, the same way BingoAversion leaves
+// them alone.
+func evaluateDrawback(rule DrawbackRule, c *scoredCandidate, preMoveRack string, bd *board.GameBoard, poolSizeBefore int) bool {
+	switch rule.Type {
+	case "wordLength":
+		return compareFloat(float64(len(c.detailed.Tiles)), rule.Comparator, rule.Value)
+
+	case "score":
+		return compareFloat(float64(c.detailed.Score), rule.Comparator, rule.Value)
+
+	case "scoreParity":
+		isEven := c.detailed.Score%2 == 0
+		return (rule.Parity == "even") == isEven
+
+	case "leaveValue":
+		return compareFloat(getLeaveValue(c.leave), rule.Comparator, rule.Value)
+
+	case "tileValueSum":
+		sum := 0
+		for _, t := range c.detailed.Tiles {
+			sum += tileLetterValue(t)
+		}
+		return compareFloat(float64(sum), rule.Comparator, rule.Value)
+
+	case "tileCount":
+		n := newTileCount(c)
+		for _, v := range rule.In {
+			if v == n {
+				return true
+			}
+		}
+		return false
+
+	case "direction":
+		// Kevin's own exemption: a play that's just one tile long overall
+		// (necessarily the game's opening move - anything later must
+		// connect to existing tiles, which makes it longer than one tile)
+		// has no real direction to forbid.
+		if len(c.detailed.Tiles) <= 1 {
+			return true
+		}
+		if rule.Forbid == "vertical" {
+			return c.detailed.Direction != "down"
+		}
+		return c.detailed.Direction != "right"
+
+	case "rackHasAnyLimitsTileCount":
+		hasAny := false
+		for _, l := range rule.RackLetters {
+			if strings.ContainsRune(preMoveRack, l) {
+				hasAny = true
+				break
+			}
+		}
+		if !hasAny {
+			return true
+		}
+		return newTileCount(c) <= rule.MaxTiles
+
+	case "letterUseRequiresRackCount":
+		usesLetter := false
+		for _, t := range c.detailed.Tiles {
+			if t.IsNew && !t.IsBlank && t.Letter == rule.Letter {
+				usesLetter = true
+				break
+			}
+		}
+		if !usesLetter {
+			return true
+		}
+		return countRune(preMoveRack, []rune(rule.Letter)[0]) >= rule.MinRackCount
+
+	case "vowelGateForScoring":
+		return countVowels(preMoveRack) >= rule.MinVowels
+
+	case "forbiddenSquareTypes":
+		for _, t := range c.detailed.Tiles {
+			if !t.IsNew {
+				continue
+			}
+			squareType, ok := premiumTypeAt(t.Row, t.Col, bd)
+			if !ok {
+				continue
+			}
+			for _, forbidden := range rule.Types {
+				if squareType == forbidden {
+					return false
+				}
+			}
+		}
+		return true
+
+	case "firstTileValueLimit":
+		return tileLetterValue(firstTileOf(c)) <= rule.MaxValue
+
+	case "wordsFormedCount":
+		threshold := rule.Value
+		if poolSizeBefore == 0 && rule.ValueWhenBagEmpty > 0 {
+			threshold = rule.ValueWhenBagEmpty
+		}
+		return compareFloat(float64(countWordsFormed(c, bd)), rule.Comparator, threshold)
+
+	case "restrictedTileSetScoreFloor":
+		usesRestricted := false
+		for _, t := range c.detailed.Tiles {
+			if !t.IsNew {
+				continue
+			}
+			if t.IsBlank {
+				if strings.ContainsRune(rule.Letters, '?') {
+					usesRestricted = true
+					break
+				}
+				continue
+			}
+			if strings.ContainsRune(rule.Letters, []rune(t.Letter)[0]) {
+				usesRestricted = true
+				break
+			}
+		}
+		if !usesRestricted {
+			return true
+		}
+		return c.detailed.Score >= rule.MinScore
+
+	case "poolParityAfterMove":
+		drawn := newTileCount(c)
+		if drawn > poolSizeBefore {
+			drawn = poolSizeBefore
+		}
+		after := poolSizeBefore - drawn
+		isEven := after%2 == 0
+		return (rule.Parity == "even") == isEven
+
+	default:
+		// Unknown/not-yet-implemented type - never silently disqualify a
+		// player's whole move set over a rule this build doesn't know how
+		// to check.
+		return true
+	}
+}
+
+// filterCandidatesByDrawback applies one drawback to a turn's already-
+// built candidate list, leaving exchanges untouched (same convention
+// BingoAversion uses) and word plays filtered by evaluateDrawback - except
+// excludeTopNCandidates, which needs the word plays' relative rank rather
+// than a per-candidate check, so it's handled as its own pass.
+func filterCandidatesByDrawback(candidates []scoredCandidate, rule DrawbackRule, preMoveRack string, bd *board.GameBoard, poolSizeBefore int) []scoredCandidate {
+	if rule.Type == "excludeTopNCandidates" {
+		ranked := make([]scoredCandidate, 0, len(candidates))
+		for _, c := range candidates {
+			if !c.isExchange {
+				ranked = append(ranked, c)
+			}
+		}
+		sort.SliceStable(ranked, func(i, j int) bool { return ranked[i].total > ranked[j].total })
+		excluded := ranked
+		if len(excluded) > rule.N {
+			excluded = excluded[:rule.N]
+		}
+		isExcluded := func(c *scoredCandidate) bool {
+			for i := range excluded {
+				if sameCandidate(c, &excluded[i]) {
+					return true
+				}
+			}
+			return false
+		}
+
+		filtered := make([]scoredCandidate, 0, len(candidates))
+		for i := range candidates {
+			if candidates[i].isExchange || !isExcluded(&candidates[i]) {
+				filtered = append(filtered, candidates[i])
+			}
+		}
+		return filtered
+	}
+
+	filtered := make([]scoredCandidate, 0, len(candidates))
+	for i := range candidates {
+		c := &candidates[i]
+		if c.isExchange || evaluateDrawback(rule, c, preMoveRack, bd, poolSizeBefore) {
+			filtered = append(filtered, *c)
+		}
+	}
+	return filtered
+}

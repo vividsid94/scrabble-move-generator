@@ -250,6 +250,15 @@ type BotConfig struct {
 	// play bingos - see BingoAversionRule. Filters the candidate pool
 	// before ranking.
 	BingoAversion *BingoAversionRule `json:"bingoAversion,omitempty"`
+	// DrawbackID, if set, looks up a DrawbackDef from drawbacks.go's
+	// registry (see that file) and filters the candidate pool by its rule
+	// before ranking - same insertion point as BingoAversion, and like it,
+	// exchanges are always left alone. An ID with no matching registry
+	// entry is silently ignored (evaluateDrawback's own default case is
+	// the same "don't touch anything" no-op), so a caller referencing a
+	// not-yet-implemented drawback ID degrades to no drawback rather than
+	// erroring.
+	DrawbackID *int `json:"drawbackId,omitempty"`
 	// SpecialSelection, if set to "longestWord" or "mostTiles", overrides
 	// every other selection mechanism entirely - see
 	// pickLongestOrMostTilesCandidate. Takes absolute precedence: Rank,
@@ -629,6 +638,19 @@ func simulateOneGame(gd *kwg.KWG, player1Bot, player2Bot BotConfig) SimGameResul
 					}
 				}
 				candidates = withoutBingos
+			}
+		}
+
+		// Drawback Scrabble: same insertion point as BingoAversion above,
+		// after it (so a bot can carry both a personality quirk and a
+		// drawback at once, each narrowing what the other left) but still
+		// before the rank-based sort, so "Nth static" is picking from the
+		// already-drawback-legal list. Skipped under SpecialSelection for
+		// the same reason BingoAversion is - those modes are an absolute
+		// override, nothing else gets a say.
+		if currentBot.DrawbackID != nil && currentBot.SpecialSelection == "" {
+			if def, ok := drawbackByID[*currentBot.DrawbackID]; ok {
+				candidates = filterCandidatesByDrawback(candidates, def.Rule, currentRack, bd, len(pool))
 			}
 		}
 
