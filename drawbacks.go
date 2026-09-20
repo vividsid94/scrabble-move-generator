@@ -162,6 +162,82 @@ func compareFloat(actual float64, comparator string, threshold float64) bool {
 	}
 }
 
+// ---- Board geometry ----
+//
+// Coordinates verified directly against Macondo's own board.CrosswordGameBoard
+// layout (github.com/domino14/macondo v0.10.9, board/layouts.go) - all
+// 0-indexed (row 0-14, col 0-14). Was originally part of rulesbot.go (a
+// RulesBot-only file, since deleted along with RulesBot itself); moved here
+// because it turned out to be generic board geometry, not anything
+// RulesBot-specific, and this is now its only consumer.
+
+type rcPos struct{ row, col int }
+
+var twsSquares = map[rcPos]bool{
+	{0, 0}: true, {0, 7}: true, {0, 14}: true,
+	{7, 0}: true, {7, 14}: true,
+	{14, 0}: true, {14, 7}: true, {14, 14}: true,
+}
+
+var tlsSquares = map[rcPos]bool{
+	{1, 5}: true, {1, 9}: true,
+	{5, 1}: true, {5, 5}: true, {5, 9}: true, {5, 13}: true,
+	{9, 1}: true, {9, 5}: true, {9, 9}: true, {9, 13}: true,
+	{13, 5}: true, {13, 9}: true,
+}
+
+var dlsSquares = map[rcPos]bool{
+	{0, 3}: true, {0, 11}: true,
+	{2, 6}: true, {2, 8}: true,
+	{3, 0}: true, {3, 7}: true, {3, 14}: true,
+	{6, 2}: true, {6, 6}: true, {6, 8}: true, {6, 12}: true,
+	{7, 3}: true, {7, 11}: true,
+	{8, 2}: true, {8, 6}: true, {8, 8}: true, {8, 12}: true,
+	{11, 0}: true, {11, 7}: true, {11, 14}: true,
+	{12, 6}: true, {12, 8}: true,
+	{14, 3}: true, {14, 11}: true,
+}
+
+var dwsSquares = map[rcPos]bool{
+	{1, 1}: true, {1, 13}: true,
+	{2, 2}: true, {2, 12}: true,
+	{3, 3}: true, {3, 11}: true,
+	{4, 4}: true, {4, 10}: true,
+	{7, 7}: true, // center
+	{10, 4}: true, {10, 10}: true,
+	{11, 3}: true, {11, 11}: true,
+	{12, 2}: true, {12, 12}: true,
+	{13, 1}: true, {13, 13}: true,
+}
+
+// premiumTypeAt returns the premium-square type at (r,c) and whether it's
+// currently empty and in-bounds - only an EMPTY premium square is a real
+// hit here, but for a NEW tile's own destination square that's always true
+// by construction (it can't be a new tile if the square were already
+// occupied), so this never actually filters anything out in practice for
+// forbiddenSquareTypes - it's kept for safety and because premiumTypeAt is
+// the established shape to match if this ever gets a second caller.
+func premiumTypeAt(r, c int, bd *board.GameBoard) (string, bool) {
+	if r < 0 || r >= 15 || c < 0 || c >= 15 {
+		return "", false
+	}
+	if bd.GetLetter(r, c) != 0 {
+		return "", false
+	}
+	pos := rcPos{r, c}
+	switch {
+	case twsSquares[pos]:
+		return "TWS", true
+	case dwsSquares[pos]:
+		return "DWS", true
+	case tlsSquares[pos]:
+		return "TLS", true
+	case dlsSquares[pos]:
+		return "DLS", true
+	}
+	return "", false
+}
+
 func newTileCount(c *scoredCandidate) int {
 	n := 0
 	for _, t := range c.detailed.Tiles {
