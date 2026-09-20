@@ -437,6 +437,17 @@ type SimTurn struct {
 	WithoutAversionWord           string `json:"withoutAversionWord,omitempty"`
 	WithoutAversionScore          int    `json:"withoutAversionScore,omitempty"`
 	WithoutAversionTilesExchanged string `json:"withoutAversionTilesExchanged,omitempty"`
+
+	// Same idea again, for a Drawback (see drawbacks.go): only set when
+	// this player's bot has one active AND it actually changed what got
+	// played this turn - i.e. re-running the same rank-based selection
+	// over the candidate list from BEFORE the drawback filtered it would
+	// have picked something else.
+	DrawbackImpacted         bool   `json:"drawbackImpacted,omitempty"`
+	WithoutDrawbackType      string `json:"withoutDrawbackType,omitempty"` // "play" | "exchange"
+	WithoutDrawbackWord      string `json:"withoutDrawbackWord,omitempty"`
+	WithoutDrawbackScore     int    `json:"withoutDrawbackScore,omitempty"`
+	WithoutDrawbackExchanged string `json:"withoutDrawbackTilesExchanged,omitempty"`
 }
 
 type SimGameResult struct {
@@ -648,8 +659,15 @@ func simulateOneGame(gd *kwg.KWG, player1Bot, player2Bot BotConfig) SimGameResul
 		// already-drawback-legal list. Skipped under SpecialSelection for
 		// the same reason BingoAversion is - those modes are an absolute
 		// override, nothing else gets a say.
+		//
+		// Snapshot first, same reasoning as unfilteredForBingoCompare above -
+		// lets the drawback-impact comparison below ask "what would this
+		// bot have picked with no drawback at all."
+		var unfilteredForDrawbackCompare []scoredCandidate
 		if currentBot.DrawbackID != nil && currentBot.SpecialSelection == "" {
 			if def, ok := drawbackByID[*currentBot.DrawbackID]; ok {
+				unfilteredForDrawbackCompare = make([]scoredCandidate, len(candidates))
+				copy(unfilteredForDrawbackCompare, candidates)
 				candidates = filterCandidatesByDrawback(candidates, def.Rule, currentRack, bd, len(pool))
 			}
 		}
@@ -727,6 +745,25 @@ func simulateOneGame(gd *kwg.KWG, player1Bot, player2Bot BotConfig) SimGameResul
 			bingoAversionImpacted = !sameCandidate(chosen, withoutAversionChosen)
 		}
 
+		// Drawback-impact check: what would this bot have picked from the
+		// candidate list from BEFORE the drawback filtered it - same rank,
+		// same board/rack, no RNG - i.e. a clean A/B on the drawback alone.
+		// unfilteredForDrawbackCompare is only non-nil when a drawback is
+		// actually active (see where it's populated above).
+		var drawbackImpacted bool
+		var withoutDrawbackChosen *scoredCandidate
+		if unfilteredForDrawbackCompare != nil && len(unfilteredForDrawbackCompare) > 0 {
+			sort.SliceStable(unfilteredForDrawbackCompare, func(i, j int) bool {
+				return unfilteredForDrawbackCompare[i].total > unfilteredForDrawbackCompare[j].total
+			})
+			dIdx := rank - 1
+			if dIdx < 0 || dIdx >= len(unfilteredForDrawbackCompare) {
+				dIdx = 0
+			}
+			withoutDrawbackChosen = &unfilteredForDrawbackCompare[dIdx]
+			drawbackImpacted = !sameCandidate(chosen, withoutDrawbackChosen)
+		}
+
 		currentScoreBefore := score1
 		if currentPlayer == 2 {
 			currentScoreBefore = score2
@@ -735,6 +772,7 @@ func simulateOneGame(gd *kwg.KWG, player1Bot, player2Bot BotConfig) SimGameResul
 		turn := SimTurn{
 			Player: currentPlayer, RackBefore: currentRack,
 			RuleImpacted: ruleImpacted, BingoAversionImpacted: bingoAversionImpacted,
+			DrawbackImpacted: drawbackImpacted,
 		}
 		if ruleImpacted {
 			if baselineChosen.isExchange {
@@ -754,6 +792,16 @@ func simulateOneGame(gd *kwg.KWG, player1Bot, player2Bot BotConfig) SimGameResul
 				turn.WithoutAversionType = "play"
 				turn.WithoutAversionWord = withoutAversionChosen.detailed.Word
 				turn.WithoutAversionScore = withoutAversionChosen.detailed.Score
+			}
+		}
+		if drawbackImpacted {
+			if withoutDrawbackChosen.isExchange {
+				turn.WithoutDrawbackType = "exchange"
+				turn.WithoutDrawbackExchanged = withoutDrawbackChosen.exchangeTiles
+			} else {
+				turn.WithoutDrawbackType = "play"
+				turn.WithoutDrawbackWord = withoutDrawbackChosen.detailed.Word
+				turn.WithoutDrawbackScore = withoutDrawbackChosen.detailed.Score
 			}
 		}
 		var newRack string
