@@ -317,7 +317,6 @@ func main() {
 	http.HandleFunc("/solve-endgame", solveEndgameHandler)
 	http.HandleFunc("/solve-endgame-exact", solveEndgameExactHandler)
 	http.HandleFunc("/simulate-series", simulateSeriesHandler)
-	http.HandleFunc("/rulesbot-debug", rulesBotDebugHandler)
 	http.HandleFunc("/proxy", proxyHandler)
 
 	port := os.Getenv("PORT")

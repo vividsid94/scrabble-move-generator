@@ -228,8 +228,6 @@ pick a fixed rank from a score+leaveValue-ranked candidate list every turn
 table - entirely server-side, returning the full turn-by-turn history for
 each game in a single response. Built for bulk-simulating series without one
 HTTP call per move. Rank 1 is "Theo" (best move); rank N is "Nth static".
-Bots that need per-move opponent simulation (Tess) aren't supported here and
-stay on the client-side loop.
 
 **Request (legacy, rank only):**
 ```json

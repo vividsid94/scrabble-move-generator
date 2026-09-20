@@ -1,8 +1,7 @@
 package main
 
 // Full-game simulator for any matchup of "static" bots - ones that pick a
-// fixed rank from a score+leaveValue-ranked candidate list every turn, with
-// no per-move opponent simulation (that's Tess, which stays client-side).
+// fixed rank from a score+leaveValue-ranked candidate list every turn.
 // Theo is just rank 1; "Nth static" is any other rank 1-15 the app's UI
 // offers. Additive to main-for-scrabble.go: reuses its package-level
 // alph/ld and resolveLexicon/lexica (gd itself is request-scoped, not a
@@ -247,33 +246,19 @@ func applyLeaveRules(leave string, rules []LeaveRule) float64 {
 type BotConfig struct {
 	Rank       int         `json:"rank,omitempty"`
 	LeaveRules []LeaveRule `json:"leaveRules,omitempty"`
-	// IsTess selects a completely different selection algorithm from Rank -
-	// see pickTessCandidate. Rank AND LeaveRules are both ignored when this
-	// is true - Tess always evaluates on the plain leaves.json value
-	// (candidate.baselineTotal), matching her original client-side
-	// behavior exactly regardless of what LeaveRules a caller sends.
-	IsTess bool `json:"isTess,omitempty"`
 	// BingoAversion, if set, makes this bot (comedically) reluctant to
-	// play bingos - see BingoAversionRule. Applies uniformly to whichever
-	// selection mechanism is in play (rank-based or Tess), since it
-	// filters the shared candidate pool before either one sees it.
+	// play bingos - see BingoAversionRule. Filters the candidate pool
+	// before ranking.
 	BingoAversion *BingoAversionRule `json:"bingoAversion,omitempty"`
 	// SpecialSelection, if set to "longestWord" or "mostTiles", overrides
 	// every other selection mechanism entirely - see
 	// pickLongestOrMostTilesCandidate. Takes absolute precedence: Rank,
-	// IsTess, LeaveRules, and BingoAversion are all ignored when this is
-	// set (checked first in simulateOneGame's turn loop, and
-	// BingoAversion's pool filtering is skipped outright) - deliberately
-	// no conjunction with any other mode, so there's nothing to reconcile
-	// between "play the longest word" and e.g. "but also avoid bingos."
+	// LeaveRules, and BingoAversion are all ignored when this is set
+	// (checked first in simulateOneGame's turn loop, and BingoAversion's
+	// pool filtering is skipped outright) - deliberately no conjunction
+	// with any other mode, so there's nothing to reconcile between "play
+	// the longest word" and e.g. "but also avoid bingos."
 	SpecialSelection string `json:"specialSelection,omitempty"` // "" | "longestWord" | "mostTiles"
-	// IsRulesBot selects a third selection algorithm alongside Rank/IsTess -
-	// see pickRulesBotCandidate in rulesbot.go for the six hardcoded defense
-	// rules it applies on top of the normal score+leave total. Unlike
-	// SpecialSelection, this is compatible with LeaveRules and
-	// BingoAversion (both still apply normally beforehand) - only Rank is
-	// meaningless here, the same way it's meaningless for Tess.
-	IsRulesBot bool `json:"isRulesBot,omitempty"`
 }
 
 // BingoAversionRule excludes bingo candidates (word plays using all 7 rack
@@ -305,122 +290,6 @@ type BotConfig struct {
 type BingoAversionRule struct {
 	Probability        float64 `json:"probability,omitempty"`
 	MaxProbabilityRank int     `json:"maxProbabilityRank,omitempty"`
-}
-
-// tessCandidateCount/tessSimIterations mirror sandboxBotFunctions.js's Tess
-// algorithm (top-15 candidates, N simulated opponent replies each) but with
-// far fewer iterations per candidate - the client's 100 was calibrated for
-// a single live HTTP decision; here the same decision gets made on every
-// turn of every game in a series, so 100 would make a multi-game Tess
-// series impractically slow. 20 is a starting guess, not a measured value -
-// worth revisiting once this can actually be timed against a deployment.
-//
-// Tried 100 + parallelizing this same loop across a bounded worker pool
-// (see git history) - live-benchmarked worse in both directions (one Tess
-// side: ~1.8-2.0s/game -> 7.43s/game; both sides: ~2.6-2.9s/game ->
-// 11.56s/game). The parallel version wasn't literally doing nothing (7.43s
-// beats the ~9.5s a naive fully-sequential 100 would predict), so Railway's
-// container almost certainly has very few real cores available -
-// runtime.GOMAXPROCS(0) doesn't know that by default (it reflects
-// runtime.NumCPU(), not necessarily the container's actual CPU quota), so
-// both this loop AND simulateSeriesHandler's own game-level pool end up
-// requesting far more concurrent workers than the hardware can actually run
-// at once. Revisit if the deployment ever gets more CPU, or if GOMAXPROCS
-// gets set explicitly (env var, or a cgroup-aware library) to match its
-// real quota - right now more parallelism here has nothing to parallelize
-// onto.
-const (
-	tessCandidateCount = 15
-	tessSimIterations  = 20
-)
-
-// pickTessCandidate mirrors sandboxBotFunctions.js's pickBotMove Tess
-// branch: from the top tessCandidateCount candidates by plain score+leave
-// value (baselineTotal - Tess ignores LeaveRules entirely, unlike the
-// rank-based bots, so any custom rules a caller attaches to a Tess
-// BotConfig have zero effect on her), simulate tessSimIterations random
-// opponent replies for each - drawing a random rack from the shared bag
-// (pool already excludes both players' actual racks, so this is the same
-// "unseen tiles" proxy the client version uses, not the specific known
-// opponent rack) and scoring their best generic score+plain-leave reply via
-// pickBestCandidate (the same logic /bulk-move-gen itself uses for its own
-// opponent-simulation) - then picks whichever candidate maximizes
-// baselineTotal - 2*avgOpponentReply. Unlike the client's version (15
-// separate HTTP calls to /bulk-move-gen, 100 iterations each), this runs
-// entirely in-process against the board/pool state simulateOneGame already
-// holds in memory - it never mutates bd or pool, only reads them (board
-// copies for word-play candidates are made and discarded internally).
-func pickTessCandidate(gd *kwg.KWG, candidates []scoredCandidate, bd *board.GameBoard, alph *tilemapping.TileMapping, pool string) *scoredCandidate {
-	if len(candidates) == 0 {
-		return nil
-	}
-
-	// Re-sort by baselineTotal rather than trusting the incoming order -
-	// candidates arrive already sorted by total, which may be rule-adjusted
-	// for a rank-based bot on the other side of the board; Tess's own pool
-	// selection must never be influenced by LeaveRules either.
-	sorted := make([]scoredCandidate, len(candidates))
-	copy(sorted, candidates)
-	sort.SliceStable(sorted, func(i, j int) bool { return sorted[i].baselineTotal > sorted[j].baselineTotal })
-
-	topN := sorted
-	if len(topN) > tessCandidateCount {
-		topN = topN[:tessCandidateCount]
-	}
-
-	// No unseen tiles left to simulate an opponent reply from - fall back
-	// to the plain best-by-total candidate, matching the client's own
-	// "empty pool -> no simulated threat" fallback.
-	if len(pool) == 0 {
-		return &topN[0]
-	}
-
-	var best *scoredCandidate
-	bestAdjusted := 0.0
-
-	for i := range topN {
-		candidate := &topN[i]
-
-		candidateBd := bd
-		if !candidate.isExchange {
-			candidateBd = bd.Copy()
-			candidateBd.PlayMove(candidate.move)
-			cross_set.UpdateCrossSetsForMove(candidateBd, candidate.move, gd, ld)
-		}
-
-		totalOpponentScore := 0
-		validIterations := 0
-		for j := 0; j < tessSimIterations; j++ {
-			opponentRackStr, opponentRack := generateRandomRack(pool, 7, alph)
-			if opponentRack == nil {
-				continue
-			}
-			remainingPool := removeRackFromPool(pool, opponentRackStr)
-			opponentGen := movegen.NewGordonGenerator(gd, candidateBd, ld)
-			opponentRawMoves := opponentGen.GenAll(opponentRack, false)
-			opponentChosen := pickBestCandidate(opponentRawMoves, candidateBd, alph, opponentRackStr, remainingPool)
-
-			score := 0
-			if opponentChosen != nil && !opponentChosen.isExchange {
-				score = opponentChosen.detailed.Score
-			}
-			totalOpponentScore += score
-			validIterations++
-		}
-
-		avgOpponentScore := 0.0
-		if validIterations > 0 {
-			avgOpponentScore = float64(totalOpponentScore) / float64(validIterations)
-		}
-
-		adjusted := candidate.baselineTotal - 2*avgOpponentScore
-		if best == nil || adjusted > bestAdjusted {
-			best = candidate
-			bestAdjusted = adjusted
-		}
-	}
-
-	return best
 }
 
 // pickLongestOrMostTilesCandidate implements the "Longest word" / "Most
@@ -553,34 +422,12 @@ type SimTurn struct {
 	// what would otherwise have been played this turn - i.e. re-running the
 	// same selection over the candidate list from BEFORE bingo filtering
 	// would have picked something else (almost always a bingo that got
-	// excluded). Like RuleImpacted, only computed for rank-based bots - see
-	// the comment at its computation site for why Tess is out of scope.
+	// excluded).
 	BingoAversionImpacted         bool   `json:"bingoAversionImpacted,omitempty"`
 	WithoutAversionType           string `json:"withoutAversionType,omitempty"` // "play" | "exchange"
 	WithoutAversionWord           string `json:"withoutAversionWord,omitempty"`
 	WithoutAversionScore          int    `json:"withoutAversionScore,omitempty"`
 	WithoutAversionTilesExchanged string `json:"withoutAversionTilesExchanged,omitempty"`
-
-	// Only set when this player's bot is RulesBot (rulesbot.go) - reports
-	// whether its six hardcoded defense rules, collectively and
-	// individually, changed what got played this turn versus a plain
-	// score+leave bot working from the same candidate list. See
-	// RulesBotImpact in rulesbot.go for exactly what each field means -
-	// these are a direct field-for-field copy of that struct, generalizing
-	// RuleImpacted/Baseline* above from one aggregate flag to RulesBot's
-	// six named rules.
-	RulesBotImpacted               bool   `json:"rulesBotImpacted,omitempty"`
-	RulesBotBaselineType           string `json:"rulesBotBaselineType,omitempty"` // "play" | "exchange"
-	RulesBotBaselineWord           string `json:"rulesBotBaselineWord,omitempty"`
-	RulesBotBaselineScore          int    `json:"rulesBotBaselineScore,omitempty"`
-	RulesBotBaselineTilesExchanged string `json:"rulesBotBaselineTilesExchanged,omitempty"`
-
-	RulesBotOpeningVowelImpacted bool `json:"rulesBotOpeningVowelImpacted,omitempty"`
-	RulesBotOpeningStarImpacted  bool `json:"rulesBotOpeningStarImpacted,omitempty"`
-	RulesBotClosenessImpacted    bool `json:"rulesBotClosenessImpacted,omitempty"`
-	RulesBotVowelPremiumImpacted bool `json:"rulesBotVowelPremiumImpacted,omitempty"`
-	RulesBotHookImpacted         bool `json:"rulesBotHookImpacted,omitempty"`
-	RulesBotLaneCountImpacted    bool `json:"rulesBotLaneCountImpacted,omitempty"`
 }
 
 type SimGameResult struct {
@@ -659,10 +506,7 @@ func sameCandidate(a, b *scoredCandidate) bool {
 // whatever order GenAll returns moves in). A "static" bot (Theo = rank 1,
 // or a user-chosen Nth rank) just indexes into that list sorted by total,
 // which its own LeaveRules adjust (via applyLeaveRules) - so two static
-// bots at the same rank can genuinely play differently. A Tess bot
-// (IsTess true) instead runs pickTessCandidate's opponent-simulation
-// selection, which ignores LeaveRules entirely and always uses the plain
-// baselineTotal - see that function's comment for why.
+// bots at the same rank can genuinely play differently.
 func simulateOneGame(gd *kwg.KWG, player1Bot, player2Bot BotConfig) SimGameResult {
 	bd := board.MakeBoard(board.CrosswordGameBoard)
 	cross_set.GenAllCrossSets(bd, gd, ld)
@@ -744,18 +588,17 @@ func simulateOneGame(gd *kwg.KWG, player1Bot, player2Bot BotConfig) SimGameResul
 		// later ask "what would this bot have picked with no aversion at
 		// all" - cheap to copy, skipped entirely when it'd never be used.
 		var unfilteredForBingoCompare []scoredCandidate
-		if currentBot.SpecialSelection == "" && currentBot.BingoAversion != nil && !currentBot.IsTess && !currentBot.IsRulesBot {
+		if currentBot.SpecialSelection == "" && currentBot.BingoAversion != nil {
 			unfilteredForBingoCompare = make([]scoredCandidate, len(candidates))
 			copy(unfilteredForBingoCompare, candidates)
 		}
 
 		// Bingo aversion filters the pool before anything else sees it, so
-		// both the rank-based total sort below and Tess's own re-sort by
-		// baselineTotal are already working from the same reduced list -
-		// no special-casing needed downstream for either selection mode.
-		// Skipped entirely under SpecialSelection - those modes exist to
-		// actively seek out bingos, the opposite of what aversion is for,
-		// so there's no conjunction to reconcile between the two.
+		// the rank-based total sort below is already working from the
+		// reduced list - no special-casing needed downstream. Skipped
+		// entirely under SpecialSelection - those modes exist to actively
+		// seek out bingos, the opposite of what aversion is for, so
+		// there's no conjunction to reconcile between the two.
 		if ba := currentBot.BingoAversion; ba != nil && currentBot.SpecialSelection == "" {
 			// Per-candidate: deterministically drop any individual bingo
 			// whose word isn't well-known enough. Words with no rank at
@@ -797,21 +640,15 @@ func simulateOneGame(gd *kwg.KWG, player1Bot, player2Bot BotConfig) SimGameResul
 		sort.SliceStable(candidates, func(i, j int) bool { return candidates[i].total > candidates[j].total })
 
 		var chosen *scoredCandidate
-		// rank stays 0 for Tess, SpecialSelection, and RulesBot (meaningless
-		// for any of them) - only used below for the rank-based rule-impact
-		// baseline.
+		// rank stays 0 for SpecialSelection (meaningless there) - only used
+		// below for the rank-based rule-impact baseline.
 		var rank int
-		var rulesBotImpact *RulesBotImpact
 		switch {
 		case currentBot.SpecialSelection != "":
 			// Absolute override - takes precedence over everything else,
 			// by construction rather than by checking flags in combination
 			// (see BotConfig.SpecialSelection's comment).
 			chosen = pickLongestOrMostTilesCandidate(candidates, currentBot.SpecialSelection)
-		case currentBot.IsTess:
-			chosen = pickTessCandidate(gd, candidates, bd, alph, pool)
-		case currentBot.IsRulesBot:
-			chosen, rulesBotImpact = pickRulesBotCandidate(gd, candidates, bd, len(turns) == 0)
 		default:
 			rank = currentBot.Rank
 			if rank < 1 {
@@ -833,15 +670,11 @@ func simulateOneGame(gd *kwg.KWG, player1Bot, player2Bot BotConfig) SimGameResul
 		// Rule-impact check: what would a plain (no custom rules) bot at the
 		// same rank have picked from this EXACT same candidate list - same
 		// board, same rack, no RNG involved, so this is a clean A/B on the
-		// rule alone. Only computed for rank-based bots for now - Tess's
-		// selection isn't rank-based (it's a 15-candidate x N-iteration
-		// opponent simulation), so a fair baseline would mean re-running
-		// that whole simulation a second time; left out of scope here to
-		// keep her already-heavier per-turn cost in check. Also skipped
-		// under SpecialSelection, which ignores LeaveRules entirely.
+		// rule alone. Skipped under SpecialSelection, which ignores
+		// LeaveRules entirely.
 		var ruleImpacted bool
 		var baselineChosen *scoredCandidate
-		if currentBot.SpecialSelection == "" && !currentBot.IsTess && !currentBot.IsRulesBot && len(currentBot.LeaveRules) > 0 && len(candidates) > 0 {
+		if currentBot.SpecialSelection == "" && len(currentBot.LeaveRules) > 0 && len(candidates) > 0 {
 			baseline := make([]scoredCandidate, len(candidates))
 			copy(baseline, candidates)
 			sort.SliceStable(baseline, func(i, j int) bool { return baseline[i].baselineTotal > baseline[j].baselineTotal })
@@ -899,25 +732,6 @@ func simulateOneGame(gd *kwg.KWG, player1Bot, player2Bot BotConfig) SimGameResul
 				turn.WithoutAversionType = "play"
 				turn.WithoutAversionWord = withoutAversionChosen.detailed.Word
 				turn.WithoutAversionScore = withoutAversionChosen.detailed.Score
-			}
-		}
-		if rulesBotImpact != nil {
-			turn.RulesBotImpacted = rulesBotImpact.Impacted
-			turn.RulesBotOpeningVowelImpacted = rulesBotImpact.OpeningVowelImpacted
-			turn.RulesBotOpeningStarImpacted = rulesBotImpact.OpeningStarImpacted
-			turn.RulesBotClosenessImpacted = rulesBotImpact.ClosenessImpacted
-			turn.RulesBotVowelPremiumImpacted = rulesBotImpact.VowelPremiumImpacted
-			turn.RulesBotHookImpacted = rulesBotImpact.HookPremiumImpacted
-			turn.RulesBotLaneCountImpacted = rulesBotImpact.LaneCountImpacted
-			if rulesBotImpact.Impacted {
-				if rulesBotImpact.BaselineIsExchange {
-					turn.RulesBotBaselineType = "exchange"
-					turn.RulesBotBaselineTilesExchanged = rulesBotImpact.BaselineExchangeTiles
-				} else {
-					turn.RulesBotBaselineType = "play"
-					turn.RulesBotBaselineWord = rulesBotImpact.BaselineWord
-					turn.RulesBotBaselineScore = rulesBotImpact.BaselineScore
-				}
 			}
 		}
 		var newRack string
@@ -1064,12 +878,7 @@ func simulateSeriesHandler(w http.ResponseWriter, r *http.Request) {
 	}
 	if games > 500 {
 		// Sane cap so one request can't run unbounded - matches the app's
-		// static-bot UI cap. NOTE: this cap was sized for cheap rank-based
-		// bots. A Tess bot (IsTess) is ~tessCandidateCount*tessSimIterations
-		// (300x) more expensive per turn - the frontend is expected to send
-		// a much lower games count whenever either bot is Tess (see
-		// sandboxStore.js's getMaxGamesForBots), but this handler itself
-		// doesn't enforce a lower cap for that case yet.
+		// static-bot UI cap.
 		games = 500
 	}
 
