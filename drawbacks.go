@@ -16,10 +16,21 @@ import (
 // ranking/selection, the same insertion point BingoAversion already uses.
 //
 // Categories A (fits an existing LeaveRule-style primitive), B (new but
-// still stateless - no memory needed beyond this one move), and C (same
-// stateless shape as B, evaluated backwards - see DrawbackRule.Forcing) are
-// implemented here. D (stateful), E (scoring override), and F (deferred
-// lose-conditions) all need machinery this file doesn't have yet.
+// still stateless - no memory needed beyond this one move), C (same
+// stateless shape as B, evaluated backwards - see DrawbackRule.Forcing),
+// and the first 4 of D (stateful - needs to know about turns other than
+// this one) are implemented here. D's own remaining 6 are either blocked
+// on a real design decision (see the ledger) or just need a quick wording
+// confirm, not built yet. E (scoring override) and F (deferred lose-
+// conditions) need machinery this file doesn't have at all.
+//
+// D's own "state" turned out not to need any new persisted-memory
+// machinery - lastWordPlayByPlayer/allWordPlaysByPlayer just query
+// simulateOneGame's own turns history, which already exists for the
+// turn-by-turn viewer output. That same history (moveHistory) already
+// exists client-side in whiffers' gameStore for a live Play-mode game too,
+// so this same querying approach carries over to that side for free
+// whenever these get wired up there - nothing here is Sandbox-specific.
 //
 // A JS mirror of this same rule vocabulary and registry lives in whiffers
 // at src/data/drawbacks.js / src/functions/drawbacks/evaluate.js, for Play
@@ -116,8 +127,9 @@ type DrawbackDef struct {
 }
 
 // drawbacks is the current registry - categories A (fits an existing
-// primitive), B (new stateless primitive), and C (forcing) only. Kept in
-// the same order as the design doc for easy comparison.
+// primitive), B (new stateless primitive), C (forcing), and D's first 4
+// (stateful) only. Kept in the same order as the design doc for easy
+// comparison.
 var drawbacks = []DrawbackDef{
 	// -- Category A --
 	{ID: 3, Name: "Hippopotomonstrosesquipedaliophobia", NameSource: "friend",
@@ -201,6 +213,29 @@ var drawbacks = []DrawbackDef{
 	{ID: 30, Name: "Fynbos", NameSource: "friend",
 		Description: "If you can play exactly 6 tiles, you must.",
 		Rule:        DrawbackRule{Type: "tileCount", In: []int{6}, Forcing: true}},
+
+	// -- Category D: stateful (first 4 - see the ledger for the other 6,
+	// which are either genuinely blocked on a design decision or just need
+	// a quick wording confirm - not implemented yet). Queried fresh from
+	// the game's own turn history each time (see lastWordPlayByPlayer/
+	// allWordPlaysByPlayer) rather than tracked as separate persisted
+	// memory - the history already exists for the turn-by-turn viewer, so
+	// there was nothing new to build to support these four specifically.
+	{ID: 13, Name: "Crisscross", NameSource: "claude",
+		Description: "Must alternate between playing vertically and horizontally.",
+		Rule:        DrawbackRule{Type: "mustAlternateDirection"}},
+	{ID: 18, Name: "Tunnel Vision", NameSource: "friend",
+		Description: "Must play through your opponent's immediately preceding play.",
+		Rule:        DrawbackRule{Type: "mustPlayThroughOpponentLastMove"}},
+	{ID: 24, Name: "Oneupsmanship", NameSource: "friend",
+		Description: "Must use more tiles than your opponent's last play, or pass.",
+		// AppliesToExchanges: true - see evaluateDrawback's own comment on
+		// this rule for why that's what makes "...or pass" fall out for
+		// free instead of needing new aggregation logic.
+		Rule: DrawbackRule{Type: "exceedOpponentLastPlayTileCount", AppliesToExchanges: true}},
+	{ID: 23, Name: "Alphabet Soup", NameSource: "claude",
+		Description: "Every word you play must start with a letter you haven't started a word with before.",
+		Rule:        DrawbackRule{Type: "uniqueStartingLetterPerWord"}},
 }
 
 var drawbackByID = func() map[int]DrawbackDef {
@@ -353,6 +388,56 @@ func firstTileOf(c *scoredCandidate) MoveTile {
 	return first
 }
 
+// firstTileOfTurn is firstTileOf's own twin for an already-committed
+// SimTurn instead of a live scoredCandidate - Category D's rules need to
+// ask this same question about PAST turns (Alphabet Soup: what letter did
+// I start my last few words with), not just the candidate under
+// evaluation right now.
+func firstTileOfTurn(t SimTurn) MoveTile {
+	tiles := t.Tiles
+	first := tiles[0]
+	for _, tile := range tiles[1:] {
+		if t.Direction == "down" {
+			if tile.Row < first.Row {
+				first = tile
+			}
+		} else if tile.Col < first.Col {
+			first = tile
+		}
+	}
+	return first
+}
+
+// lastWordPlayByPlayer scans the game's turn history backward for the most
+// recent "play" entry (a real word play - Pass/Exchange don't count as "a
+// play" for any of Category D's rules, which all read the word the same
+// way normal Scrabble terminology does) by the given player. Returns nil
+// when that player hasn't played a word yet - every Category D rule here
+// treats "no prior play to compare against" as "nothing to enforce yet,"
+// not as a failure.
+func lastWordPlayByPlayer(turns []SimTurn, player int) *SimTurn {
+	for i := len(turns) - 1; i >= 0; i-- {
+		if turns[i].Player == player && turns[i].Type == "play" {
+			return &turns[i]
+		}
+	}
+	return nil
+}
+
+// allWordPlaysByPlayer is lastWordPlayByPlayer's own twin for rules that
+// need the WHOLE history, not just the most recent entry - Alphabet Soup's
+// "a letter you haven't started a word with before" has to check every
+// past word, not only the last one.
+func allWordPlaysByPlayer(turns []SimTurn, player int) []SimTurn {
+	var result []SimTurn
+	for _, t := range turns {
+		if t.Player == player && t.Type == "play" {
+			result = append(result, t)
+		}
+	}
+	return result
+}
+
 // countWordsFormed is 1 (the main word) plus one more for every NEW tile
 // that has an occupied square immediately before or after it on the
 // PERPENDICULAR axis, on the board as it stood before this move - the same
@@ -382,11 +467,16 @@ func countWordsFormed(c *scoredCandidate, bd *board.GameBoard) int {
 
 // evaluateDrawback reports whether candidate c is still allowed under
 // rule, given the board as it stood before this move, the acting player's
-// rack before this move, and how many tiles remain in the bag before this
-// move. Only ever called for word-play candidates - exchanges are always
-// left alone by every drawback here, the same way BingoAversion leaves
-// them alone.
-func evaluateDrawback(rule DrawbackRule, c *scoredCandidate, preMoveRack string, bd *board.GameBoard, poolSizeBefore int) bool {
+// rack before this move, how many tiles remain in the bag before this
+// move, and (Category D only) the game's own turn history so far plus
+// which player (1 or 2) is the one this candidate belongs to - the same
+// role Viewer's own moveHistory scans (getOpponentTotalAtMove and
+// friends) play in the frontend, just queried here instead. Only ever
+// called for word-play candidates - exchanges are always left alone by
+// every drawback here, the same way BingoAversion leaves them alone -
+// except where AppliesToExchanges opts a rule out of that (see its own
+// comment).
+func evaluateDrawback(rule DrawbackRule, c *scoredCandidate, preMoveRack string, bd *board.GameBoard, poolSizeBefore int, turns []SimTurn, currentPlayer int) bool {
 	switch rule.Type {
 	case "wordLength":
 		return compareFloat(float64(len(c.detailed.Tiles)), rule.Comparator, rule.Value)
@@ -551,6 +641,92 @@ func evaluateDrawback(rule DrawbackRule, c *scoredCandidate, preMoveRack string,
 		first := firstTileOf(c)
 		return first.IsNew && !first.IsBlank && first.Letter == string(lastAlpha)
 
+	// Category D ("Stateful"): unlike A/B/C, these need to know something
+	// about turns OTHER than this one - but per drawbacks.go's own header
+	// comment on the state-threading structure, that's just the game's own
+	// turn history (turns), already built up by simulateOneGame's loop for
+	// its turn-by-turn viewer output - queried fresh each time via
+	// lastWordPlayByPlayer/allWordPlaysByPlayer rather than tracked as a
+	// separate piece of persisted memory. "No prior play yet to compare
+	// against" is treated as "nothing to enforce yet" (return true), not a
+	// failure, for all four of these - early game turns shouldn't be
+	// unplayable just because there's no history yet.
+
+	// Crisscross: same 1-tile-play exemption Fear of Heights/Vertie already
+	// use (a play that's just one tile long has no real direction).
+	case "mustAlternateDirection":
+		if len(c.detailed.Tiles) <= 1 {
+			return true
+		}
+		last := lastWordPlayByPlayer(turns, currentPlayer)
+		if last == nil {
+			return true
+		}
+		return c.detailed.Direction != last.Direction
+
+	// Tunnel Vision: "play through" means the candidate's own resulting
+	// word (its FULL tile span, not just the newly-placed ones - a play
+	// can run through the opponent's tile without placing anything new
+	// exactly there) shares at least one square with a tile the opponent
+	// placed NEW on their immediately preceding play.
+	case "mustPlayThroughOpponentLastMove":
+		opponent := 1
+		if currentPlayer == 1 {
+			opponent = 2
+		}
+		last := lastWordPlayByPlayer(turns, opponent)
+		if last == nil {
+			return true
+		}
+		for _, t := range c.detailed.Tiles {
+			for _, lt := range last.Tiles {
+				if lt.IsNew && lt.Row == t.Row && lt.Col == t.Col {
+					return true
+				}
+			}
+		}
+		return false
+
+	// Oneupsmanship: AppliesToExchanges (set on this rule's own registry
+	// entry) is what makes this work correctly - newTileCount(c) is always
+	// 0 for an exchange (see drawnTileCount's own comment), which is never
+	// greater than a real prior play's tile count, so an exchange
+	// naturally and always fails this check rather than needing a separate
+	// exclusion. With nothing left qualifying, filterCandidatesByDrawback
+	// returns an empty list, and simulateOneGame's own existing "empty
+	// candidates -> pass" fallback covers the "...or pass" clause for
+	// free - no new aggregation behavior needed here at all.
+	case "exceedOpponentLastPlayTileCount":
+		opponent := 1
+		if currentPlayer == 1 {
+			opponent = 2
+		}
+		last := lastWordPlayByPlayer(turns, opponent)
+		if last == nil {
+			return true
+		}
+		lastCount := 0
+		for _, t := range last.Tiles {
+			if t.IsNew {
+				lastCount++
+			}
+		}
+		return newTileCount(c) > lastCount
+
+	// Alphabet Soup: a blank's own played Letter (not its blank-ness) is
+	// what counts as "the letter you started with" - once placed, a blank
+	// IS that letter for every other purpose in this codebase (board
+	// storage, scoring), and there's no reason "which letter you started
+	// with" should be the one exception.
+	case "uniqueStartingLetterPerWord":
+		first := firstTileOf(c)
+		for _, t := range allWordPlaysByPlayer(turns, currentPlayer) {
+			if firstTileOfTurn(t).Letter == first.Letter {
+				return false
+			}
+		}
+		return true
+
 	default:
 		// Unknown/not-yet-implemented type - never silently disqualify a
 		// player's whole move set over a rule this build doesn't know how
@@ -564,7 +740,7 @@ func evaluateDrawback(rule DrawbackRule, c *scoredCandidate, preMoveRack string,
 // BingoAversion uses) and word plays filtered by evaluateDrawback - except
 // excludeTopNCandidates, which needs the word plays' relative rank rather
 // than a per-candidate check, so it's handled as its own pass.
-func filterCandidatesByDrawback(candidates []scoredCandidate, rule DrawbackRule, preMoveRack string, bd *board.GameBoard, poolSizeBefore int) []scoredCandidate {
+func filterCandidatesByDrawback(candidates []scoredCandidate, rule DrawbackRule, preMoveRack string, bd *board.GameBoard, poolSizeBefore int, turns []SimTurn, currentPlayer int) []scoredCandidate {
 	if rule.Type == "excludeTopNCandidates" {
 		ranked := make([]scoredCandidate, 0, len(candidates))
 		for _, c := range candidates {
@@ -606,7 +782,7 @@ func filterCandidatesByDrawback(candidates []scoredCandidate, rule DrawbackRule,
 		qualifying := make([]scoredCandidate, 0, len(candidates))
 		for i := range candidates {
 			c := &candidates[i]
-			if !c.isExchange && evaluateDrawback(rule, c, preMoveRack, bd, poolSizeBefore) {
+			if !c.isExchange && evaluateDrawback(rule, c, preMoveRack, bd, poolSizeBefore, turns, currentPlayer) {
 				qualifying = append(qualifying, *c)
 			}
 		}
@@ -625,7 +801,7 @@ func filterCandidatesByDrawback(candidates []scoredCandidate, rule DrawbackRule,
 		filtered := make([]scoredCandidate, 0, len(candidates))
 		for i := range candidates {
 			c := &candidates[i]
-			if evaluateDrawback(rule, c, preMoveRack, bd, poolSizeBefore) {
+			if evaluateDrawback(rule, c, preMoveRack, bd, poolSizeBefore, turns, currentPlayer) {
 				filtered = append(filtered, *c)
 			}
 		}
@@ -635,7 +811,7 @@ func filterCandidatesByDrawback(candidates []scoredCandidate, rule DrawbackRule,
 	filtered := make([]scoredCandidate, 0, len(candidates))
 	for i := range candidates {
 		c := &candidates[i]
-		if c.isExchange || evaluateDrawback(rule, c, preMoveRack, bd, poolSizeBefore) {
+		if c.isExchange || evaluateDrawback(rule, c, preMoveRack, bd, poolSizeBefore, turns, currentPlayer) {
 			filtered = append(filtered, *c)
 		}
 	}

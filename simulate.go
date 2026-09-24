@@ -668,7 +668,7 @@ func simulateOneGame(gd *kwg.KWG, player1Bot, player2Bot BotConfig) SimGameResul
 			if def, ok := drawbackByID[*currentBot.DrawbackID]; ok {
 				unfilteredForDrawbackCompare = make([]scoredCandidate, len(candidates))
 				copy(unfilteredForDrawbackCompare, candidates)
-				candidates = filterCandidatesByDrawback(candidates, def.Rule, currentRack, bd, len(pool))
+				candidates = filterCandidatesByDrawback(candidates, def.Rule, currentRack, bd, len(pool), turns, currentPlayer)
 			}
 		}
 
