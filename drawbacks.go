@@ -155,6 +155,8 @@ func compareFloat(actual float64, comparator string, threshold float64) bool {
 	switch comparator {
 	case "lte":
 		return actual <= threshold
+	case "lt":
+		return actual < threshold
 	case "eq":
 		return actual == threshold
 	default: // "gte"
