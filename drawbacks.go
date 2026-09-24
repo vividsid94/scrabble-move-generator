@@ -73,6 +73,20 @@ type DrawbackRule struct {
 	// all) - Forcing only changes what filterCandidatesByDrawback does with
 	// the result.
 	Forcing bool `json:"forcing,omitempty"`
+
+	// AppliesToExchanges opts a rule into being checked against exchange
+	// candidates too, instead of filterCandidatesByDrawback's default of
+	// always letting them through untouched. That default is right for a
+	// rule about the PLAYED WORD (word length, direction - an exchange has
+	// neither), which is why it's the default; it's wrong for a rule about
+	// what's KEPT (leaveValue), since an exchange produces a leave just as
+	// much as a word play does, and exempting it lets a player dodge the
+	// whole constraint by exchanging into a good leave instead of playing
+	// into a bad one. evaluateDrawback needs no changes for this - its
+	// leaveValue case already reads getLeaveValue(c.leave) generically for
+	// any candidate type; this flag only changes whether
+	// filterCandidatesByDrawback bothers calling it on an exchange at all.
+	AppliesToExchanges bool `json:"appliesToExchanges,omitempty"`
 }
 
 // DrawbackDef pairs one drawback's identity (its game number, name, and
@@ -105,7 +119,13 @@ var drawbacks = []DrawbackDef{
 		Rule:        DrawbackRule{Type: "score", Comparator: "lte", Value: 35}},
 	{ID: 16, Name: "UV Gotta Be Kidding", NameSource: "friend",
 		Description: "Must keep a leave with negative valuation every turn.",
-		Rule:        DrawbackRule{Type: "leaveValue", Comparator: "lt", Value: 0}},
+		// AppliesToExchanges: true - confirmed for real against rack
+		// ?DEOPRT that without it, the bot exchanges into a strongly
+		// positive leave (42.76) instead of playing an actual qualifying
+		// word (best available: 21.9) - exchanges are exempt from every
+		// OTHER drawback by default, but this one is specifically about
+		// the leave, which an exchange produces too.
+		Rule: DrawbackRule{Type: "leaveValue", Comparator: "lt", Value: 0, AppliesToExchanges: true}},
 	{ID: 31, Name: "Oddball", NameSource: "claude",
 		Description: "Can't score an even amount of points on a turn.",
 		Rule:        DrawbackRule{Type: "scoreParity", Parity: "odd"}},
@@ -549,6 +569,22 @@ func filterCandidatesByDrawback(candidates []scoredCandidate, rule DrawbackRule,
 			return qualifying
 		}
 		return candidates
+	}
+
+	// See DrawbackRule.AppliesToExchanges' own comment - exchanges are
+	// exempt from every drawback by default (right for a rule about the
+	// played WORD), but a small number of rules are about the LEAVE, which
+	// an exchange produces too, so they opt out of that exemption instead
+	// of automatically letting every exchange through.
+	if rule.AppliesToExchanges {
+		filtered := make([]scoredCandidate, 0, len(candidates))
+		for i := range candidates {
+			c := &candidates[i]
+			if evaluateDrawback(rule, c, preMoveRack, bd, poolSizeBefore) {
+				filtered = append(filtered, *c)
+			}
+		}
+		return filtered
 	}
 
 	filtered := make([]scoredCandidate, 0, len(candidates))
