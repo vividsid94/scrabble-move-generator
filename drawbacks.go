@@ -15,11 +15,11 @@ import (
 // and the interpreter that filters simulateOneGame's candidate list before
 // ranking/selection, the same insertion point BingoAversion already uses.
 //
-// Only categories A (fits an existing LeaveRule-style primitive) and B (new
-// but still stateless - no memory needed beyond this one move) are
-// implemented here. Category C (forcing), D (stateful), E (scoring
-// override), and F (deferred lose-conditions) all need machinery this file
-// doesn't have yet.
+// Categories A (fits an existing LeaveRule-style primitive), B (new but
+// still stateless - no memory needed beyond this one move), and C (same
+// stateless shape as B, evaluated backwards - see DrawbackRule.Forcing) are
+// implemented here. D (stateful), E (scoring override), and F (deferred
+// lose-conditions) all need machinery this file doesn't have yet.
 //
 // A JS mirror of this same rule vocabulary and registry lives in whiffers
 // at src/data/drawbacks.js / src/functions/drawbacks/evaluate.js, for Play
@@ -61,6 +61,18 @@ type DrawbackRule struct {
 
 	Letters  string `json:"letters,omitempty"` // restrictedTileSetScoreFloor
 	MinScore int    `json:"minScore,omitempty"`
+
+	// Forcing (category C - see the ledger) flips filterCandidatesByDrawback's
+	// own aggregation policy for this rule: instead of dropping candidates
+	// that fail Type's per-move check, it collapses the whole list down to
+	// just the ones that PASS - but only when at least one does; with zero
+	// qualifying candidates the rule doesn't bite this turn (the original
+	// list comes back untouched) rather than forcing a play that doesn't
+	// exist. Type itself still just describes the ordinary per-move
+	// predicate (evaluateDrawback doesn't need to know about this flag at
+	// all) - Forcing only changes what filterCandidatesByDrawback does with
+	// the result.
+	Forcing bool `json:"forcing,omitempty"`
 }
 
 // DrawbackDef pairs one drawback's identity (its game number, name, and
@@ -80,9 +92,9 @@ type DrawbackDef struct {
 	Rule        DrawbackRule `json:"rule"`
 }
 
-// drawbacks is the current registry - category A (fits an existing
-// primitive) and category B (new stateless primitive) only. Kept in the
-// same order as the design doc for easy comparison.
+// drawbacks is the current registry - categories A (fits an existing
+// primitive), B (new stateless primitive), and C (forcing) only. Kept in
+// the same order as the design doc for easy comparison.
 var drawbacks = []DrawbackDef{
 	// -- Category A --
 	{ID: 3, Name: "Hippopotomonstrosesquipedaliophobia", NameSource: "friend",
@@ -141,6 +153,14 @@ var drawbacks = []DrawbackDef{
 	{ID: 40, Name: "Even Steven", NameSource: "claude",
 		Description: "Can't leave an odd number of tiles in the bag after your play.",
 		Rule:        DrawbackRule{Type: "poolParityAfterMove", Parity: "even"}},
+
+	// -- Category C: forcing --
+	{ID: 29, Name: "Zyzzyva", NameSource: "friend",
+		Description: "If a legal play starts with your rack's last-alphabetical tile, you must make it.",
+		Rule:        DrawbackRule{Type: "startsWithLastAlphabeticalRackTile", Forcing: true}},
+	{ID: 30, Name: "Fynbos", NameSource: "friend",
+		Description: "If you can play exactly 6 tiles, you must.",
+		Rule:        DrawbackRule{Type: "tileCount", In: []int{6}, Forcing: true}},
 }
 
 var drawbackByID = func() map[int]DrawbackDef {
@@ -441,6 +461,31 @@ func evaluateDrawback(rule DrawbackRule, c *scoredCandidate, preMoveRack string,
 		isEven := after%2 == 0
 		return (rule.Parity == "even") == isEven
 
+	// Category C ("Forcing"): still just an ordinary per-move predicate -
+	// "does THIS move start with the target letter" - same as every case
+	// above. rule.Forcing (checked in filterCandidatesByDrawback, not here)
+	// is what turns that into "must play a qualifying move if one exists."
+	// Blanks are excluded from "last-alphabetical" - a blank has no
+	// inherent letter until placed, so it's not a candidate for "your
+	// rack's Z-iest tile"; a rack of nothing but blanks has no target at
+	// all (returns false for every move, which correctly means "no
+	// qualifying candidate" -> no forcing this turn).
+	case "startsWithLastAlphabeticalRackTile":
+		var lastAlpha rune
+		for _, l := range preMoveRack {
+			if l == '?' {
+				continue
+			}
+			if lastAlpha == 0 || l > lastAlpha {
+				lastAlpha = l
+			}
+		}
+		if lastAlpha == 0 {
+			return false
+		}
+		first := firstTileOf(c)
+		return first.IsNew && !first.IsBlank && first.Letter == string(lastAlpha)
+
 	default:
 		// Unknown/not-yet-implemented type - never silently disqualify a
 		// player's whole move set over a rule this build doesn't know how
@@ -483,6 +528,27 @@ func filterCandidatesByDrawback(candidates []scoredCandidate, rule DrawbackRule,
 			}
 		}
 		return filtered
+	}
+
+	// Category C ("Forcing"): evaluated backwards from every other rule
+	// here (see DrawbackRule.Forcing's own comment). Collect the word-plays
+	// that qualify (exchanges are never eligible to satisfy a forcing rule -
+	// the player is required to make the qualifying PLAY, not sidestep it
+	// with an exchange); if any exist, the whole list collapses to just
+	// those, exchanges included in the result set. If none qualify, the
+	// rule doesn't bite this turn - return candidates unchanged.
+	if rule.Forcing {
+		qualifying := make([]scoredCandidate, 0, len(candidates))
+		for i := range candidates {
+			c := &candidates[i]
+			if !c.isExchange && evaluateDrawback(rule, c, preMoveRack, bd, poolSizeBefore) {
+				qualifying = append(qualifying, *c)
+			}
+		}
+		if len(qualifying) > 0 {
+			return qualifying
+		}
+		return candidates
 	}
 
 	filtered := make([]scoredCandidate, 0, len(candidates))
