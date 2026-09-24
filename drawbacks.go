@@ -172,7 +172,13 @@ var drawbacks = []DrawbackDef{
 		Rule:        DrawbackRule{Type: "wordsFormedCount", Comparator: "gte", Value: 3, ValueWhenBagEmpty: 2}},
 	{ID: 40, Name: "Even Steven", NameSource: "claude",
 		Description: "Can't leave an odd number of tiles in the bag after your play.",
-		Rule:        DrawbackRule{Type: "poolParityAfterMove", Parity: "even"}},
+		// AppliesToExchanges: true - an exchange changes pool size exactly
+		// the same way a word play does, so exempting it would let a
+		// player dodge bad parity by exchanging instead of playing into it
+		// (the same exploit shape #16 had). drawnTileCount (not
+		// newTileCount, which returns 0 for any exchange - see its own
+		// comment) is what makes the count itself correct for an exchange.
+		Rule: DrawbackRule{Type: "poolParityAfterMove", Parity: "even", AppliesToExchanges: true}},
 
 	// -- Category C: forcing --
 	{ID: 29, Name: "Zyzzyva", NameSource: "friend",
@@ -288,6 +294,23 @@ func newTileCount(c *scoredCandidate) int {
 		}
 	}
 	return n
+}
+
+// drawnTileCount is how many tiles this move will draw replacements for -
+// newTileCount's own IsNew filter is right for a word play (a pre-existing
+// board tile the play merely runs through isn't "new," and costs no draw)
+// but wrong for an exchange: every one of an exchange's own tiles comes
+// back marked IsNew:false (correctly - nothing's new ON THE BOARD, since
+// an exchange never touches it), which would make newTileCount silently
+// return 0 for ANY exchange instead of the real count being exchanged.
+// Only poolParityAfterMove needs this distinction today (the one other
+// rule, besides leaveValue, where an exchange affects the exact thing
+// being measured - see that rule's own AppliesToExchanges).
+func drawnTileCount(c *scoredCandidate) int {
+	if c.isExchange {
+		return len(c.detailed.Tiles)
+	}
+	return newTileCount(c)
 }
 
 func tileLetterValue(t MoveTile) int {
@@ -473,7 +496,7 @@ func evaluateDrawback(rule DrawbackRule, c *scoredCandidate, preMoveRack string,
 		return c.detailed.Score >= rule.MinScore
 
 	case "poolParityAfterMove":
-		drawn := newTileCount(c)
+		drawn := drawnTileCount(c)
 		if drawn > poolSizeBefore {
 			drawn = poolSizeBefore
 		}
