@@ -87,6 +87,15 @@ type DrawbackRule struct {
 	// any candidate type; this flag only changes whether
 	// filterCandidatesByDrawback bothers calling it on an exchange at all.
 	AppliesToExchanges bool `json:"appliesToExchanges,omitempty"`
+
+	// AllowEmptyLeave is leaveValue's own bingo exception: a play that
+	// empties the rack entirely (a real bingo, or just going out with
+	// fewer than 7 left) has no leave to be negative, so "must keep a
+	// negative-value leave" doesn't really describe that turn at all -
+	// this lets it through as its own carve-out instead of failing it.
+	// Never extends to exchanges (checked in evaluateDrawback itself, not
+	// here) - exchanging your whole rack away isn't a bingo.
+	AllowEmptyLeave bool `json:"allowEmptyLeave,omitempty"`
 }
 
 // DrawbackDef pairs one drawback's identity (its game number, name, and
@@ -118,14 +127,19 @@ var drawbacks = []DrawbackDef{
 		Description: "Can't score more than 35 points on a turn.",
 		Rule:        DrawbackRule{Type: "score", Comparator: "lte", Value: 35}},
 	{ID: 16, Name: "UV Gotta Be Kidding", NameSource: "friend",
-		Description: "Must keep a leave with negative valuation every turn.",
+		Description: "Must keep a leave with negative valuation every turn - unless you empty your rack.",
 		// AppliesToExchanges: true - confirmed for real against rack
 		// ?DEOPRT that without it, the bot exchanges into a strongly
 		// positive leave (42.76) instead of playing an actual qualifying
 		// word (best available: 21.9) - exchanges are exempt from every
 		// OTHER drawback by default, but this one is specifically about
 		// the leave, which an exchange produces too.
-		Rule: DrawbackRule{Type: "leaveValue", Comparator: "lt", Value: 0, AppliesToExchanges: true}},
+		//
+		// AllowEmptyLeave: true - the bingo exception: emptying the rack
+		// entirely has no leave to be negative, so it's a carve-out rather
+		// than a failure (doesn't extend to exchanges - see
+		// evaluateDrawback's own comment on why).
+		Rule: DrawbackRule{Type: "leaveValue", Comparator: "lt", Value: 0, AppliesToExchanges: true, AllowEmptyLeave: true}},
 	{ID: 31, Name: "Oddball", NameSource: "claude",
 		Description: "Can't score an even amount of points on a turn.",
 		Rule:        DrawbackRule{Type: "scoreParity", Parity: "odd"}},
@@ -385,6 +399,14 @@ func evaluateDrawback(rule DrawbackRule, c *scoredCandidate, preMoveRack string,
 		return (rule.Parity == "even") == isEven
 
 	case "leaveValue":
+		// AllowEmptyLeave (#16's own bingo exception - see its own struct
+		// comment): a play emptying the rack has no leave to be negative
+		// OR positive, so it's a carve-out rather than a failure. Excludes
+		// exchanges on purpose - emptying your rack via an exchange isn't
+		// a bingo, and shouldn't get the same free pass a real one does.
+		if rule.AllowEmptyLeave && !c.isExchange && c.leave == "" {
+			return true
+		}
 		return compareFloat(getLeaveValue(c.leave), rule.Comparator, rule.Value)
 
 	case "tileValueSum":
