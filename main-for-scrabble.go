@@ -225,6 +225,33 @@ type ValidateWordsResponse struct {
 // the same way CSW24 originally was - see whiffers' notes/kwg-builder.md
 // and notes/macondo-analysis.md for exactly where each word list and .kwg
 // came from.
+//
+// exposedLexiconFiles maps the lexicon name API callers actually send
+// (ideally the literal historical #lexicon tag, so Viewer can one day
+// match a game's own tag exactly with no translation needed) to the .kwg
+// file word-golib loads for it. These differ for two entries only:
+// word-golib's own ProbableLetterDistributionName (tilemapping package)
+// guesses the alphabet/letter-distribution purely from a hardcoded prefix
+// table (nwl/twl/owl/csw/america/cel/ecwl/iwi plus a few non-English ones)
+// matched against the KWG's own filename - "otcwl" and "wow" aren't on
+// that list, so a file literally named OTCWL2016.kwg or WOW24.kwg fails
+// to load at all ("cannot determine alphabet from lexicon name ...").
+// Both are English/NASPA-family regardless (confirmed: WOW is closer to
+// NWL than CSW), so they're stored on disk under a prefix word-golib does
+// recognize - OWL2016.kwg (OTCWL2016's own real alternate name) and
+// NWLWOW24.kwg - while still being requested by callers as "OTCWL2016"/
+// "WOW24".
+var exposedLexiconFiles = map[string]string{
+	"NWL23":     "NWL23",
+	"CSW24":     "CSW24",
+	"TWL06":     "TWL06",
+	"TWL14":     "TWL14",
+	"OTCWL2016": "OWL2016",
+	"NWL18":     "NWL18",
+	"NWL20":     "NWL20",
+	"WOW24":     "NWLWOW24",
+}
+
 var (
 	lexica map[string]*kwg.KWG
 	alph   *tilemapping.TileMapping
@@ -344,13 +371,17 @@ func initService() error {
 	cfg.Set("data-path", ".")
 
 	lexica = make(map[string]*kwg.KWG)
-	for _, name := range []string{"NWL23", "CSW24", "TWL06", "TWL14", "OTCWL2016", "NWL18", "NWL20", "WOW24"} {
-		g, err := kwg.GetKWG(cfg.WGLConfig(), name)
+	for exposedName, fileName := range exposedLexiconFiles {
+		g, err := kwg.GetKWG(cfg.WGLConfig(), fileName)
 		if err != nil {
-			return fmt.Errorf("failed to load lexicon %s: %v", name, err)
+			return fmt.Errorf("failed to load lexicon %s (file %s): %v", exposedName, fileName, err)
 		}
-		lexica[name] = g
-		fmt.Printf("✓ Loaded lexicon %s\n", name)
+		lexica[exposedName] = g
+		if exposedName == fileName {
+			fmt.Printf("✓ Loaded lexicon %s\n", exposedName)
+		} else {
+			fmt.Printf("✓ Loaded lexicon %s (as %s)\n", exposedName, fileName)
+		}
 	}
 	// Alphabet is lexicon-independent (see the lexica var's own comment) -
 	// any loaded KWG's GetAlphabet() gives the same result, so this just
