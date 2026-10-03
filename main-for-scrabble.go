@@ -65,9 +65,10 @@ type GenerateMovesRequest struct {
 	// unset too, so their response shape is byte-identical to before this
 	// field existed.
 	PauseMode string `json:"pauseMode,omitempty"`
-	// Lexicon selects which loaded KWG to use ("NWL23" or "CSW24") -
-	// resolveLexicon defaults to defaultLexicon when omitted, so existing
-	// callers that don't send this yet are unaffected.
+	// Lexicon selects which loaded KWG to use - see the lexica var's own
+	// comment for the full list this service loads. resolveLexicon defaults
+	// to defaultLexicon when omitted, so existing callers that don't send
+	// this yet are unaffected.
 	Lexicon string `json:"lexicon,omitempty"`
 }
 
@@ -211,9 +212,19 @@ type ValidateWordsResponse struct {
 // once in initService() and only ever READ afterward (never mutated per
 // request), so concurrent requests resolving different lexicons out of it
 // via resolveLexicon is safe. alph/ld stay single, shared values rather
-// than per-lexicon maps: NWL and CSW both use the same English tile set
+// than per-lexicon maps: every lexicon loaded below is English Scrabble
 // (26 letters + 2 blanks, same distribution/point values), so there's
-// nothing lexicon-specific about either one.
+// nothing lexicon-specific about any of them.
+//
+// Lexicons loaded: NWL23/CSW24 (current) plus six historical ones added so
+// Viewer's Ask Wally/Analysis Mode can use a real game's own declared
+// #lexicon exactly, instead of always approximating it down to NWL23/CSW24
+// (see whiffers' resolveAnalysisLexicon.js) - TWL06, TWL14 (= OTCWL2014),
+// OTCWL2016, NWL18 (= NWL2018), NWL20 (= NWL2020) are old NASPA-family
+// lists; WOW24 is NASPA-family too (closer to NWL than CSW). Sourced/built
+// the same way CSW24 originally was - see whiffers' notes/kwg-builder.md
+// and notes/macondo-analysis.md for exactly where each word list and .kwg
+// came from.
 var (
 	lexica map[string]*kwg.KWG
 	alph   *tilemapping.TileMapping
@@ -333,7 +344,7 @@ func initService() error {
 	cfg.Set("data-path", ".")
 
 	lexica = make(map[string]*kwg.KWG)
-	for _, name := range []string{"NWL23", "CSW24"} {
+	for _, name := range []string{"NWL23", "CSW24", "TWL06", "TWL14", "OTCWL2016", "NWL18", "NWL20", "WOW24"} {
 		g, err := kwg.GetKWG(cfg.WGLConfig(), name)
 		if err != nil {
 			return fmt.Errorf("failed to load lexicon %s: %v", name, err)
