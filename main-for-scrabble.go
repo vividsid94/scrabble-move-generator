@@ -354,6 +354,7 @@ func main() {
 	http.HandleFunc("/bulk-move-gen", bulkMoveGenHandler)
 	http.HandleFunc("/solve-endgame", solveEndgameHandler)
 	http.HandleFunc("/solve-endgame-exact", solveEndgameExactHandler)
+	http.HandleFunc("/solve-endgame-explain", solveEndgameExplainHandler)
 	http.HandleFunc("/simulate-series", simulateSeriesHandler)
 	http.HandleFunc("/proxy", proxyHandler)
 
