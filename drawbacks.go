@@ -1,6 +1,7 @@
 package main
 
 import (
+	"math/rand"
 	"sort"
 	"strings"
 
@@ -18,9 +19,10 @@ import (
 // Categories A (fits an existing LeaveRule-style primitive), B (new but
 // still stateless - no memory needed beyond this one move), C (same
 // stateless shape as B, evaluated backwards - see DrawbackRule.Forcing),
-// and the first 4 of D (stateful - needs to know about turns other than
-// this one) are implemented here. D's own remaining 6 are either blocked
-// on a real design decision (see the ledger) or just need a quick wording
+// and 6 of D's 10 (stateful - needs to know about turns other than this
+// one, or - Quota's own case - a value rolled once and held for the whole
+// turn) are implemented here. D's own remaining 4 are either blocked on a
+// real design decision (see the ledger) or just need a quick wording
 // confirm, not built yet. E (scoring override) and F (deferred lose-
 // conditions) need machinery this file doesn't have at all.
 //
@@ -127,9 +129,11 @@ type DrawbackDef struct {
 }
 
 // drawbacks is the current registry - categories A (fits an existing
-// primitive), B (new stateless primitive), C (forcing), and D's first 4
-// (stateful) only. Kept in the same order as the design doc for easy
-// comparison.
+// primitive), B (new stateless primitive), C (forcing), and 6 of D's 10
+// (stateful) so far. Kept in the same order as the design doc for easy
+// comparison (Quota and Well Aged, the newest additions, are the
+// exception - appended at the end rather than resorted into their own
+// numeric position, so they don't shift every ID below them in a diff).
 var drawbacks = []DrawbackDef{
 	// -- Category A --
 	{ID: 3, Name: "Hippopotomonstrosesquipedaliophobia", NameSource: "friend",
@@ -214,10 +218,11 @@ var drawbacks = []DrawbackDef{
 		Description: "If you can play exactly 6 tiles, you must.",
 		Rule:        DrawbackRule{Type: "tileCount", In: []int{6}, Forcing: true}},
 
-	// -- Category D: stateful (first 4 - see the ledger for the other 6,
-	// which are either genuinely blocked on a design decision or just need
-	// a quick wording confirm - not implemented yet). Queried fresh from
-	// the game's own turn history each time (see lastWordPlayByPlayer/
+	// -- Category D: stateful (these first 4, plus Quota and Well Aged
+	// appended at the very end of this slice below - see the ledger for
+	// the other 4, which are either genuinely blocked on a design decision
+	// or just need a quick wording confirm - not implemented yet). Queried
+	// fresh from the game's own turn history each time (see lastWordPlayByPlayer/
 	// allWordPlaysByPlayer) rather than tracked as separate persisted
 	// memory - the history already exists for the turn-by-turn viewer, so
 	// there was nothing new to build to support these four specifically.
@@ -236,6 +241,17 @@ var drawbacks = []DrawbackDef{
 	{ID: 23, Name: "Alphabet Soup", NameSource: "claude",
 		Description: "Every word you play must start with a letter you haven't started a word with before.",
 		Rule:        DrawbackRule{Type: "uniqueStartingLetterPerWord"}},
+	{ID: 14, Name: "Quota", NameSource: "claude",
+		Description: "Randomly assigned 2 numbers 1-7 each turn; must use exactly that many tiles (exchanges count).",
+		// No AppliesToExchanges/other fields - this one's rolled and checked
+		// entirely in filterCandidatesByDrawback's own special case (same
+		// precedent as excludeTopNCandidates), not through evaluateDrawback,
+		// since the 2 numbers have to be the SAME for every candidate in one
+		// turn's list, not re-rolled per candidate.
+		Rule: DrawbackRule{Type: "randomTileCountQuota"}},
+	{ID: 39, Name: "Well Aged", NameSource: "friend",
+		Description: "Can't play a tile you drew after your last play.",
+		Rule:        DrawbackRule{Type: "cannotPlayFreshlyDrawnTile"}},
 }
 
 var drawbackByID = func() map[int]DrawbackDef {
@@ -436,6 +452,26 @@ func allWordPlaysByPlayer(turns []SimTurn, player int) []SimTurn {
 		}
 	}
 	return result
+}
+
+// newlyUsedLetters is Well Aged's own need: the letters a PAST turn's play
+// actually placed (blanks as "?"), from its own []MoveTile - not reused
+// from endgame_solver_exact.go's near-identical newlyUsedLettersExact,
+// which takes a *DetailedMove specifically rather than a bare []MoveTile,
+// and lives in a file this one has no reason to depend on.
+func newlyUsedLetters(tiles []MoveTile) string {
+	var used []rune
+	for _, t := range tiles {
+		if !t.IsNew {
+			continue
+		}
+		if t.IsBlank {
+			used = append(used, '?')
+		} else {
+			used = append(used, []rune(t.Letter)[0])
+		}
+	}
+	return string(used)
 }
 
 // countWordsFormed is 1 (the main word) plus one more for every NEW tile
@@ -727,6 +763,38 @@ func evaluateDrawback(rule DrawbackRule, c *scoredCandidate, preMoveRack string,
 		}
 		return true
 
+	// Well Aged (#39): a tile counts as "aged" if it survived from before
+	// the player's own last play - that play's own RackBefore, minus
+	// whatever letters it actually used. Anything beyond those per-letter
+	// counts must have been drawn as a replacement since then, and so is
+	// forbidden now. No prior play yet (this player's first turn) means
+	// everything already in hand is aged by definition - same "nothing to
+	// compare against yet" treatment every other Category D rule already
+	// gives an empty history. Exchanges are left at the default exemption
+	// (no AppliesToExchanges on this rule) - this is about which tiles get
+	// PLACED, not which get discarded; nothing in the ledger says otherwise.
+	case "cannotPlayFreshlyDrawnTile":
+		last := lastWordPlayByPlayer(turns, currentPlayer)
+		if last == nil {
+			return true
+		}
+		agedRack := removeRackFromPool(last.RackBefore, newlyUsedLetters(last.Tiles))
+		for _, t := range c.detailed.Tiles {
+			if !t.IsNew {
+				continue
+			}
+			letter := "?"
+			if !t.IsBlank {
+				letter = t.Letter
+			}
+			idx := strings.Index(agedRack, letter)
+			if idx == -1 {
+				return false
+			}
+			agedRack = agedRack[:idx] + agedRack[idx+1:]
+		}
+		return true
+
 	default:
 		// Unknown/not-yet-implemented type - never silently disqualify a
 		// player's whole move set over a rule this build doesn't know how
@@ -738,8 +806,10 @@ func evaluateDrawback(rule DrawbackRule, c *scoredCandidate, preMoveRack string,
 // filterCandidatesByDrawback applies one drawback to a turn's already-
 // built candidate list, leaving exchanges untouched (same convention
 // BingoAversion uses) and word plays filtered by evaluateDrawback - except
-// excludeTopNCandidates, which needs the word plays' relative rank rather
-// than a per-candidate check, so it's handled as its own pass.
+// excludeTopNCandidates (needs the word plays' relative rank rather than a
+// per-candidate check) and randomTileCountQuota (needs ONE shared random
+// roll for the whole turn, not a fresh one per candidate), each handled as
+// their own pass instead.
 func filterCandidatesByDrawback(candidates []scoredCandidate, rule DrawbackRule, preMoveRack string, bd *board.GameBoard, poolSizeBefore int, turns []SimTurn, currentPlayer int) []scoredCandidate {
 	if rule.Type == "excludeTopNCandidates" {
 		ranked := make([]scoredCandidate, 0, len(candidates))
@@ -765,6 +835,30 @@ func filterCandidatesByDrawback(candidates []scoredCandidate, rule DrawbackRule,
 		filtered := make([]scoredCandidate, 0, len(candidates))
 		for i := range candidates {
 			if candidates[i].isExchange || !isExcluded(&candidates[i]) {
+				filtered = append(filtered, candidates[i])
+			}
+		}
+		return filtered
+	}
+
+	// Quota (#14): the 2 numbers are rolled ONCE per call (= once per real
+	// turn, since this function is called once per turn, not once per
+	// candidate) - evaluateDrawback runs once PER CANDIDATE, so rolling
+	// there would hand every candidate in the same turn's list a different
+	// pair instead of the one shared quota a real turn actually has. Same
+	// special-casing precedent as excludeTopNCandidates above. Measures
+	// drawnTileCount, not newTileCount, because the ledger's own wording
+	// ("exchanges count") means an exchange has to satisfy the same quota a
+	// word play does, not get the automatic pass most drawbacks give it -
+	// so this never checks c.isExchange at all, word plays and exchanges
+	// are both just measured by however many tiles they actually move.
+	if rule.Type == "randomTileCountQuota" {
+		n1 := rand.Intn(7) + 1
+		n2 := rand.Intn(7) + 1
+		filtered := make([]scoredCandidate, 0, len(candidates))
+		for i := range candidates {
+			n := drawnTileCount(&candidates[i])
+			if n == n1 || n == n2 {
 				filtered = append(filtered, candidates[i])
 			}
 		}
