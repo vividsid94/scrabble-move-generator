@@ -1,6 +1,7 @@
 package main
 
 import (
+	"fmt"
 	"math/rand"
 	"sort"
 	"strings"
@@ -827,7 +828,14 @@ func evaluateDrawback(rule DrawbackRule, c *scoredCandidate, preMoveRack string,
 // per-candidate check) and randomTileCountQuota (needs ONE shared random
 // roll for the whole turn, not a fresh one per candidate), each handled as
 // their own pass instead.
-func filterCandidatesByDrawback(candidates []scoredCandidate, rule DrawbackRule, preMoveRack string, bd *board.GameBoard, poolSizeBefore int, turns []SimTurn, currentPlayer int) []scoredCandidate {
+//
+// The second return value is a short, human-readable debug note - empty
+// for every rule except randomTileCountQuota, whose own 2 rolled numbers
+// are otherwise genuinely unobservable from outside this function (used
+// once to filter, then gone). Surfaced as SimTurn.DrawbackDebug so a real
+// game log can be checked by eye ("needed 3 or 6 tiles, played 3") instead
+// of having to trust the filter blindly - see simulate.go's own call site.
+func filterCandidatesByDrawback(candidates []scoredCandidate, rule DrawbackRule, preMoveRack string, bd *board.GameBoard, poolSizeBefore int, turns []SimTurn, currentPlayer int) ([]scoredCandidate, string) {
 	if rule.Type == "excludeTopNCandidates" {
 		ranked := make([]scoredCandidate, 0, len(candidates))
 		for _, c := range candidates {
@@ -855,7 +863,7 @@ func filterCandidatesByDrawback(candidates []scoredCandidate, rule DrawbackRule,
 				filtered = append(filtered, candidates[i])
 			}
 		}
-		return filtered
+		return filtered, ""
 	}
 
 	// Quota (#14): the 2 numbers are rolled ONCE per call (= once per real
@@ -879,7 +887,7 @@ func filterCandidatesByDrawback(candidates []scoredCandidate, rule DrawbackRule,
 				filtered = append(filtered, candidates[i])
 			}
 		}
-		return filtered
+		return filtered, fmt.Sprintf("Quota: needed %d or %d tiles this turn", n1, n2)
 	}
 
 	// Category C ("Forcing"): evaluated backwards from every other rule
@@ -898,9 +906,9 @@ func filterCandidatesByDrawback(candidates []scoredCandidate, rule DrawbackRule,
 			}
 		}
 		if len(qualifying) > 0 {
-			return qualifying
+			return qualifying, ""
 		}
-		return candidates
+		return candidates, ""
 	}
 
 	// See DrawbackRule.AppliesToExchanges' own comment - exchanges are
@@ -916,7 +924,7 @@ func filterCandidatesByDrawback(candidates []scoredCandidate, rule DrawbackRule,
 				filtered = append(filtered, *c)
 			}
 		}
-		return filtered
+		return filtered, ""
 	}
 
 	filtered := make([]scoredCandidate, 0, len(candidates))
@@ -926,5 +934,5 @@ func filterCandidatesByDrawback(candidates []scoredCandidate, rule DrawbackRule,
 			filtered = append(filtered, *c)
 		}
 	}
-	return filtered
+	return filtered, ""
 }
