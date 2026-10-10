@@ -368,12 +368,22 @@ func newTileCount(c *scoredCandidate) int {
 // back marked IsNew:false (correctly - nothing's new ON THE BOARD, since
 // an exchange never touches it), which would make newTileCount silently
 // return 0 for ANY exchange instead of the real count being exchanged.
-// Only poolParityAfterMove needs this distinction today (the one other
-// rule, besides leaveValue, where an exchange affects the exact thing
-// being measured - see that rule's own AppliesToExchanges).
+// poolParityAfterMove and Quota (randomTileCountQuota) are the rules that
+// need this distinction today.
 func drawnTileCount(c *scoredCandidate) int {
 	if c.isExchange {
-		return len(c.detailed.Tiles)
+		// Pre-existing bug, fixed here: an exchange scoredCandidate never
+		// has .detailed set at all (see its own construction - only
+		// isExchange/exchangeTiles/leave/total are populated), so reading
+		// c.detailed.Tiles panicked with a nil pointer dereference on ANY
+		// exchange candidate - simply never hit in practice until Quota
+		// became the first caller to run this against an UNFILTERED
+		// candidate list (every other caller reaches this only through
+		// AppliesToExchanges, and apparently never actually drew a real
+		// exchange candidate while testing). exchangeTiles is the right
+		// field - its own length IS how many tiles this exchange draws
+		// replacements for.
+		return len(c.exchangeTiles)
 	}
 	return newTileCount(c)
 }
@@ -724,15 +734,22 @@ func evaluateDrawback(rule DrawbackRule, c *scoredCandidate, preMoveRack string,
 		return false
 
 	// Oneupsmanship: AppliesToExchanges (set on this rule's own registry
-	// entry) is what makes this work correctly - newTileCount(c) is always
-	// 0 for an exchange (see drawnTileCount's own comment), which is never
-	// greater than a real prior play's tile count, so an exchange
-	// naturally and always fails this check rather than needing a separate
-	// exclusion. With nothing left qualifying, filterCandidatesByDrawback
-	// returns an empty list, and simulateOneGame's own existing "empty
-	// candidates -> pass" fallback covers the "...or pass" clause for
-	// free - no new aggregation behavior needed here at all.
+	// entry) is what makes this work correctly - an exchange always fails
+	// this check (explicit below, not just "happens to"), so it naturally
+	// never qualifies rather than needing a separate exclusion. With
+	// nothing left qualifying, filterCandidatesByDrawback returns an empty
+	// list, and simulateOneGame's own existing "empty candidates -> pass"
+	// fallback covers the "...or pass" clause for free - no new
+	// aggregation behavior needed here at all. The explicit isExchange
+	// check (rather than calling newTileCount(c) unconditionally the way
+	// this used to) is what actually avoids a crash here - an exchange
+	// candidate's own .detailed is always nil (see drawnTileCount's own
+	// comment on the same thing), so newTileCount(c) would panic on one
+	// instead of returning the 0 this comment always claimed.
 	case "exceedOpponentLastPlayTileCount":
+		if c.isExchange {
+			return false
+		}
 		opponent := 1
 		if currentPlayer == 1 {
 			opponent = 2
