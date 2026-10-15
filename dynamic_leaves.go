@@ -206,7 +206,33 @@ func ComputeBoardMetrics(bd *board.GameBoard, gd *kwg.KWG, ld *tilemapping.Lette
 			if m.TilesPlayed() != 1 || len(m.Tiles()) < 3 {
 				continue
 			}
-			row, col, vertical := m.CoordsAndVertical()
+			// CoordsAndVertical() returns the START of the whole resulting
+			// word, not the new tile's own square - for a front hook
+			// (SCAT, new tile first) those are the same square, but for a
+			// back hook (CATS, new tile last) they're not: this would
+			// otherwise report the pre-existing C's position instead of
+			// the actual new S. Tiles() marks played-through squares as 0
+			// and the one genuinely new tile as its real (non-zero) letter
+			// value, so its index IS the offset from the word's start to
+			// the actual hook square.
+			startRow, startCol, vertical := m.CoordsAndVertical()
+			tiles := m.Tiles()
+			newOffset := -1
+			for i, t := range tiles {
+				if t != 0 {
+					newOffset = i
+					break
+				}
+			}
+			if newOffset == -1 {
+				continue // shouldn't happen given TilesPlayed()==1, but don't report a wrong square if it ever does
+			}
+			row, col := startRow, startCol
+			if vertical {
+				row += newOffset
+			} else {
+				col += newOffset
+			}
 			// Hook extends a horizontal word (vertical=false) -> the
 			// bingo lane it opens runs vertically, and vice versa.
 			perpendicular := verticalBingoPositions
