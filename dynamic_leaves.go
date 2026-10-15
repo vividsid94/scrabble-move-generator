@@ -105,14 +105,25 @@ func ComputeOpenness(bd *board.GameBoard) float64 {
 // 7-tile bingo placement right now (an all-blank rack search -
 // dictionary-validated the same way every other check in this file is,
 // not a raw empty-space count), record which 1-indexed position (1-7)
-// within that bingo word the square occupies - e.g. a square that's the
-// 3rd letter of one valid bingo and the 6th letter of a different valid
-// bingo gets both 3 and 6 recorded. A square can only ever be reached by a
-// bingo whose start is within 6 squares of it in that bingo's own
-// direction (a 7-tile word spans at most 6 squares past wherever the hook
-// tile sits), so this inherently only ever looks at the 13-square window
-// centered on each square - 6 either side plus itself - without needing a
-// separate explicit scan for that window.
+// within that bingo word the square occupies, PER LETTER - e.g. a square
+// that's the 3rd letter of one valid bingo (using a 'G' there) and the 6th
+// letter of a different valid bingo (using an 'S' there) gets position 3
+// recorded under "G" and position 6 recorded under "S", not both positions
+// recorded as if either letter could reach either one. This matters because
+// the hook square's own perpendicular word is already validated down to a
+// SPECIFIC letter (the hook word only exists because, say, an S extends IT
+// into SIT) - but plenty of OTHER letters are equally valid single-tile
+// hooks of the same existing stem (FIT, BIT, HIT, KIT, LIT, NIT, PIT, WIT,
+// GIT all extend IT too), and the all-blank 7-tile search finds bingos
+// using every one of them. Without tracking which letter actually lands at
+// each position, a bingo that only works with a 'G' there would get
+// reported as a bingo lane for the S hook, which isn't real - S doesn't
+// reach that position just because G does. A square can only ever be
+// reached by a bingo whose start is within 6 squares of it in that bingo's
+// own direction (a 7-tile word spans at most 6 squares past wherever the
+// hook tile sits), so this inherently only ever looks at the 13-square
+// window centered on each square - 6 either side plus itself - without
+// needing a separate explicit scan for that window.
 //
 // Split by the BINGO's OWN direction, not the hook's: a hook only "opens a
 // bingo lane" through a PERPENDICULAR play (the hook tile becomes a fresh
@@ -120,12 +131,12 @@ func ComputeOpenness(bd *board.GameBoard) float64 {
 // vertical bingo positions have to stay in separate maps rather than one
 // combined set; a hook gets checked against whichever map runs the
 // opposite direction from the word it extends (see ComputeBoardMetrics).
-func findBingoLanePositions(bd *board.GameBoard, gd *kwg.KWG, ld *tilemapping.LetterDistribution, alph *tilemapping.TileMapping) (horizontal map[[2]int]map[int]bool, vertical map[[2]int]map[int]bool) {
+func findBingoLanePositions(bd *board.GameBoard, gd *kwg.KWG, ld *tilemapping.LetterDistribution, alph *tilemapping.TileMapping) (horizontal map[[2]int]map[string]map[int]bool, vertical map[[2]int]map[string]map[int]bool) {
 	rack := tilemapping.RackFromString("???????", alph)
 	generator := movegen.NewGordonGenerator(gd, bd, ld)
 	moves := generator.GenAll(rack, false)
-	horizontal = make(map[[2]int]map[int]bool)
-	vertical = make(map[[2]int]map[int]bool)
+	horizontal = make(map[[2]int]map[string]map[int]bool)
+	vertical = make(map[[2]int]map[string]map[int]bool)
 	for _, m := range moves {
 		// TilesPlayed()==7 alone isn't enough: the generator also returns
 		// moves that play 7 new tiles but connect through OTHER existing
@@ -142,23 +153,67 @@ func findBingoLanePositions(bd *board.GameBoard, gd *kwg.KWG, ld *tilemapping.Le
 			continue
 		}
 		row, col, isVertical := m.CoordsAndVertical()
-		length := len(m.Tiles())
+		tiles := m.Tiles()
 		target := horizontal
 		if isVertical {
 			target = vertical
 		}
-		for i := 0; i < length; i++ {
+		for i, t := range tiles {
 			sq := [2]int{row, col + i}
 			if isVertical {
 				sq = [2]int{row + i, col}
 			}
+			// The all-blank rack means every placed tile comes back
+			// blank-flagged (high bit set) - Unblank before converting to
+			// a user-visible letter so "S" compares equal regardless of
+			// whether the generator assigned it via a literal S or (in a
+			// real game) a blank standing in for one.
+			letter := t.Unblank().UserVisible(alph, false)
 			if target[sq] == nil {
-				target[sq] = make(map[int]bool)
+				target[sq] = make(map[string]map[int]bool)
 			}
-			target[sq][i+1] = true // 1-indexed position within the bingo word
+			if target[sq][letter] == nil {
+				target[sq][letter] = make(map[int]bool)
+			}
+			target[sq][letter][i+1] = true // 1-indexed position within the bingo word
 		}
 	}
 	return horizontal, vertical
+}
+
+// bingoWindowIsOpen reports whether every square in a candidate 7-letter
+// bingo window, OTHER than the hook square itself, is genuinely untouched
+// by any nearby word - its cross-set in the bingo word's own direction is
+// board.TrivialCrossSet, meaning no adjacent tile constrains it at all.
+// This is deliberately stricter than "the dictionary allows some letter
+// there": a square sitting right next to an existing word (e.g. directly
+// below AGOUTI, or above TROUBLE) can occasionally still pass a cross-check
+// for one specific rare word (ISOTOPE legally plays an I into AGOUTI's own
+// T-cross-check), but that's not a realistic standalone bingo lane for a
+// generic hook tile - it's piggybacking on a freak dictionary coincidence
+// right next to another word's territory, not open space. The hook square
+// itself is always constrained by design (that's what makes it a hook) and
+// is skipped.
+func bingoWindowIsOpen(bd *board.GameBoard, hookRow, hookCol, position int, bingoVertical bool) bool {
+	dir := board.HorizontalDirection
+	if bingoVertical {
+		dir = board.VerticalDirection
+	}
+	for i := 0; i < 7; i++ {
+		row, col := hookRow, hookCol
+		if bingoVertical {
+			row = hookRow - (position - 1) + i
+		} else {
+			col = hookCol - (position - 1) + i
+		}
+		if row == hookRow && col == hookCol {
+			continue
+		}
+		if bd.GetCrossSet(row, col, dir) != board.TrivialCrossSet {
+			return false
+		}
+	}
+	return true
 }
 
 // sortedPositions converts a position set into a deterministic sorted
@@ -250,10 +305,23 @@ func ComputeBoardMetrics(bd *board.GameBoard, gd *kwg.KWG, ld *tilemapping.Lette
 			if vertical {
 				perpendicular = horizontalBingoPositions
 			}
+			// Only positions where THIS letter (not some other letter that
+			// also happens to validly extend the same stem, e.g. GIT
+			// alongside SIT) lands at the hook square count - see
+			// findBingoLanePositions' own comment on why. Then, of those,
+			// only ones where the rest of the window is genuinely open -
+			// see bingoWindowIsOpen's own comment on why dictionary
+			// legality alone isn't enough.
+			var bingoPositions []int
+			for _, p := range sortedPositions(perpendicular[[2]int{row, col}][letter]) {
+				if bingoWindowIsOpen(bd, row, col, p, !vertical) {
+					bingoPositions = append(bingoPositions, p)
+				}
+			}
 			found = append(found, HookDetail{
 				Row:            row,
 				Col:            col,
-				BingoPositions: sortedPositions(perpendicular[[2]int{row, col}]),
+				BingoPositions: bingoPositions,
 			})
 		}
 		hooks[letter] = found
