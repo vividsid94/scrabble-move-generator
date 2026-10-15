@@ -6,9 +6,9 @@ import (
 
 	"github.com/domino14/macondo/board"
 	"github.com/domino14/macondo/cross_set"
-	"github.com/domino14/macondo/kwg"
 	"github.com/domino14/macondo/movegen"
-	"github.com/domino14/macondo/tilemapping"
+	"github.com/domino14/word-golib/kwg"
+	"github.com/domino14/word-golib/tilemapping"
 )
 
 // Dynamic-leave experiment - step 1 only (board-state metrics). The goal:
