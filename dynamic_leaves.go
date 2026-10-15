@@ -3,6 +3,7 @@ package main
 import (
 	"encoding/json"
 	"net/http"
+	"sort"
 
 	"github.com/domino14/macondo/board"
 	"github.com/domino14/macondo/cross_set"
@@ -22,13 +23,14 @@ import (
 // gets adjusted. This file only answers "can we measure the board," not
 // "here's the new S value."
 //
-// Deliberately NOT reimplementing hook detection via GADDAG internals.
-// countHooks below reuses the exact same board.MakeBoard /
-// cross_set.GenAllCrossSets / movegen.NewGordonGenerator pipeline
-// generateMovesHandler already runs (main-for-scrabble.go) - just with a
-// synthetic one-letter rack - so hook legality is governed by the same
-// dictionary-validated generator every real move already goes through,
-// not a second implementation that could quietly drift from it.
+// Deliberately NOT reimplementing hook/bingo-lane detection via GADDAG
+// internals. ComputeBoardMetrics and findBingoLanePositions below reuse the
+// exact same board.MakeBoard / cross_set.GenAllCrossSets /
+// movegen.NewGordonGenerator pipeline generateMovesHandler already runs
+// (main-for-scrabble.go) - just with synthetic racks (one letter, or seven
+// blanks) - so hook/bingo legality is governed by the same dictionary-
+// validated generator every real move already goes through, not a second
+// implementation that could quietly drift from it.
 
 // BoardMetrics is a pure function of board state - no rack, no move, same
 // "board, dictionary, letter distribution only" shape cross_set.GenAllCrossSets
@@ -43,15 +45,29 @@ type BoardMetrics struct {
 	// cross-checks live), or have many tiles down in one dense pocket while
 	// the rest of the board is still fully open.
 	Openness float64
-	// LiveHooks: for each letter in the `letters` argument passed to
-	// ComputeBoardMetrics, how many TRUE hooks exist right now - a single
-	// new tile added at the front or back of an already-complete existing
-	// word (CAT -> SCAT, CAT -> CATS). Deliberately NOT every legal
-	// single-tile play: placing a letter below a single pre-existing tile
-	// to form a short perpendicular word (e.g. S below A forming "AS") is a
-	// parallel play, not a hook of anything, and was inflating this count
-	// before the length>=3 filter below excluded it.
-	LiveHooks map[string]int
+	// Hooks: for each letter in the `letters` argument passed to
+	// ComputeBoardMetrics, every TRUE hook that exists right now - a
+	// single new tile added at the front or back of an already-complete
+	// existing word (CAT -> SCAT, CAT -> CATS). Deliberately NOT every
+	// legal single-tile play: placing a letter below a single pre-existing
+	// tile to form a short perpendicular word (e.g. S below A forming
+	// "AS") is a parallel play, not a hook of anything, and was inflating
+	// this count before the length>=3 filter in findHooks excluded it.
+	Hooks map[string][]HookDetail
+}
+
+// HookDetail is one true hook's location plus which 1-indexed positions
+// (1 through 7) within a REAL bingo word this tile could occupy, if a
+// bingo were played perpendicular through it - e.g. for CAT -> CATS, the
+// S at the hook square might be playable as the bingo's 1st letter, or its
+// 4th, or several positions, depending on what dictionary words actually
+// fit in the open space around it. An empty BingoPositions means a real
+// hook that's only ever worth a few cheap points right now, not a bingo
+// lane - that's the actual signal this whole exercise is after.
+type HookDetail struct {
+	Row            int   `json:"row"`
+	Col            int   `json:"col"`
+	BingoPositions []int `json:"bingoPositions"`
 }
 
 func isEmptySquare(bd *board.GameBoard, row, col int) bool {
@@ -85,52 +101,130 @@ func ComputeOpenness(bd *board.GameBoard) float64 {
 	return 1 - float64(constrainedCount)/float64(emptyCount)
 }
 
-// countHooks: generate every legal move for a one-tile rack of `letter`
-// against the current board, and count the TRUE hooks among them - a move
-// that places exactly one new tile (TilesPlayed() == 1) AND whose resulting
-// word is at least 3 tiles long. The length>=3 check is what separates a
-// real hook from a parallel play: any run of 2+ adjacent same-direction
-// tiles already on the board must have been validated as a real word when
-// it was placed (Scrabble enforces that on every play), so "1 new tile +
-// a 2-letter-or-longer existing stem" reliably means "extending an actual
-// word." A result of length exactly 2 means the "stem" was just a single
-// pre-existing letter - not a word, just a perpendicular 2-letter parallel
-// play (e.g. S below a lone A forming "AS") - and a single new tile can
-// never land in the MIDDLE of an existing word (every board square is
-// permanent once filled), so front/back is the only way length>=3 happens.
-func countHooks(bd *board.GameBoard, gd *kwg.KWG, ld *tilemapping.LetterDistribution, alph *tilemapping.TileMapping, letter string) int {
-	rack := tilemapping.RackFromString(letter, alph)
+// findBingoLanePositions: for every square touched by at least one real
+// 7-tile bingo placement right now (an all-blank rack search -
+// dictionary-validated the same way every other check in this file is,
+// not a raw empty-space count), record which 1-indexed position (1-7)
+// within that bingo word the square occupies - e.g. a square that's the
+// 3rd letter of one valid bingo and the 6th letter of a different valid
+// bingo gets both 3 and 6 recorded. A square can only ever be reached by a
+// bingo whose start is within 6 squares of it in that bingo's own
+// direction (a 7-tile word spans at most 6 squares past wherever the hook
+// tile sits), so this inherently only ever looks at the 13-square window
+// centered on each square - 6 either side plus itself - without needing a
+// separate explicit scan for that window.
+//
+// Split by the BINGO's OWN direction, not the hook's: a hook only "opens a
+// bingo lane" through a PERPENDICULAR play (the hook tile becomes a fresh
+// cross-anchor for a word running the other way), so horizontal and
+// vertical bingo positions have to stay in separate maps rather than one
+// combined set; a hook gets checked against whichever map runs the
+// opposite direction from the word it extends (see ComputeBoardMetrics).
+func findBingoLanePositions(bd *board.GameBoard, gd *kwg.KWG, ld *tilemapping.LetterDistribution, alph *tilemapping.TileMapping) (horizontal map[[2]int]map[int]bool, vertical map[[2]int]map[int]bool) {
+	rack := tilemapping.RackFromString("???????", alph)
 	generator := movegen.NewGordonGenerator(gd, bd, ld)
 	moves := generator.GenAll(rack, false)
-	count := 0
+	horizontal = make(map[[2]int]map[int]bool)
+	vertical = make(map[[2]int]map[int]bool)
 	for _, m := range moves {
-		if m.TilesPlayed() == 1 && len(m.Tiles()) >= 3 {
-			count++
+		if m.TilesPlayed() != 7 {
+			continue
+		}
+		row, col, isVertical := m.CoordsAndVertical()
+		length := len(m.Tiles())
+		target := horizontal
+		if isVertical {
+			target = vertical
+		}
+		for i := 0; i < length; i++ {
+			sq := [2]int{row, col + i}
+			if isVertical {
+				sq = [2]int{row + i, col}
+			}
+			if target[sq] == nil {
+				target[sq] = make(map[int]bool)
+			}
+			target[sq][i+1] = true // 1-indexed position within the bingo word
 		}
 	}
-	return count
+	return horizontal, vertical
+}
+
+// sortedPositions converts a position set into a deterministic sorted
+// slice for JSON output (map iteration order isn't stable) - nil, not an
+// empty slice, when there's nothing, so an uninvolved hook serializes as
+// "bingoPositions":null rather than [] (cheap, honest signal of "checked,
+// found nothing" either way, but nil is what a zero-value map lookup
+// naturally produces here without extra code).
+func sortedPositions(positions map[int]bool) []int {
+	if len(positions) == 0 {
+		return nil
+	}
+	result := make([]int, 0, len(positions))
+	for p := range positions {
+		result = append(result, p)
+	}
+	sort.Ints(result)
+	return result
 }
 
 // ComputeBoardMetrics runs GenAllCrossSets/UpdateAllAnchors once (bd is
 // mutated - same expectation every handler that calls GenAllCrossSets
 // already has, not a new side effect introduced here), then computes
-// openness and, for each requested letter (e.g. []string{"S"}), its live
-// hook count. The blank isn't a meaningful letter to pass here - its
-// dynamic value is driven by Openness alone, not a hook count (a blank
-// "hooking" is really just "some letter can hook," which isn't a property
-// of the blank specifically) - see boardMetricsHandler's own default.
+// openness and, for each requested letter (e.g. []string{"S"}), every true
+// hook along with which bingo positions (if any) it could fill. The blank
+// isn't a meaningful letter to pass here - its dynamic value is driven by
+// Openness alone, not a hook count (a blank "hooking" is really just "some
+// letter can hook," which isn't a property of the blank specifically) -
+// see boardMetricsHandler's own default.
 func ComputeBoardMetrics(bd *board.GameBoard, gd *kwg.KWG, ld *tilemapping.LetterDistribution, alph *tilemapping.TileMapping, letters []string) BoardMetrics {
 	cross_set.GenAllCrossSets(bd, gd, ld)
 	bd.UpdateAllAnchors()
 
-	hooks := make(map[string]int, len(letters))
+	horizontalBingoPositions, verticalBingoPositions := findBingoLanePositions(bd, gd, ld, alph)
+
+	hooks := make(map[string][]HookDetail, len(letters))
 	for _, letter := range letters {
-		hooks[letter] = countHooks(bd, gd, ld, alph, letter)
+		rack := tilemapping.RackFromString(letter, alph)
+		generator := movegen.NewGordonGenerator(gd, bd, ld)
+		moves := generator.GenAll(rack, false)
+
+		var found []HookDetail
+		for _, m := range moves {
+			// TilesPlayed()==1 + word length>=3 is the TRUE-hook filter:
+			// any run of 2+ adjacent same-direction tiles already on the
+			// board must have been validated as a real word when it was
+			// placed (Scrabble enforces that on every play), so "1 new
+			// tile + a 2-letter-or-longer existing stem" reliably means
+			// "extending an actual word." Length exactly 2 means the
+			// "stem" was just a single pre-existing letter - not a word,
+			// just a perpendicular 2-letter parallel play (e.g. S below a
+			// lone A forming "AS") - and a single new tile can never land
+			// in the MIDDLE of an existing word (every board square is
+			// permanent once filled), so front/back is the only way
+			// length>=3 happens.
+			if m.TilesPlayed() != 1 || len(m.Tiles()) < 3 {
+				continue
+			}
+			row, col, vertical := m.CoordsAndVertical()
+			// Hook extends a horizontal word (vertical=false) -> the
+			// bingo lane it opens runs vertically, and vice versa.
+			perpendicular := verticalBingoPositions
+			if vertical {
+				perpendicular = horizontalBingoPositions
+			}
+			found = append(found, HookDetail{
+				Row:            row,
+				Col:            col,
+				BingoPositions: sortedPositions(perpendicular[[2]int{row, col}]),
+			})
+		}
+		hooks[letter] = found
 	}
 
 	return BoardMetrics{
-		Openness:  ComputeOpenness(bd),
-		LiveHooks: hooks,
+		Openness: ComputeOpenness(bd),
+		Hooks:    hooks,
 	}
 }
 
@@ -147,9 +241,9 @@ type BoardMetricsRequest struct {
 }
 
 type BoardMetricsResponse struct {
-	Openness float64        `json:"openness"`
-	Hooks    map[string]int `json:"hooks"`
-	Lexicon  string         `json:"lexicon"`
+	Openness float64                 `json:"openness"`
+	Hooks    map[string][]HookDetail `json:"hooks"`
+	Lexicon  string                  `json:"lexicon"`
 }
 
 // boardMetricsHandler - a standalone way to sanity-check ComputeBoardMetrics
@@ -218,7 +312,7 @@ func boardMetricsHandler(w http.ResponseWriter, r *http.Request) {
 
 	json.NewEncoder(w).Encode(BoardMetricsResponse{
 		Openness: metrics.Openness,
-		Hooks:    metrics.LiveHooks,
+		Hooks:    metrics.Hooks,
 		Lexicon:  lexiconName,
 	})
 }
