@@ -127,7 +127,18 @@ func findBingoLanePositions(bd *board.GameBoard, gd *kwg.KWG, ld *tilemapping.Le
 	horizontal = make(map[[2]int]map[int]bool)
 	vertical = make(map[[2]int]map[int]bool)
 	for _, m := range moves {
-		if m.TilesPlayed() != 7 {
+		// TilesPlayed()==7 alone isn't enough: the generator also returns
+		// moves that play 7 new tiles but connect through OTHER existing
+		// tiles elsewhere on the same line, producing a combined word
+		// longer than 7 (e.g. tacking a 7-tile play onto an unrelated word
+		// already down the board). Those aren't a standalone 7-letter
+		// bingo fitting in this square's own local window - they'd mark
+		// squares reachable (and at positions) that no real isolated
+		// 7-letter word actually supports here, and that set shifts
+		// turn to turn as unrelated tiles get added elsewhere on the
+		// board. len(m.Tiles())==7 forces the whole resulting word to be
+		// exactly the 7 new tiles, nothing more.
+		if m.TilesPlayed() != 7 || len(m.Tiles()) != 7 {
 			continue
 		}
 		row, col, isVertical := m.CoordsAndVertical()
