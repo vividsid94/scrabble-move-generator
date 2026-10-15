@@ -23,7 +23,7 @@ import (
 // "here's the new S value."
 //
 // Deliberately NOT reimplementing hook detection via GADDAG internals.
-// countSingleTileMoves below reuses the exact same board.MakeBoard /
+// countHooks below reuses the exact same board.MakeBoard /
 // cross_set.GenAllCrossSets / movegen.NewGordonGenerator pipeline
 // generateMovesHandler already runs (main-for-scrabble.go) - just with a
 // synthetic one-letter rack - so hook legality is governed by the same
@@ -44,10 +44,13 @@ type BoardMetrics struct {
 	// the rest of the board is still fully open.
 	Openness float64
 	// LiveHooks: for each letter in the `letters` argument passed to
-	// ComputeBoardMetrics, how many single-tile moves exist RIGHT NOW that
-	// place just that letter - i.e., a real hook onto an existing word,
-	// found by literally asking the move generator what a one-tile rack of
-	// that letter could do against the current board.
+	// ComputeBoardMetrics, how many TRUE hooks exist right now - a single
+	// new tile added at the front or back of an already-complete existing
+	// word (CAT -> SCAT, CAT -> CATS). Deliberately NOT every legal
+	// single-tile play: placing a letter below a single pre-existing tile
+	// to form a short perpendicular word (e.g. S below A forming "AS") is a
+	// parallel play, not a hook of anything, and was inflating this count
+	// before the length>=3 filter below excluded it.
 	LiveHooks map[string]int
 }
 
@@ -82,19 +85,26 @@ func ComputeOpenness(bd *board.GameBoard) float64 {
 	return 1 - float64(constrainedCount)/float64(emptyCount)
 }
 
-// countSingleTileMoves: generate every legal move for a one-tile rack of
-// `letter` against the current board, and count how many of them actually
-// place exactly one new tile (TilesPlayed() == 1 is always true for a
-// one-tile rack's own plays here, but kept as an explicit check rather than
-// just len(moves) in case GenAll ever returns a non-scoring move type like
-// a pass for an empty list - belt and suspenders, not load-bearing today).
-func countSingleTileMoves(bd *board.GameBoard, gd *kwg.KWG, ld *tilemapping.LetterDistribution, alph *tilemapping.TileMapping, letter string) int {
+// countHooks: generate every legal move for a one-tile rack of `letter`
+// against the current board, and count the TRUE hooks among them - a move
+// that places exactly one new tile (TilesPlayed() == 1) AND whose resulting
+// word is at least 3 tiles long. The length>=3 check is what separates a
+// real hook from a parallel play: any run of 2+ adjacent same-direction
+// tiles already on the board must have been validated as a real word when
+// it was placed (Scrabble enforces that on every play), so "1 new tile +
+// a 2-letter-or-longer existing stem" reliably means "extending an actual
+// word." A result of length exactly 2 means the "stem" was just a single
+// pre-existing letter - not a word, just a perpendicular 2-letter parallel
+// play (e.g. S below a lone A forming "AS") - and a single new tile can
+// never land in the MIDDLE of an existing word (every board square is
+// permanent once filled), so front/back is the only way length>=3 happens.
+func countHooks(bd *board.GameBoard, gd *kwg.KWG, ld *tilemapping.LetterDistribution, alph *tilemapping.TileMapping, letter string) int {
 	rack := tilemapping.RackFromString(letter, alph)
 	generator := movegen.NewGordonGenerator(gd, bd, ld)
 	moves := generator.GenAll(rack, false)
 	count := 0
 	for _, m := range moves {
-		if m.TilesPlayed() == 1 {
+		if m.TilesPlayed() == 1 && len(m.Tiles()) >= 3 {
 			count++
 		}
 	}
@@ -104,15 +114,18 @@ func countSingleTileMoves(bd *board.GameBoard, gd *kwg.KWG, ld *tilemapping.Lett
 // ComputeBoardMetrics runs GenAllCrossSets/UpdateAllAnchors once (bd is
 // mutated - same expectation every handler that calls GenAllCrossSets
 // already has, not a new side effect introduced here), then computes
-// openness and, for each requested letter (e.g. []string{"S"} or
-// []string{"S", "?"}), its live single-tile hook count.
+// openness and, for each requested letter (e.g. []string{"S"}), its live
+// hook count. The blank isn't a meaningful letter to pass here - its
+// dynamic value is driven by Openness alone, not a hook count (a blank
+// "hooking" is really just "some letter can hook," which isn't a property
+// of the blank specifically) - see boardMetricsHandler's own default.
 func ComputeBoardMetrics(bd *board.GameBoard, gd *kwg.KWG, ld *tilemapping.LetterDistribution, alph *tilemapping.TileMapping, letters []string) BoardMetrics {
 	cross_set.GenAllCrossSets(bd, gd, ld)
 	bd.UpdateAllAnchors()
 
 	hooks := make(map[string]int, len(letters))
 	for _, letter := range letters {
-		hooks[letter] = countSingleTileMoves(bd, gd, ld, alph, letter)
+		hooks[letter] = countHooks(bd, gd, ld, alph, letter)
 	}
 
 	return BoardMetrics{
@@ -124,7 +137,8 @@ func ComputeBoardMetrics(bd *board.GameBoard, gd *kwg.KWG, ld *tilemapping.Lette
 // BoardMetricsRequest mirrors GenerateMovesRequest's own board/premiumSquares/
 // lexicon shape exactly (main-for-scrabble.go) - no rack, since this is a
 // pure board-state question, plus Letters for which hook counts to compute
-// (defaults to S and the blank if omitted).
+// (defaults to just S if omitted - see ComputeBoardMetrics on why the
+// blank isn't a sensible entry here).
 type BoardMetricsRequest struct {
 	Board          [][]string      `json:"board"`
 	PremiumSquares []PremiumSquare `json:"premiumSquares,omitempty"`
@@ -195,17 +209,9 @@ func boardMetricsHandler(w http.ResponseWriter, r *http.Request) {
 	}
 	bd.TestSetTilesPlayed(tilesPlayed)
 
-	// "?" (blank) is a real, meaningful entry here, not a placeholder - a
-	// one-tile blank rack generates a move for every letter the blank
-	// could stand in for at every live hook, so LiveHooks["?"] counts
-	// total blank-fillable opportunities, not distinct positions (one
-	// position offering 3 different letter choices counts as 3). That's a
-	// deliberate first-pass simplification, not a bug - worth revisiting
-	// once there's an actual value-deriving pipeline that cares about the
-	// distinction.
 	letters := req.Letters
 	if len(letters) == 0 {
-		letters = []string{"S", "?"}
+		letters = []string{"S"}
 	}
 
 	metrics := ComputeBoardMetrics(bd, gd, ld, alph, letters)
