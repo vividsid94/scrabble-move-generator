@@ -195,9 +195,17 @@ func findBingoLanePositions(bd *board.GameBoard, gd *kwg.KWG, ld *tilemapping.Le
 // itself is always constrained by design (that's what makes it a hook) and
 // is skipped.
 func bingoWindowIsOpen(bd *board.GameBoard, hookRow, hookCol, position int, bingoVertical bool) bool {
-	dir := board.HorizontalDirection
+	// Counterintuitive but confirmed against macondo's own cross_set.go:
+	// the "HorizontalDirection" cross-set is computed by scanning LEFT/
+	// RIGHT neighbors (board.LeftAndRightEmpty, no transpose) - that's the
+	// check a VERTICAL word needs at each square (does a horizontal cross-
+	// word form with the neighbor beside it). "VerticalDirection" is the
+	// same scan run on the transposed board, i.e. UP/DOWN neighbors - what
+	// a HORIZONTAL word needs. So the direction passed to GetCrossSet is
+	// the OPPOSITE of the bingo word's own orientation, not a match to it.
+	dir := board.VerticalDirection
 	if bingoVertical {
-		dir = board.VerticalDirection
+		dir = board.HorizontalDirection
 	}
 	for i := 0; i < 7; i++ {
 		row, col := hookRow, hookCol
