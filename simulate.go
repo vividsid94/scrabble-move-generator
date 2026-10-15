@@ -448,6 +448,25 @@ type SimTurn struct {
 	WithoutDrawbackWord      string `json:"withoutDrawbackWord,omitempty"`
 	WithoutDrawbackScore     int    `json:"withoutDrawbackScore,omitempty"`
 	WithoutDrawbackExchanged string `json:"withoutDrawbackTilesExchanged,omitempty"`
+
+	// DrawbackActive is true whenever this player had a drawback active
+	// this turn at all - independent of DrawbackImpacted (which only
+	// answers "did it change the pick") and DrawbackDebug (which is empty
+	// for every drawback except Quota). Lets the frontend show every turn
+	// worth checking a drawback's own rule against.
+	DrawbackActive bool `json:"drawbackActive,omitempty"`
+	// DrawbackDebug is a short, human-readable note for whichever active
+	// drawback has per-turn state that's otherwise unobservable from the
+	// rest of this struct - today, just Quota's own 2 rolled numbers (see
+	// filterCandidatesByDrawback's own comment). Empty for every other
+	// drawback, and for every turn with no drawback active at all.
+	DrawbackDebug string `json:"drawbackDebug,omitempty"`
+	// PoolAfterMove is however many tiles are left in the bag once this
+	// turn's own move AND its replacement draw are both done - always
+	// populated (not gated on any drawback), so a pool-parity-style rule
+	// (Even Steven, #40) can be checked against the real number directly,
+	// same motivation as DrawbackDebug above.
+	PoolAfterMove int `json:"poolAfterMove"`
 }
 
 type SimGameResult struct {
@@ -664,11 +683,12 @@ func simulateOneGame(gd *kwg.KWG, player1Bot, player2Bot BotConfig) SimGameResul
 		// lets the drawback-impact comparison below ask "what would this
 		// bot have picked with no drawback at all."
 		var unfilteredForDrawbackCompare []scoredCandidate
+		var drawbackDebug string
 		if currentBot.DrawbackID != nil && currentBot.SpecialSelection == "" {
 			if def, ok := drawbackByID[*currentBot.DrawbackID]; ok {
 				unfilteredForDrawbackCompare = make([]scoredCandidate, len(candidates))
 				copy(unfilteredForDrawbackCompare, candidates)
-				candidates = filterCandidatesByDrawback(candidates, def.Rule, currentRack, bd, len(pool), turns, currentPlayer)
+				candidates, drawbackDebug = filterCandidatesByDrawback(candidates, def.Rule, currentRack, bd, len(pool), turns, currentPlayer)
 			}
 		}
 
@@ -772,7 +792,13 @@ func simulateOneGame(gd *kwg.KWG, player1Bot, player2Bot BotConfig) SimGameResul
 		turn := SimTurn{
 			Player: currentPlayer, RackBefore: currentRack,
 			RuleImpacted: ruleImpacted, BingoAversionImpacted: bingoAversionImpacted,
-			DrawbackImpacted: drawbackImpacted,
+			DrawbackImpacted: drawbackImpacted, DrawbackDebug: drawbackDebug,
+			// True whenever a drawback was active for this player THIS turn,
+			// regardless of whether it changed the pick (DrawbackImpacted) or
+			// had anything to say about it (DrawbackDebug) - lets the
+			// frontend show every turn worth checking a drawback's own rule
+			// against, not just the ones where it visibly did something.
+			DrawbackActive: unfilteredForDrawbackCompare != nil,
 		}
 		if ruleImpacted {
 			if baselineChosen.isExchange {
@@ -864,6 +890,15 @@ func simulateOneGame(gd *kwg.KWG, player1Bot, player2Bot BotConfig) SimGameResul
 			}
 		}
 
+		// Set after the switch above, not before - word play/exchange both
+		// mutate pool in there (drawing replacements), so this has to read
+		// pool AFTER that to actually mean "what's left in the bag once this
+		// move (and its draw) is done." Always populated, not just when a
+		// drawback cares about it - cheap, and lets a pool-parity-style rule
+		// (Even Steven, #40) be checked by eye against the real number
+		// instead of trusting the filter blindly, same motivation as
+		// DrawbackDebug above.
+		turn.PoolAfterMove = len(pool)
 		turns = append(turns, turn)
 
 		if currentPlayer == 1 {
