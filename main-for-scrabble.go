@@ -357,6 +357,7 @@ func main() {
 	http.HandleFunc("/solve-endgame-explain", solveEndgameExplainHandler)
 	http.HandleFunc("/simulate-series", simulateSeriesHandler)
 	http.HandleFunc("/board-metrics", boardMetricsHandler)
+	http.HandleFunc("/bot-turn", botTurnHandler)
 	http.HandleFunc("/proxy", proxyHandler)
 
 	port := os.Getenv("PORT")
@@ -485,31 +486,56 @@ func generateMovesHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if req.Rack == "" {
-		http.Error(w, "Rack is required", http.StatusBadRequest)
+	if msg := validateMovesRequest(&req); msg != "" {
+		http.Error(w, msg, http.StatusBadRequest)
 		return
 	}
-	if len(req.Board) != 15 {
-		http.Error(w, "Board must have 15 rows", http.StatusBadRequest)
+	responseMoves, total, lexiconName, err := rankMovesForRequest(req)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
+	}
+	resp := GenerateMovesResponse{
+		Moves:       responseMoves,
+		Total:       total,
+		PauseReason: decideGeneratePauseReason(responseMoves, req.PauseMode),
+		Lexicon:     lexiconName,
+	}
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(resp)
+}
+
+// validateMovesRequest checks a move-generation request's shape (shared by
+// /generate-moves and /bot-turn) and defaults TopN. Returns an error
+// message for a 400, or "" when the request is fine.
+func validateMovesRequest(req *GenerateMovesRequest) string {
+	if req.Rack == "" {
+		return "Rack is required"
+	}
+	if len(req.Board) != 15 {
+		return "Board must have 15 rows"
 	}
 	for i := range req.Board {
 		if len(req.Board[i]) != 15 {
-			http.Error(w, "Each board row must have 15 columns", http.StatusBadRequest)
-			return
+			return "Each board row must have 15 columns"
 		}
 	}
 	if req.TopN <= 0 {
 		req.TopN = 10
 	}
+	return ""
+}
 
-	// Shadows the removed package-level gd - every gd reference below this
-	// point in the function resolves to this request-scoped local instead,
-	// so nothing past this line needed to change.
+// rankMovesForRequest is /generate-moves' ranking, pulled out so /bot-turn
+// (persona.go) ranks moves exactly the same way: every play plus, with 7+
+// tiles in the bag, every exchange, sorted best-first by score + leave and
+// cut to req.TopN. Returns the moves, the raw generated-move count, and
+// the lexicon actually used.
+func rankMovesForRequest(req GenerateMovesRequest) ([]Move, int, string, error) {
+	// Request-scoped lexicon - see resolveLexicon.
 	gd, lexiconName, err := resolveLexicon(req.Lexicon)
 	if err != nil {
-		http.Error(w, err.Error(), http.StatusBadRequest)
-		return
+		return nil, 0, "", err
 	}
 
 	// Create and initialize the board with custom premium squares if provided
@@ -640,14 +666,7 @@ func generateMovesHandler(w http.ResponseWriter, r *http.Request) {
 			Tiles: rm.detailed.Tiles,
 		})
 	}
-	resp := GenerateMovesResponse{
-		Moves:       responseMoves,
-		Total:       len(moves),
-		PauseReason: decideGeneratePauseReason(responseMoves, req.PauseMode),
-		Lexicon:     lexiconName,
-	}
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(resp)
+	return responseMoves, len(moves), lexiconName, nil
 }
 
 func validateWordHandler(w http.ResponseWriter, r *http.Request) {
