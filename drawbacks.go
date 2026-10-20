@@ -500,6 +500,20 @@ func drawbackLossAtGameEnd(rule DrawbackRule, turns []SimTurn, holder int) (bool
 	return false, ""
 }
 
+// zeroedInMustSkip: should a Zeroed In bot exchange or pass this turn? Yes
+// once the exchanges/passes it still needs reach its own turns left, roughly
+// one per 8 tiles in the bag (both players drawing ~4 a turn) plus one.
+func zeroedInMustSkip(rule DrawbackRule, poolSize int, turns []SimTurn, player int) bool {
+	count := 0
+	for _, t := range turns {
+		if t.Player == player && (t.Type == "exchange" || t.Type == "pass") {
+			count++
+		}
+	}
+	needed := int(rule.Value) - count
+	return needed > 0 && needed >= poolSize/8+1
+}
+
 // openedPremiumSquares: the empty premium squares right next to a tile the
 // opponent placed on the immediately preceding turn (I'll Take That). None
 // when that turn wasn't the opponent's play.
@@ -1391,6 +1405,18 @@ func filterCandidatesByDrawback(candidates []scoredCandidate, rule DrawbackRule,
 	// Lose conditions don't forbid moves - a bot just avoids the losing ones
 	// when it has a safe option; with none, it makes its best move and loses.
 	if isLoseRule(rule) {
+		// Zeroed In: a bot never exchanges or passes by choice, so once the
+		// count still needed catches up with its turns left it only
+		// exchanges - or passes (no candidates) when it can't.
+		if rule.Type == "loseIfFewExchangesOrPasses" && zeroedInMustSkip(rule, poolSizeBefore, turns, currentPlayer) {
+			exchanges := make([]scoredCandidate, 0)
+			for _, c := range candidates {
+				if c.isExchange {
+					exchanges = append(exchanges, c)
+				}
+			}
+			return exchanges, "Zeroed In: exchanging/passing to reach the count"
+		}
 		safe := make([]scoredCandidate, 0, len(candidates))
 		for i := range candidates {
 			if lost, _ := losesWith(rule, &candidates[i], poolSizeBefore, turns, currentPlayer); !lost {
