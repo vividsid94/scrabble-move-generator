@@ -263,6 +263,11 @@ var drawbacks = []DrawbackDef{
 		// AppliesToExchanges: an exchange's tiles leave the rack too, so it
 		// has to fit the remaining allowance like a play does.
 		Rule: DrawbackRule{Type: "maxTilesLeaveRack", MaxTiles: 40, AppliesToExchanges: true}},
+	{ID: 7, Name: "Shifting Sands", NameSource: "claude",
+		Description: "50% of squares are off-limits, re-randomized every turn (never the center star).",
+		// Rolled in filterCandidatesByDrawback's own special case - one
+		// shared roll per turn, like Quota. Value is the off-limits share.
+		Rule: DrawbackRule{Type: "randomBlockedSquares", Value: 0.5}},
 }
 
 var drawbackByID = func() map[int]DrawbackDef {
@@ -990,6 +995,45 @@ func filterCandidatesByDrawback(candidates []scoredCandidate, rule DrawbackRule,
 			return qualifying, ""
 		}
 		return exchanges, ""
+	}
+
+	// Shifting Sands: this turn, a random share (rule.Value) of the squares
+	// other than the center star are off-limits - a word play can't put a
+	// new tile on one. Rolled once here so every candidate faces the same
+	// squares; exchanges aren't affected.
+	if rule.Type == "randomBlockedSquares" {
+		const center = 7*15 + 7
+		others := make([]int, 0, 224)
+		for i := 0; i < 225; i++ {
+			if i != center {
+				others = append(others, i)
+			}
+		}
+		rand.Shuffle(len(others), func(i, j int) { others[i], others[j] = others[j], others[i] })
+		blockedCount := int(float64(len(others)) * rule.Value)
+		blocked := make(map[int]bool, blockedCount)
+		for _, sq := range others[:blockedCount] {
+			blocked[sq] = true
+		}
+		filtered := make([]scoredCandidate, 0, len(candidates))
+		for i := range candidates {
+			c := &candidates[i]
+			if c.isExchange {
+				filtered = append(filtered, *c)
+				continue
+			}
+			ok := true
+			for _, t := range c.detailed.Tiles {
+				if t.IsNew && blocked[t.Row*15+t.Col] {
+					ok = false
+					break
+				}
+			}
+			if ok {
+				filtered = append(filtered, *c)
+			}
+		}
+		return filtered, fmt.Sprintf("Shifting Sands: %d squares off-limits this turn", blockedCount)
 	}
 
 	if rule.Type == "randomTileCountQuota" {
