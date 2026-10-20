@@ -310,6 +310,21 @@ var drawbacks = []DrawbackDef{
 		// The zone is rolled per game in simulateOneGame (rollClaustroZone)
 		// and applies to BOTH players - see claustroLoss.
 		Rule: DrawbackRule{Type: "loseIfPlayInZone"}},
+	{ID: 36, Name: "Zeroed In", NameSource: "friend",
+		Description: "Must exchange or pass at least 6 times over the course of the game.",
+		// Lose rule, judged at game end: exchanges and passes both count.
+		Rule: DrawbackRule{Type: "loseIfFewExchangesOrPasses", Value: 6}},
+	{ID: 25, Name: "I'll Take That", NameSource: "friend",
+		Description: "If your opponent's play opens a bonus square you can reach, you must play there.",
+		// Forcing: "opened" = an empty premium square right next to a tile
+		// the opponent placed on their immediately preceding turn.
+		Rule: DrawbackRule{Type: "mustCoverOpenedPremium", Forcing: true}},
+	{ID: 17, Name: "Nerf War", NameSource: "friend",
+		Description: "All of your tiles score 1 point, hidden from your opponent until the game ends.",
+		// Rescored in filterCandidatesByDrawback's own special case: tiles
+		// you place count 1 (blanks stay 0); tiles already on the board keep
+		// their value; premiums and the bingo bonus still apply.
+		Rule: DrawbackRule{Type: "nerfTileValues"}},
 }
 
 // isLoseRule reports whether a drawback is a lose condition (breaking it
@@ -318,7 +333,8 @@ func isLoseRule(rule DrawbackRule) bool {
 	switch rule.Type {
 	case "loseIfPlayScoreBelow", "loseIfPastTurnLimit", "loseIfLeadingBeforeTurn",
 		"loseIfOpponentBingos", "loseIfOpponentCoversSquare", "loseIfFewLongPlays",
-		"loseIfNoTileOnSquareByTurn", "loseIfFewTilesInRows", "loseIfPlayInZone":
+		"loseIfNoTileOnSquareByTurn", "loseIfFewTilesInRows", "loseIfPlayInZone",
+		"loseIfFewExchangesOrPasses":
 		return true
 	}
 	return false
@@ -438,6 +454,18 @@ func drawbackLossAfterTurn(rule DrawbackRule, turn SimTurn, poolSizeBefore int, 
 // drawbackLossAtGameEnd reports whether `holder`'s lose rule is broken once
 // the game is over (We All Floater Down Here), and why.
 func drawbackLossAtGameEnd(rule DrawbackRule, turns []SimTurn, holder int) (bool, string) {
+	if rule.Type == "loseIfFewExchangesOrPasses" {
+		count := 0
+		for _, t := range turns {
+			if t.Player == holder && (t.Type == "exchange" || t.Type == "pass") {
+				count++
+			}
+		}
+		if float64(count) < rule.Value {
+			return true, fmt.Sprintf("only %d exchanges/passes by game end", count)
+		}
+		return false, ""
+	}
 	if rule.Type == "loseIfFewTilesInRows" {
 		for _, row := range rule.Rows {
 			count := 0
@@ -470,6 +498,87 @@ func drawbackLossAtGameEnd(rule DrawbackRule, turns []SimTurn, holder int) (bool
 		return true, fmt.Sprintf("only %d %d-letter play(s) by game end", count, rule.MinLength)
 	}
 	return false, ""
+}
+
+// openedPremiumSquares: the empty premium squares right next to a tile the
+// opponent placed on the immediately preceding turn (I'll Take That). None
+// when that turn wasn't the opponent's play.
+func openedPremiumSquares(turns []SimTurn, player int, bd *board.GameBoard) map[rcPos]bool {
+	opened := map[rcPos]bool{}
+	if len(turns) == 0 {
+		return opened
+	}
+	last := turns[len(turns)-1]
+	if last.Player == player || last.Type != "play" {
+		return opened
+	}
+	for _, t := range last.Tiles {
+		if !t.IsNew {
+			continue
+		}
+		for _, d := range [][2]int{{-1, 0}, {1, 0}, {0, -1}, {0, 1}} {
+			r, c := t.Row+d[0], t.Col+d[1]
+			if _, ok := premiumTypeAt(r, c, bd); ok {
+				opened[rcPos{r, c}] = true
+			}
+		}
+	}
+	return opened
+}
+
+// squareMultipliers is (letter, word) multiplier for an EMPTY square.
+func squareMultipliers(r, c int, bd *board.GameBoard) (int, int) {
+	switch t, _ := premiumTypeAt(r, c, bd); t {
+	case "DLS":
+		return 2, 1
+	case "TLS":
+		return 3, 1
+	case "DWS":
+		return 1, 2
+	case "TWS":
+		return 1, 3
+	}
+	return 1, 1
+}
+
+// nerfedScore is candidate c's score with the tiles it places worth 1 each
+// (Nerf War): the normal score minus what each new tile's face value above
+// 1 added - in the main word (x its letter multiplier x the main word's
+// multiplier) and in its cross word if it forms one (x its letter
+// multiplier x its own square's word multiplier). Blanks are 0 either way.
+// bd is the board before the move, so the new tiles' squares are empty.
+func nerfedScore(c *scoredCandidate, bd *board.GameBoard) int {
+	mainWordMult := 1
+	for _, t := range c.detailed.Tiles {
+		if t.IsNew {
+			_, wm := squareMultipliers(t.Row, t.Col, bd)
+			mainWordMult *= wm
+		}
+	}
+	diff := 0
+	for _, t := range c.detailed.Tiles {
+		if !t.IsNew || t.IsBlank {
+			continue
+		}
+		extra := tileLetterValue(t) - 1
+		if extra <= 0 {
+			continue
+		}
+		lm, wm := squareMultipliers(t.Row, t.Col, bd)
+		diff += extra * lm * mainWordMult
+		var crossBefore, crossAfter bool
+		if c.detailed.Direction == "down" {
+			crossBefore = t.Col > 0 && bd.GetLetter(t.Row, t.Col-1) != 0
+			crossAfter = t.Col < 14 && bd.GetLetter(t.Row, t.Col+1) != 0
+		} else {
+			crossBefore = t.Row > 0 && bd.GetLetter(t.Row-1, t.Col) != 0
+			crossAfter = t.Row < 14 && bd.GetLetter(t.Row+1, t.Col) != 0
+		}
+		if crossBefore || crossAfter {
+			diff += extra * lm * wm
+		}
+	}
+	return c.detailed.Score - diff
 }
 
 // holderCoveredSquare: did holder place a tile on (row, col) in any play?
@@ -1195,6 +1304,17 @@ func evaluateDrawback(rule DrawbackRule, c *scoredCandidate, preMoveRack string,
 	case "maxTilesLeaveRack":
 		return tilesLeftRackTotal(turns, currentPlayer)+drawnTileCount(c) <= rule.MaxTiles
 
+	// I'll Take That (forcing): does this play put a new tile on a square
+	// the opponent's last play opened?
+	case "mustCoverOpenedPremium":
+		opened := openedPremiumSquares(turns, currentPlayer, bd)
+		for _, t := range c.detailed.Tiles {
+			if t.IsNew && opened[rcPos{t.Row, t.Col}] {
+				return true
+			}
+		}
+		return false
+
 	case "cannotPlayFreshlyDrawnTile":
 		last := lastTurnByPlayer(turns, currentPlayer)
 		if last == nil {
@@ -1247,6 +1367,27 @@ func evaluateDrawback(rule DrawbackRule, c *scoredCandidate, preMoveRack string,
 // game log can be checked by eye ("needed 3 or 6 tiles, played 3") instead
 // of having to trust the filter blindly - see simulate.go's own call site.
 func filterCandidatesByDrawback(candidates []scoredCandidate, rule DrawbackRule, preMoveRack string, bd *board.GameBoard, poolSizeBefore int, turns []SimTurn, currentPlayer int) ([]scoredCandidate, string) {
+	// Nerf War: nothing is forbidden - every word play is rescored with the
+	// player's placed tiles worth 1, so the bot picks (and scores) by its
+	// real points. Copies each DetailedMove so the unfiltered snapshot the
+	// caller keeps for comparison isn't changed.
+	if rule.Type == "nerfTileValues" {
+		rescored := make([]scoredCandidate, len(candidates))
+		for i, c := range candidates {
+			if !c.isExchange {
+				nerfed := nerfedScore(&c, bd)
+				delta := float64(c.detailed.Score - nerfed)
+				d := *c.detailed
+				d.Score = nerfed
+				c.detailed = &d
+				c.total -= delta
+				c.baselineTotal -= delta
+			}
+			rescored[i] = c
+		}
+		return rescored, ""
+	}
+
 	// Lose conditions don't forbid moves - a bot just avoids the losing ones
 	// when it has a safe option; with none, it makes its best move and loses.
 	if isLoseRule(rule) {
