@@ -54,6 +54,10 @@ type DrawbackRule struct {
 	// star is a DWS).
 	ExemptCenter bool `json:"exemptCenter,omitempty"`
 
+	// MinLength (loseIfFewLongPlays): the main-word length that counts as a
+	// "long" play (We All Floater Down Here: 8).
+	MinLength int `json:"minLength,omitempty"`
+
 	Comparator string  `json:"comparator,omitempty"` // "gte" | "lte" | "eq", for any *Comparator-driven type
 	Value      float64 `json:"value,omitempty"`
 
@@ -274,43 +278,179 @@ var drawbacks = []DrawbackDef{
 	{ID: 8, Name: "Scoring Never Stops", NameSource: "friend",
 		Description: "Score under 25 on a play (15 once the bag is empty) and you lose.",
 		Rule:        DrawbackRule{Type: "loseIfPlayScoreBelow", Value: 25, ValueWhenBagEmpty: 15}},
+	{ID: 34, Name: "Time Crunch", NameSource: "friend",
+		Description: "Game runs past 25 turns and you lose.",
+		Rule:        DrawbackRule{Type: "loseIfPastTurnLimit", Value: 25}},
+	{ID: 10, Name: "Turnabout Board", NameSource: "friend",
+		Description: "You can't be winning before turn 16.",
+		Rule:        DrawbackRule{Type: "loseIfLeadingBeforeTurn", Value: 16}},
+	{ID: 9, Name: "Vervain", NameSource: "friend",
+		Description: "Your opponent plays a bingo and you lose.",
+		Rule:        DrawbackRule{Type: "loseIfOpponentBingos"}},
+	{ID: 21, Name: "Triple Threat", NameSource: "claude",
+		Description: "Your opponent covers a triple word score and you lose.",
+		Rule:        DrawbackRule{Type: "loseIfOpponentCoversSquare", Types: []string{"TWS"}}},
+	{ID: 12, Name: "We All Floater Down Here", NameSource: "friend",
+		Description: "Fewer than 3 eight-letter plays (bingo or not) by game end and you lose.",
+		Rule:        DrawbackRule{Type: "loseIfFewLongPlays", Value: 3, MinLength: 8}},
 }
 
 // isLoseRule reports whether a drawback is a lose condition (breaking it
 // ends the game as a loss) rather than a restriction on which moves count.
 func isLoseRule(rule DrawbackRule) bool {
 	switch rule.Type {
-	case "loseIfPlayScoreBelow":
+	case "loseIfPlayScoreBelow", "loseIfPastTurnLimit", "loseIfLeadingBeforeTurn",
+		"loseIfOpponentBingos", "loseIfOpponentCoversSquare", "loseIfFewLongPlays":
 		return true
 	}
 	return false
 }
 
-// losesWith reports whether making candidate c this turn would break lose
-// rule `rule`, and why - used so a bot avoids a losing move when it has a
-// safe one. poolSizeBefore is the bag size before the move.
-func losesWith(rule DrawbackRule, c *scoredCandidate, poolSizeBefore int) (bool, string) {
+// Turn counts here are the game's turns across both players - every play,
+// exchange and pass is one turn - so len(turns) once a turn has been added.
+
+// lastScores is each player's running total as of the turns so far.
+func lastScores(turns []SimTurn) (int, int) {
+	s1, s2 := 0, 0
+	for _, t := range turns {
+		if t.Player == 1 {
+			s1 = t.RunningTotal
+		} else {
+			s2 = t.RunningTotal
+		}
+	}
+	return s1, s2
+}
+
+// losesWith reports whether the holder making candidate c this turn would
+// break lose rule `rule` - used so a bot avoids a losing move when it has a
+// safe one. Only rules the holder's own move can break are judged here (an
+// opponent's bingo, say, isn't the holder's to avoid).
+func losesWith(rule DrawbackRule, c *scoredCandidate, poolSizeBefore int, turns []SimTurn, holder int) (bool, string) {
 	switch rule.Type {
 	case "loseIfPlayScoreBelow":
 		if c.isExchange {
 			return false, ""
 		}
 		return playScoreBelow(rule, c.detailed.Score, poolSizeBefore)
+	case "loseIfLeadingBeforeTurn":
+		turnNumber := len(turns) + 1
+		if float64(turnNumber) >= rule.Value {
+			return false, ""
+		}
+		s1, s2 := lastScores(turns)
+		mine, theirs := s1, s2
+		if holder == 2 {
+			mine, theirs = s2, s1
+		}
+		if !c.isExchange {
+			mine += c.detailed.Score
+		}
+		if mine > theirs {
+			return true, fmt.Sprintf("ahead %d-%d after turn %d", mine, theirs, turnNumber)
+		}
 	}
 	return false, ""
 }
 
-// drawbackLossAfterTurn reports whether the turn just played broke lose rule
-// `rule` (the game then ends), and the reason to report.
-func drawbackLossAfterTurn(rule DrawbackRule, turn SimTurn, poolSizeBefore int) (bool, string) {
+// drawbackLossAfterTurn reports whether the turn just played (the last entry
+// of turns, made by turn.Player) broke `holder`'s lose rule, and why.
+// gameEnding: this turn also ended the game normally (went out / six
+// scoreless turns) - Time Crunch only bites if the game would go on.
+func drawbackLossAfterTurn(rule DrawbackRule, turn SimTurn, poolSizeBefore int, turns []SimTurn, holder int, gameEnding bool) (bool, string) {
+	byHolder := turn.Player == holder
 	switch rule.Type {
 	case "loseIfPlayScoreBelow":
-		if turn.Type != "play" {
+		if !byHolder || turn.Type != "play" {
 			return false, ""
 		}
 		return playScoreBelow(rule, turn.Score, poolSizeBefore)
+	case "loseIfPastTurnLimit":
+		if !gameEnding && float64(len(turns)) >= rule.Value {
+			return true, fmt.Sprintf("the game reached turn %d", len(turns))
+		}
+	case "loseIfLeadingBeforeTurn":
+		if float64(len(turns)) >= rule.Value {
+			return false, ""
+		}
+		s1, s2 := lastScores(turns)
+		mine, theirs := s1, s2
+		if holder == 2 {
+			mine, theirs = s2, s1
+		}
+		if mine > theirs {
+			return true, fmt.Sprintf("ahead %d-%d after turn %d", mine, theirs, len(turns))
+		}
+	case "loseIfOpponentBingos":
+		if !byHolder && turn.Type == "play" && newTileCountOf(turn.Tiles) == 7 {
+			return true, "the opponent played a bingo"
+		}
+	case "loseIfOpponentCoversSquare":
+		if byHolder || turn.Type != "play" {
+			return false, ""
+		}
+		for _, t := range turn.Tiles {
+			if t.IsNew && containsString(rule.Types, squareTypeAt(t.Row, t.Col)) {
+				return true, "the opponent covered a " + squareTypeAt(t.Row, t.Col)
+			}
+		}
 	}
 	return false, ""
+}
+
+// drawbackLossAtGameEnd reports whether `holder`'s lose rule is broken once
+// the game is over (We All Floater Down Here), and why.
+func drawbackLossAtGameEnd(rule DrawbackRule, turns []SimTurn, holder int) (bool, string) {
+	if rule.Type != "loseIfFewLongPlays" {
+		return false, ""
+	}
+	count := 0
+	for _, t := range turns {
+		if t.Player == holder && t.Type == "play" && len(t.Tiles) == rule.MinLength {
+			count++
+		}
+	}
+	if float64(count) < rule.Value {
+		return true, fmt.Sprintf("only %d %d-letter play(s) by game end", count, rule.MinLength)
+	}
+	return false, ""
+}
+
+func newTileCountOf(tiles []MoveTile) int {
+	n := 0
+	for _, t := range tiles {
+		if t.IsNew {
+			n++
+		}
+	}
+	return n
+}
+
+// squareTypeAt is the board layout's premium type at (r, c) - "TWS", "DWS",
+// "TLS", "DLS" or "" - whether or not a tile now sits there (premiumTypeAt
+// answers "" for an occupied square).
+func squareTypeAt(r, c int) string {
+	pos := rcPos{r, c}
+	switch {
+	case twsSquares[pos]:
+		return "TWS"
+	case dwsSquares[pos]:
+		return "DWS"
+	case tlsSquares[pos]:
+		return "TLS"
+	case dlsSquares[pos]:
+		return "DLS"
+	}
+	return ""
+}
+
+func containsString(list []string, s string) bool {
+	for _, x := range list {
+		if x == s {
+			return true
+		}
+	}
+	return false
 }
 
 // Scoring Never Stops: a play scoring under Value (ValueWhenBagEmpty once
@@ -997,7 +1137,7 @@ func filterCandidatesByDrawback(candidates []scoredCandidate, rule DrawbackRule,
 	if isLoseRule(rule) {
 		safe := make([]scoredCandidate, 0, len(candidates))
 		for i := range candidates {
-			if lost, _ := losesWith(rule, &candidates[i], poolSizeBefore); !lost {
+			if lost, _ := losesWith(rule, &candidates[i], poolSizeBefore, turns, currentPlayer); !lost {
 				safe = append(safe, candidates[i])
 			}
 		}

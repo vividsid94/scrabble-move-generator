@@ -922,16 +922,21 @@ func simulateOneGame(gd *kwg.KWG, player1Bot, player2Bot BotConfig) SimGameResul
 			rack2 = newRack
 		}
 
-		// A lose-condition drawback broken this turn ends the game on the spot.
-		if currentBot.DrawbackID != nil {
-			if def, ok := drawbackByID[*currentBot.DrawbackID]; ok && isLoseRule(def.Rule) {
-				if lost, reason := drawbackLossAfterTurn(def.Rule, turn, poolSizeAtTurnStart); lost {
-					endReason = "drawbackLoss"
-					lossPlayer = currentPlayer
-					lossReason = def.Name + ": " + reason
-					break
-				}
+		// A lose-condition drawback broken this turn ends the game on the
+		// spot. Both players are checked - some rules trigger on the
+		// opponent's move or on the turn count, not just on your own move.
+		gameEnding := (len(newRack) == 0 && len(pool) == 0) || consecutiveScoreless >= 6
+		for _, holder := range []int{currentPlayer, 3 - currentPlayer} {
+			if lost, reason := loseRuleBroken(player1Bot, player2Bot, holder, func(rule DrawbackRule) (bool, string) {
+				return drawbackLossAfterTurn(rule, turn, poolSizeAtTurnStart, turns, holder, gameEnding)
+			}); lost {
+				lossPlayer, lossReason = holder, reason
+				break
 			}
+		}
+		if lossPlayer != 0 {
+			endReason = "drawbackLoss"
+			break
 		}
 
 		if len(newRack) == 0 && len(pool) == 0 {
@@ -944,6 +949,18 @@ func simulateOneGame(gd *kwg.KWG, player1Bot, player2Bot BotConfig) SimGameResul
 		}
 
 		currentPlayer = 3 - currentPlayer
+	}
+
+	// Rules judged once the game is over (We All Floater Down Here).
+	if endReason != "drawbackLoss" {
+		for _, holder := range []int{1, 2} {
+			if lost, reason := loseRuleBroken(player1Bot, player2Bot, holder, func(rule DrawbackRule) (bool, string) {
+				return drawbackLossAtGameEnd(rule, turns, holder)
+			}); lost {
+				endReason, lossPlayer, lossReason = "drawbackLoss", holder, reason
+				break
+			}
+		}
 	}
 
 	// Final score adjustment - same two end-game rules as
@@ -991,6 +1008,26 @@ func simulateOneGame(gd *kwg.KWG, player1Bot, player2Bot BotConfig) SimGameResul
 		LossPlayer:       lossPlayer,
 		LossReason:       lossReason,
 	}
+}
+
+// loseRuleBroken runs check against `holder`'s drawback if it's a lose
+// rule, returning whether it was broken and the full reason to report.
+func loseRuleBroken(player1Bot, player2Bot BotConfig, holder int, check func(DrawbackRule) (bool, string)) (bool, string) {
+	bot := player1Bot
+	if holder == 2 {
+		bot = player2Bot
+	}
+	if bot.DrawbackID == nil {
+		return false, ""
+	}
+	def, ok := drawbackByID[*bot.DrawbackID]
+	if !ok || !isLoseRule(def.Rule) {
+		return false, ""
+	}
+	if lost, reason := check(def.Rule); lost {
+		return true, def.Name + ": " + reason
+	}
+	return false, ""
 }
 
 func simulateSeriesHandler(w http.ResponseWriter, r *http.Request) {
