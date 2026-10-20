@@ -251,7 +251,7 @@ var drawbacks = []DrawbackDef{
 		// turn's list, not re-rolled per candidate.
 		Rule: DrawbackRule{Type: "randomTileCountQuota"}},
 	{ID: 39, Name: "Well Aged", NameSource: "friend",
-		Description: "Can't play a tile you drew after your last play.",
+		Description: "Can't play a tile you drew after your last turn.",
 		Rule:        DrawbackRule{Type: "cannotPlayFreshlyDrawnTile"}},
 }
 
@@ -445,6 +445,18 @@ func firstTileOfTurn(t SimTurn) MoveTile {
 func lastWordPlayByPlayer(turns []SimTurn, player int) *SimTurn {
 	for i := len(turns) - 1; i >= 0; i-- {
 		if turns[i].Player == player && turns[i].Type == "play" {
+			return &turns[i]
+		}
+	}
+	return nil
+}
+
+// lastTurnByPlayer is lastWordPlayByPlayer without the "play" filter - the
+// player's most recent turn of any kind (play, exchange or pass). Well Aged
+// ages tiles at every turn, not just word plays.
+func lastTurnByPlayer(turns []SimTurn, player int) *SimTurn {
+	for i := len(turns) - 1; i >= 0; i-- {
+		if turns[i].Player == player {
 			return &turns[i]
 		}
 	}
@@ -781,22 +793,31 @@ func evaluateDrawback(rule DrawbackRule, c *scoredCandidate, preMoveRack string,
 		}
 		return true
 
-	// Well Aged (#39): a tile counts as "aged" if it survived from before
-	// the player's own last play - that play's own RackBefore, minus
-	// whatever letters it actually used. Anything beyond those per-letter
-	// counts must have been drawn as a replacement since then, and so is
-	// forbidden now. No prior play yet (this player's first turn) means
-	// everything already in hand is aged by definition - same "nothing to
-	// compare against yet" treatment every other Category D rule already
-	// gives an empty history. Exchanges are left at the default exemption
-	// (no AppliesToExchanges on this rule) - this is about which tiles get
-	// PLACED, not which get discarded; nothing in the ledger says otherwise.
+	// Well Aged (#39): a tile counts as "aged" if it was already in hand
+	// at the player's own last TURN of any kind - that turn's RackBefore,
+	// minus whatever left the rack on it (a play's placed tiles, an
+	// exchange's returned tiles, nothing for a pass). Anything beyond those
+	// per-letter counts was drawn since then, and so is forbidden now.
+	// Exchanges and passes count as turns on purpose: counting only word
+	// plays (the original version) let a player stuck with unplayable aged
+	// tiles - e.g. after a bingo, which leaves none - exchange forever,
+	// since nothing ever aged again. No prior turn yet (the first turn)
+	// means everything already in hand is aged by definition. Exchanges
+	// themselves stay allowed (no AppliesToExchanges on this rule) - this
+	// is about which tiles get PLACED, not which get discarded.
 	case "cannotPlayFreshlyDrawnTile":
-		last := lastWordPlayByPlayer(turns, currentPlayer)
+		last := lastTurnByPlayer(turns, currentPlayer)
 		if last == nil {
 			return true
 		}
-		agedRack := removeRackFromPool(last.RackBefore, newlyUsedLetters(last.Tiles))
+		left := ""
+		switch last.Type {
+		case "play":
+			left = newlyUsedLetters(last.Tiles)
+		case "exchange":
+			left = last.TilesExchanged
+		}
+		agedRack := removeRackFromPool(last.RackBefore, left)
 		for _, t := range c.detailed.Tiles {
 			if !t.IsNew {
 				continue
