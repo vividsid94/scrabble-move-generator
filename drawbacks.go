@@ -507,7 +507,7 @@ func rollClaustroZone(holder int) claustroZone {
 	for r := 0; r <= 12; r++ {
 		for c := 0; c <= 12; c++ {
 			if r == 0 || r == 12 || c == 0 || c == 12 {
-				options = append(options, claustroZone{r, c})
+				options = append(options, claustroZone{Row: r, Col: c})
 			}
 		}
 	}
