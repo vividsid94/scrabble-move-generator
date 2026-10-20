@@ -371,7 +371,8 @@ func main() {
 		port = "8080"
 	}
 	fmt.Printf("\n🚀 Macondo MoveGen Service running on :%s\n", port)
-	log.Fatal(http.ListenAndServe(":"+port, nil))
+	// gzipHandler (gzip.go) compresses responses for clients that accept it.
+	log.Fatal(http.ListenAndServe(":"+port, gzipHandler(http.DefaultServeMux)))
 }
 
 func initService() error {
