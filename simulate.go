@@ -486,6 +486,11 @@ type SimGameResult struct {
 	Player1FinalRack string    `json:"player1FinalRack"`
 	Player2FinalRack string    `json:"player2FinalRack"`
 	FinalPool        string    `json:"finalPool"`
+	// Set when a lose-condition drawback ended the game (EndReason
+	// "drawbackLoss"): who lost and why. The loser is scored 0; the winner
+	// keeps their score at that moment.
+	LossPlayer int    `json:"lossPlayer,omitempty"`
+	LossReason string `json:"lossReason,omitempty"`
 }
 
 type SimulateSeriesRequest struct {
@@ -574,6 +579,7 @@ func simulateOneGame(gd *kwg.KWG, player1Bot, player2Bot BotConfig) SimGameResul
 
 	var turns []SimTurn
 	endReason := ""
+	lossPlayer, lossReason := 0, ""
 
 	for {
 		currentRack := rack1
@@ -582,6 +588,7 @@ func simulateOneGame(gd *kwg.KWG, player1Bot, player2Bot BotConfig) SimGameResul
 			currentRack = rack2
 			currentBot = player2Bot
 		}
+		poolSizeAtTurnStart := len(pool)
 
 		rack := tilemapping.RackFromString(currentRack, alph)
 		generator := movegen.NewGordonGenerator(gd, bd, ld)
@@ -915,6 +922,18 @@ func simulateOneGame(gd *kwg.KWG, player1Bot, player2Bot BotConfig) SimGameResul
 			rack2 = newRack
 		}
 
+		// A lose-condition drawback broken this turn ends the game on the spot.
+		if currentBot.DrawbackID != nil {
+			if def, ok := drawbackByID[*currentBot.DrawbackID]; ok && isLoseRule(def.Rule) {
+				if lost, reason := drawbackLossAfterTurn(def.Rule, turn, poolSizeAtTurnStart); lost {
+					endReason = "drawbackLoss"
+					lossPlayer = currentPlayer
+					lossReason = def.Name + ": " + reason
+					break
+				}
+			}
+		}
+
 		if len(newRack) == 0 && len(pool) == 0 {
 			endReason = "emptied"
 			break
@@ -941,10 +960,20 @@ func simulateOneGame(gd *kwg.KWG, player1Bot, player2Bot BotConfig) SimGameResul
 	} else if endReason == "sixPasses" {
 		score1 -= rackPointValue(rack1)
 		score2 -= rackPointValue(rack2)
+	} else if endReason == "drawbackLoss" {
+		// Loser scored 0, winner keeps their score - so the winner always
+		// has the higher score, whatever the score was when it ended.
+		if lossPlayer == 1 {
+			score1 = 0
+		} else {
+			score2 = 0
+		}
 	}
 
 	winner := 0
-	if score1 > score2 {
+	if endReason == "drawbackLoss" {
+		winner = 3 - lossPlayer
+	} else if score1 > score2 {
 		winner = 1
 	} else if score2 > score1 {
 		winner = 2
@@ -959,6 +988,8 @@ func simulateOneGame(gd *kwg.KWG, player1Bot, player2Bot BotConfig) SimGameResul
 		Player1FinalRack: rack1,
 		Player2FinalRack: rack2,
 		FinalPool:        pool,
+		LossPlayer:       lossPlayer,
+		LossReason:       lossReason,
 	}
 }
 

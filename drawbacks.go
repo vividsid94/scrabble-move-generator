@@ -268,6 +268,62 @@ var drawbacks = []DrawbackDef{
 		// Rolled in filterCandidatesByDrawback's own special case - one
 		// shared roll per turn, like Quota. Value is the off-limits share.
 		Rule: DrawbackRule{Type: "randomBlockedSquares", Value: 0.5}},
+	// -- Lose conditions: breaking one ends the game on the spot - the
+	// player who broke it loses, scored 0, and the winner keeps their score
+	// (see isLoseRule / drawbackLossAfterTurn and simulateOneGame).
+	{ID: 8, Name: "Scoring Never Stops", NameSource: "friend",
+		Description: "Score under 25 on a play (15 once the bag is empty) and you lose.",
+		Rule:        DrawbackRule{Type: "loseIfPlayScoreBelow", Value: 25, ValueWhenBagEmpty: 15}},
+}
+
+// isLoseRule reports whether a drawback is a lose condition (breaking it
+// ends the game as a loss) rather than a restriction on which moves count.
+func isLoseRule(rule DrawbackRule) bool {
+	switch rule.Type {
+	case "loseIfPlayScoreBelow":
+		return true
+	}
+	return false
+}
+
+// losesWith reports whether making candidate c this turn would break lose
+// rule `rule`, and why - used so a bot avoids a losing move when it has a
+// safe one. poolSizeBefore is the bag size before the move.
+func losesWith(rule DrawbackRule, c *scoredCandidate, poolSizeBefore int) (bool, string) {
+	switch rule.Type {
+	case "loseIfPlayScoreBelow":
+		if c.isExchange {
+			return false, ""
+		}
+		return playScoreBelow(rule, c.detailed.Score, poolSizeBefore)
+	}
+	return false, ""
+}
+
+// drawbackLossAfterTurn reports whether the turn just played broke lose rule
+// `rule` (the game then ends), and the reason to report.
+func drawbackLossAfterTurn(rule DrawbackRule, turn SimTurn, poolSizeBefore int) (bool, string) {
+	switch rule.Type {
+	case "loseIfPlayScoreBelow":
+		if turn.Type != "play" {
+			return false, ""
+		}
+		return playScoreBelow(rule, turn.Score, poolSizeBefore)
+	}
+	return false, ""
+}
+
+// Scoring Never Stops: a play scoring under Value (ValueWhenBagEmpty once
+// the bag is empty) loses. Exchanges and passes aren't plays.
+func playScoreBelow(rule DrawbackRule, score, poolSizeBefore int) (bool, string) {
+	threshold := rule.Value
+	if poolSizeBefore == 0 && rule.ValueWhenBagEmpty > 0 {
+		threshold = rule.ValueWhenBagEmpty
+	}
+	if float64(score) < threshold {
+		return true, fmt.Sprintf("scored %d, under %d", score, int(threshold))
+	}
+	return false, ""
 }
 
 var drawbackByID = func() map[int]DrawbackDef {
@@ -936,6 +992,21 @@ func evaluateDrawback(rule DrawbackRule, c *scoredCandidate, preMoveRack string,
 // game log can be checked by eye ("needed 3 or 6 tiles, played 3") instead
 // of having to trust the filter blindly - see simulate.go's own call site.
 func filterCandidatesByDrawback(candidates []scoredCandidate, rule DrawbackRule, preMoveRack string, bd *board.GameBoard, poolSizeBefore int, turns []SimTurn, currentPlayer int) ([]scoredCandidate, string) {
+	// Lose conditions don't forbid moves - a bot just avoids the losing ones
+	// when it has a safe option; with none, it makes its best move and loses.
+	if isLoseRule(rule) {
+		safe := make([]scoredCandidate, 0, len(candidates))
+		for i := range candidates {
+			if lost, _ := losesWith(rule, &candidates[i], poolSizeBefore); !lost {
+				safe = append(safe, candidates[i])
+			}
+		}
+		if len(safe) > 0 {
+			return safe, ""
+		}
+		return candidates, ""
+	}
+
 	if rule.Type == "excludeTopNCandidates" {
 		ranked := make([]scoredCandidate, 0, len(candidates))
 		for _, c := range candidates {
