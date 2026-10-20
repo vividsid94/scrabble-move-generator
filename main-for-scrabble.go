@@ -70,6 +70,12 @@ type GenerateMovesRequest struct {
 	// to defaultLexicon when omitted, so existing callers that don't send
 	// this yet are unaffected.
 	Lexicon string `json:"lexicon,omitempty"`
+	// IncludeAllExchanges keeps every exchange candidate in the response even
+	// past TopN (TopN then only caps word plays). Exchanges usually rank
+	// below hundreds of word plays, so a plain TopN cut drops them - Play's
+	// Drawbacks mode needs them all to know whether an exchange is legal.
+	// omitempty/false keeps every other caller's response unchanged.
+	IncludeAllExchanges bool `json:"includeAllExchanges,omitempty"`
 }
 
 // Move is a single ranked candidate: a word play, or (when IsExchange is
@@ -645,7 +651,21 @@ func rankMovesForRequest(req GenerateMovesRequest) ([]Move, int, string, error) 
 
 	sort.SliceStable(ranked, func(i, j int) bool { return ranked[i].total > ranked[j].total })
 	if len(ranked) > req.TopN {
-		ranked = ranked[:req.TopN]
+		if req.IncludeAllExchanges {
+			kept := make([]rankedMove, 0, req.TopN)
+			wordPlays := 0
+			for _, rm := range ranked {
+				if rm.isExchange {
+					kept = append(kept, rm)
+				} else if wordPlays < req.TopN {
+					kept = append(kept, rm)
+					wordPlays++
+				}
+			}
+			ranked = kept
+		} else {
+			ranked = ranked[:req.TopN]
+		}
 	}
 
 	responseMoves := make([]Move, 0, len(ranked))
