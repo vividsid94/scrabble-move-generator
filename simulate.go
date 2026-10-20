@@ -381,6 +381,10 @@ func allExchangeCandidates(rack string) []scoredCandidate {
 	}
 
 	candidates := make([]scoredCandidate, 0, (1<<uint(n))-1)
+	// Tiles are picked by position, so a rack with repeated letters would
+	// produce the same exchange more than once (the first I vs the second
+	// I). The leave identifies an exchange exactly, so keep one per leave.
+	seenLeaves := make(map[string]bool)
 	for mask := 1; mask < (1 << uint(n)); mask++ {
 		var toExchange []rune
 		var remaining []rune
@@ -392,6 +396,10 @@ func allExchangeCandidates(rack string) []scoredCandidate {
 			}
 		}
 		leave := sortLeaveString(string(remaining))
+		if seenLeaves[leave] {
+			continue
+		}
+		seenLeaves[leave] = true
 		candidates = append(candidates, scoredCandidate{
 			isExchange:    true,
 			exchangeTiles: string(toExchange),
