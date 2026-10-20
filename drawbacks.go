@@ -492,14 +492,17 @@ func squareName(row, col int) string {
 	return fmt.Sprintf("%c%d", 'A'+col, row+1)
 }
 
-// claustroZone is Claustrophobia's 3x3 zone, by its top-left square.
+// claustroZone is Claustrophobia's 3x3 zone, by its top-left square, and
+// the player whose drawback it is. Only that player knows where it is (it
+// would give the drawback away), but it applies to both.
 type claustroZone struct {
-	Row int `json:"row"`
-	Col int `json:"col"`
+	Row    int `json:"row"`
+	Col    int `json:"col"`
+	Holder int `json:"holder"`
 }
 
 // rollClaustroZone picks a random 3x3 zone touching the board's edge.
-func rollClaustroZone() claustroZone {
+func rollClaustroZone(holder int) claustroZone {
 	var options []claustroZone
 	for r := 0; r <= 12; r++ {
 		for c := 0; c <= 12; c++ {
@@ -508,7 +511,9 @@ func rollClaustroZone() claustroZone {
 			}
 		}
 	}
-	return options[rand.Intn(len(options))]
+	z := options[rand.Intn(len(options))]
+	z.Holder = holder
+	return z
 }
 
 // placesInZone: does a play's new tile land inside any of the zones?

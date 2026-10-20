@@ -584,12 +584,13 @@ func simulateOneGame(gd *kwg.KWG, player1Bot, player2Bot BotConfig) SimGameResul
 	lossPlayer, lossReason := 0, ""
 
 	// Claustrophobia: each holder's 3x3 zone, rolled once per game. It
-	// applies to BOTH players - whoever places a tile inside loses.
+	// applies to BOTH players - whoever places a tile inside loses - but only
+	// its holder knows where it is.
 	var claustroZones []claustroZone
-	for _, bot := range []BotConfig{player1Bot, player2Bot} {
+	for i, bot := range []BotConfig{player1Bot, player2Bot} {
 		if bot.DrawbackID != nil {
 			if def, ok := drawbackByID[*bot.DrawbackID]; ok && def.Rule.Type == "loseIfPlayInZone" {
-				claustroZones = append(claustroZones, rollClaustroZone())
+				claustroZones = append(claustroZones, rollClaustroZone(i+1))
 			}
 		}
 	}
@@ -720,12 +721,18 @@ func simulateOneGame(gd *kwg.KWG, player1Bot, player2Bot BotConfig) SimGameResul
 			}
 		}
 
-		// Claustrophobia zones are visible to both players, so either bot
-		// avoids playing inside one when it has a safe option.
-		if len(claustroZones) > 0 {
+		// A bot avoids its OWN Claustrophobia zone when it has a safe option.
+		// It doesn't know where the opponent's zone is, so it can walk in.
+		var ownZones []claustroZone
+		for _, z := range claustroZones {
+			if z.Holder == currentPlayer {
+				ownZones = append(ownZones, z)
+			}
+		}
+		if len(ownZones) > 0 {
 			safe := make([]scoredCandidate, 0, len(candidates))
 			for _, c := range candidates {
-				if c.isExchange || !placesInZone(c.detailed.Tiles, claustroZones) {
+				if c.isExchange || !placesInZone(c.detailed.Tiles, ownZones) {
 					safe = append(safe, c)
 				}
 			}
