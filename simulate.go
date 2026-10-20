@@ -491,6 +491,8 @@ type SimGameResult struct {
 	// keeps their score at that moment.
 	LossPlayer int    `json:"lossPlayer,omitempty"`
 	LossReason string `json:"lossReason,omitempty"`
+	// Claustrophobia zones in play this game (one per holder).
+	ClaustroZones []claustroZone `json:"claustroZones,omitempty"`
 }
 
 type SimulateSeriesRequest struct {
@@ -580,6 +582,17 @@ func simulateOneGame(gd *kwg.KWG, player1Bot, player2Bot BotConfig) SimGameResul
 	var turns []SimTurn
 	endReason := ""
 	lossPlayer, lossReason := 0, ""
+
+	// Claustrophobia: each holder's 3x3 zone, rolled once per game. It
+	// applies to BOTH players - whoever places a tile inside loses.
+	var claustroZones []claustroZone
+	for _, bot := range []BotConfig{player1Bot, player2Bot} {
+		if bot.DrawbackID != nil {
+			if def, ok := drawbackByID[*bot.DrawbackID]; ok && def.Rule.Type == "loseIfPlayInZone" {
+				claustroZones = append(claustroZones, rollClaustroZone())
+			}
+		}
+	}
 
 	for {
 		currentRack := rack1
@@ -704,6 +717,20 @@ func simulateOneGame(gd *kwg.KWG, player1Bot, player2Bot BotConfig) SimGameResul
 				unfilteredForDrawbackCompare = make([]scoredCandidate, len(candidates))
 				copy(unfilteredForDrawbackCompare, candidates)
 				candidates, drawbackDebug = filterCandidatesByDrawback(candidates, def.Rule, currentRack, bd, len(pool), turns, currentPlayer)
+			}
+		}
+
+		// Claustrophobia zones are visible to both players, so either bot
+		// avoids playing inside one when it has a safe option.
+		if len(claustroZones) > 0 {
+			safe := make([]scoredCandidate, 0, len(candidates))
+			for _, c := range candidates {
+				if c.isExchange || !placesInZone(c.detailed.Tiles, claustroZones) {
+					safe = append(safe, c)
+				}
+			}
+			if len(safe) > 0 {
+				candidates = safe
 			}
 		}
 
@@ -926,7 +953,13 @@ func simulateOneGame(gd *kwg.KWG, player1Bot, player2Bot BotConfig) SimGameResul
 		// spot. Both players are checked - some rules trigger on the
 		// opponent's move or on the turn count, not just on your own move.
 		gameEnding := (len(newRack) == 0 && len(pool) == 0) || consecutiveScoreless >= 6
+		if turn.Type == "play" && placesInZone(turn.Tiles, claustroZones) {
+			lossPlayer, lossReason = currentPlayer, "Claustrophobia: played inside the zone"
+		}
 		for _, holder := range []int{currentPlayer, 3 - currentPlayer} {
+			if lossPlayer != 0 {
+				break
+			}
 			if lost, reason := loseRuleBroken(player1Bot, player2Bot, holder, func(rule DrawbackRule) (bool, string) {
 				return drawbackLossAfterTurn(rule, turn, poolSizeAtTurnStart, turns, holder, gameEnding)
 			}); lost {
@@ -1007,6 +1040,7 @@ func simulateOneGame(gd *kwg.KWG, player1Bot, player2Bot BotConfig) SimGameResul
 		FinalPool:        pool,
 		LossPlayer:       lossPlayer,
 		LossReason:       lossReason,
+		ClaustroZones:    claustroZones,
 	}
 }
 

@@ -58,6 +58,12 @@ type DrawbackRule struct {
 	// "long" play (We All Floater Down Here: 8).
 	MinLength int `json:"minLength,omitempty"`
 
+	// Row/Col (loseIfNoTileOnSquareByTurn): the square you must cover.
+	Row int `json:"row,omitempty"`
+	Col int `json:"col,omitempty"`
+	// Rows (loseIfFewTilesInRows): rows that each need Value of your tiles.
+	Rows []int `json:"rows,omitempty"`
+
 	Comparator string  `json:"comparator,omitempty"` // "gte" | "lte" | "eq", for any *Comparator-driven type
 	Value      float64 `json:"value,omitempty"`
 
@@ -293,6 +299,17 @@ var drawbacks = []DrawbackDef{
 	{ID: 12, Name: "We All Floater Down Here", NameSource: "friend",
 		Description: "Fewer than 3 eight-letter plays (bingo or not) by game end and you lose.",
 		Rule:        DrawbackRule{Type: "loseIfFewLongPlays", Value: 3, MinLength: 8}},
+	{ID: 20, Name: "Corner Rush", NameSource: "claude",
+		Description: "No tile of yours on A1 by turn 14 and you lose.",
+		Rule:        DrawbackRule{Type: "loseIfNoTileOnSquareByTurn", Row: 0, Col: 0, Value: 14}},
+	{ID: 19, Name: "Border Patrol", NameSource: "claude",
+		Description: "Fewer than 5 of your tiles in row 1, or in row 15, by game end and you lose.",
+		Rule:        DrawbackRule{Type: "loseIfFewTilesInRows", Rows: []int{0, 14}, Value: 5}},
+	{ID: 38, Name: "Claustrophobia", NameSource: "friend",
+		Description: "A random 3x3 zone touching the board's edge is set at game start; whoever plays inside it loses.",
+		// The zone is rolled per game in simulateOneGame (rollClaustroZone)
+		// and applies to BOTH players - see claustroLoss.
+		Rule: DrawbackRule{Type: "loseIfPlayInZone"}},
 }
 
 // isLoseRule reports whether a drawback is a lose condition (breaking it
@@ -300,7 +317,8 @@ var drawbacks = []DrawbackDef{
 func isLoseRule(rule DrawbackRule) bool {
 	switch rule.Type {
 	case "loseIfPlayScoreBelow", "loseIfPastTurnLimit", "loseIfLeadingBeforeTurn",
-		"loseIfOpponentBingos", "loseIfOpponentCoversSquare", "loseIfFewLongPlays":
+		"loseIfOpponentBingos", "loseIfOpponentCoversSquare", "loseIfFewLongPlays",
+		"loseIfNoTileOnSquareByTurn", "loseIfFewTilesInRows", "loseIfPlayInZone":
 		return true
 	}
 	return false
@@ -333,6 +351,21 @@ func losesWith(rule DrawbackRule, c *scoredCandidate, poolSizeBefore int, turns 
 			return false, ""
 		}
 		return playScoreBelow(rule, c.detailed.Score, poolSizeBefore)
+	case "loseIfNoTileOnSquareByTurn":
+		turnNumber := len(turns) + 1
+		// Your last own turn at or before the deadline (turns alternate).
+		lastChance := float64(turnNumber) <= rule.Value && float64(turnNumber+2) > rule.Value
+		if !lastChance || holderCoveredSquare(turns, holder, rule.Row, rule.Col) {
+			return false, ""
+		}
+		if !c.isExchange {
+			for _, t := range c.detailed.Tiles {
+				if t.IsNew && t.Row == rule.Row && t.Col == rule.Col {
+					return false, ""
+				}
+			}
+		}
+		return true, "didn't cover the square in time"
 	case "loseIfLeadingBeforeTurn":
 		turnNumber := len(turns) + 1
 		if float64(turnNumber) >= rule.Value {
@@ -381,6 +414,10 @@ func drawbackLossAfterTurn(rule DrawbackRule, turn SimTurn, poolSizeBefore int, 
 		if mine > theirs {
 			return true, fmt.Sprintf("ahead %d-%d after turn %d", mine, theirs, len(turns))
 		}
+	case "loseIfNoTileOnSquareByTurn":
+		if float64(len(turns)) == rule.Value && !holderCoveredSquare(turns, holder, rule.Row, rule.Col) {
+			return true, fmt.Sprintf("no tile of yours on %s by turn %d", squareName(rule.Row, rule.Col), len(turns))
+		}
 	case "loseIfOpponentBingos":
 		if !byHolder && turn.Type == "play" && newTileCountOf(turn.Tiles) == 7 {
 			return true, "the opponent played a bingo"
@@ -401,6 +438,25 @@ func drawbackLossAfterTurn(rule DrawbackRule, turn SimTurn, poolSizeBefore int, 
 // drawbackLossAtGameEnd reports whether `holder`'s lose rule is broken once
 // the game is over (We All Floater Down Here), and why.
 func drawbackLossAtGameEnd(rule DrawbackRule, turns []SimTurn, holder int) (bool, string) {
+	if rule.Type == "loseIfFewTilesInRows" {
+		for _, row := range rule.Rows {
+			count := 0
+			for _, t := range turns {
+				if t.Player != holder || t.Type != "play" {
+					continue
+				}
+				for _, tile := range t.Tiles {
+					if tile.IsNew && tile.Row == row {
+						count++
+					}
+				}
+			}
+			if float64(count) < rule.Value {
+				return true, fmt.Sprintf("only %d of your tiles in row %d by game end", count, row+1)
+			}
+		}
+		return false, ""
+	}
 	if rule.Type != "loseIfFewLongPlays" {
 		return false, ""
 	}
@@ -414,6 +470,60 @@ func drawbackLossAtGameEnd(rule DrawbackRule, turns []SimTurn, holder int) (bool
 		return true, fmt.Sprintf("only %d %d-letter play(s) by game end", count, rule.MinLength)
 	}
 	return false, ""
+}
+
+// holderCoveredSquare: did holder place a tile on (row, col) in any play?
+func holderCoveredSquare(turns []SimTurn, holder, row, col int) bool {
+	for _, t := range turns {
+		if t.Player != holder || t.Type != "play" {
+			continue
+		}
+		for _, tile := range t.Tiles {
+			if tile.IsNew && tile.Row == row && tile.Col == col {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// squareName is board notation for (row, col), e.g. (0, 0) -> "A1".
+func squareName(row, col int) string {
+	return fmt.Sprintf("%c%d", 'A'+col, row+1)
+}
+
+// claustroZone is Claustrophobia's 3x3 zone, by its top-left square.
+type claustroZone struct {
+	Row int `json:"row"`
+	Col int `json:"col"`
+}
+
+// rollClaustroZone picks a random 3x3 zone touching the board's edge.
+func rollClaustroZone() claustroZone {
+	var options []claustroZone
+	for r := 0; r <= 12; r++ {
+		for c := 0; c <= 12; c++ {
+			if r == 0 || r == 12 || c == 0 || c == 12 {
+				options = append(options, claustroZone{r, c})
+			}
+		}
+	}
+	return options[rand.Intn(len(options))]
+}
+
+// placesInZone: does a play's new tile land inside any of the zones?
+func placesInZone(tiles []MoveTile, zones []claustroZone) bool {
+	for _, t := range tiles {
+		if !t.IsNew {
+			continue
+		}
+		for _, z := range zones {
+			if t.Row >= z.Row && t.Row < z.Row+3 && t.Col >= z.Col && t.Col < z.Col+3 {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 func newTileCountOf(tiles []MoveTile) int {
