@@ -258,6 +258,11 @@ var drawbacks = []DrawbackDef{
 	{ID: 39, Name: "Well Aged", NameSource: "friend",
 		Description: "Can't play a tile you drew after your last turn.",
 		Rule:        DrawbackRule{Type: "cannotPlayFreshlyDrawnTile"}},
+	{ID: 33, Name: "Here For A Good Time", NameSource: "friend",
+		Description: "Only 40 tiles may ever leave your rack, for the whole game (exchanges count).",
+		// AppliesToExchanges: an exchange's tiles leave the rack too, so it
+		// has to fit the remaining allowance like a play does.
+		Rule: DrawbackRule{Type: "maxTilesLeaveRack", MaxTiles: 40, AppliesToExchanges: true}},
 }
 
 var drawbackByID = func() map[int]DrawbackDef {
@@ -466,6 +471,29 @@ func lastTurnByPlayer(turns []SimTurn, player int) *SimTurn {
 		}
 	}
 	return nil
+}
+
+// tilesLeftRackTotal is how many tiles have left player's rack so far this
+// game: every play's new tiles plus every exchange's returned tiles (Here
+// For A Good Time).
+func tilesLeftRackTotal(turns []SimTurn, player int) int {
+	total := 0
+	for _, t := range turns {
+		if t.Player != player {
+			continue
+		}
+		switch t.Type {
+		case "play":
+			for _, tile := range t.Tiles {
+				if tile.IsNew {
+					total++
+				}
+			}
+		case "exchange":
+			total += len([]rune(t.TilesExchanged))
+		}
+	}
+	return total
 }
 
 // allWordPlaysByPlayer is lastWordPlayByPlayer's own twin for rules that
@@ -846,6 +874,11 @@ func evaluateDrawback(rule DrawbackRule, c *scoredCandidate, preMoveRack string,
 	// means everything already in hand is aged by definition. Exchanges
 	// themselves stay allowed (no AppliesToExchanges on this rule) - this
 	// is about which tiles get PLACED, not which get discarded.
+	// Here For A Good Time: this move's tiles (placed or exchanged) must fit
+	// in what's left of the player's whole-game allowance.
+	case "maxTilesLeaveRack":
+		return tilesLeftRackTotal(turns, currentPlayer)+drawnTileCount(c) <= rule.MaxTiles
+
 	case "cannotPlayFreshlyDrawnTile":
 		last := lastTurnByPlayer(turns, currentPlayer)
 		if last == nil {
