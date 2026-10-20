@@ -234,11 +234,11 @@ var drawbacks = []DrawbackDef{
 		Description: "Must play through your opponent's immediately preceding play.",
 		Rule:        DrawbackRule{Type: "mustPlayThroughOpponentLastMove"}},
 	{ID: 24, Name: "Oneupsmanship", NameSource: "friend",
-		Description: "Must use more tiles than your opponent's last play, or pass.",
-		// AppliesToExchanges: true - see evaluateDrawback's own comment on
-		// this rule for why that's what makes "...or pass" fall out for
-		// free instead of needing new aggregation logic.
-		Rule: DrawbackRule{Type: "exceedOpponentLastPlayTileCount", AppliesToExchanges: true}},
+		Description: "Must use more tiles than your opponent's last play - if you can't, exchange or pass.",
+		// Filtered in filterCandidatesByDrawback's own special case: a
+		// qualifying play is required when one exists; otherwise only
+		// exchanges (or a pass) remain.
+		Rule: DrawbackRule{Type: "exceedOpponentLastPlayTileCount"}},
 	{ID: 23, Name: "Alphabet Soup", NameSource: "claude",
 		Description: "Every word you play must start with a letter you haven't started a word with before.",
 		Rule:        DrawbackRule{Type: "uniqueStartingLetterPerWord"}},
@@ -524,6 +524,39 @@ func countWordsFormed(c *scoredCandidate, bd *board.GameBoard) int {
 	return count
 }
 
+// wordLengthsFormed is the length of every word candidate c forms: its main
+// word, plus the cross word through each NEW tile that has neighbours on
+// the perpendicular axis (walked on the board as it stood before this
+// move, same convention as countWordsFormed).
+func wordLengthsFormed(c *scoredCandidate, bd *board.GameBoard) []int {
+	lengths := []int{len(c.detailed.Tiles)}
+	for _, t := range c.detailed.Tiles {
+		if !t.IsNew {
+			continue
+		}
+		length := 1
+		if c.detailed.Direction == "down" {
+			for col := t.Col - 1; col >= 0 && bd.GetLetter(t.Row, col) != 0; col-- {
+				length++
+			}
+			for col := t.Col + 1; col <= 14 && bd.GetLetter(t.Row, col) != 0; col++ {
+				length++
+			}
+		} else {
+			for row := t.Row - 1; row >= 0 && bd.GetLetter(row, t.Col) != 0; row-- {
+				length++
+			}
+			for row := t.Row + 1; row <= 14 && bd.GetLetter(row, t.Col) != 0; row++ {
+				length++
+			}
+		}
+		if length > 1 {
+			lengths = append(lengths, length)
+		}
+	}
+	return lengths
+}
+
 // evaluateDrawback reports whether candidate c is still allowed under
 // rule, given the board as it stood before this move, the acting player's
 // rack before this move, how many tiles remain in the bag before this
@@ -537,8 +570,16 @@ func countWordsFormed(c *scoredCandidate, bd *board.GameBoard) int {
 // comment).
 func evaluateDrawback(rule DrawbackRule, c *scoredCandidate, preMoveRack string, bd *board.GameBoard, poolSizeBefore int, turns []SimTurn, currentPlayer int) bool {
 	switch rule.Type {
+	// Every word the play forms must pass - the main word and each cross
+	// word. Checking only the main word let DE through beside a column
+	// that it turned into ORATED (Hippopotomonstrosesquipedaliophobia).
 	case "wordLength":
-		return compareFloat(float64(len(c.detailed.Tiles)), rule.Comparator, rule.Value)
+		for _, length := range wordLengthsFormed(c, bd) {
+			if !compareFloat(float64(length), rule.Comparator, rule.Value) {
+				return false
+			}
+		}
+		return true
 
 	case "score":
 		return compareFloat(float64(c.detailed.Score), rule.Comparator, rule.Value)
@@ -746,19 +787,11 @@ func evaluateDrawback(rule DrawbackRule, c *scoredCandidate, preMoveRack string,
 		}
 		return false
 
-	// Oneupsmanship: AppliesToExchanges (set on this rule's own registry
-	// entry) is what makes this work correctly - an exchange always fails
-	// this check (explicit below, not just "happens to"), so it naturally
-	// never qualifies rather than needing a separate exclusion. With
-	// nothing left qualifying, filterCandidatesByDrawback returns an empty
-	// list, and simulateOneGame's own existing "empty candidates -> pass"
-	// fallback covers the "...or pass" clause for free - no new
-	// aggregation behavior needed here at all. The explicit isExchange
-	// check (rather than calling newTileCount(c) unconditionally the way
-	// this used to) is what actually avoids a crash here - an exchange
-	// candidate's own .detailed is always nil (see drawnTileCount's own
-	// comment on the same thing), so newTileCount(c) would panic on one
-	// instead of returning the 0 this comment always claimed.
+	// Oneupsmanship: whether one word play uses more tiles than the
+	// opponent's last play. filterCandidatesByDrawback's own special case
+	// decides what happens to exchanges (allowed only when no play
+	// qualifies). The isExchange check stays as a guard: an exchange
+	// candidate's .detailed is nil, so newTileCount(c) would panic on one.
 	case "exceedOpponentLastPlayTileCount":
 		if c.isExchange {
 			return false
@@ -898,6 +931,26 @@ func filterCandidatesByDrawback(candidates []scoredCandidate, rule DrawbackRule,
 	// word play does, not get the automatic pass most drawbacks give it -
 	// so this never checks c.isExchange at all, word plays and exchanges
 	// are both just measured by however many tiles they actually move.
+	// Oneupsmanship: a play using more tiles than the opponent's last one is
+	// required whenever one exists. When none does, the player may exchange
+	// (or pass, which is what an empty list becomes) - word plays stay out.
+	if rule.Type == "exceedOpponentLastPlayTileCount" {
+		qualifying := make([]scoredCandidate, 0, len(candidates))
+		exchanges := make([]scoredCandidate, 0)
+		for i := range candidates {
+			c := &candidates[i]
+			if c.isExchange {
+				exchanges = append(exchanges, *c)
+			} else if evaluateDrawback(rule, c, preMoveRack, bd, poolSizeBefore, turns, currentPlayer) {
+				qualifying = append(qualifying, *c)
+			}
+		}
+		if len(qualifying) > 0 {
+			return qualifying, ""
+		}
+		return exchanges, ""
+	}
+
 	if rule.Type == "randomTileCountQuota" {
 		n1 := rand.Intn(7) + 1
 		n2 := rand.Intn(7) + 1
