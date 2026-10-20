@@ -49,6 +49,11 @@ import (
 type DrawbackRule struct {
 	Type string `json:"type"`
 
+	// ExemptCenter (forbiddenSquareTypes): the center star never counts as
+	// forbidden, so the opening move stays possible (Double Trouble - the
+	// star is a DWS).
+	ExemptCenter bool `json:"exemptCenter,omitempty"`
+
 	Comparator string  `json:"comparator,omitempty"` // "gte" | "lte" | "eq", for any *Comparator-driven type
 	Value      float64 `json:"value,omitempty"`
 
@@ -184,8 +189,8 @@ var drawbacks = []DrawbackDef{
 		Description: "Can only score points if you have 3+ vowels on your rack.",
 		Rule:        DrawbackRule{Type: "vowelGateForScoring", MinVowels: 3}},
 	{ID: 11, Name: "Double Trouble", NameSource: "friend",
-		Description: "Can't play a tile on a DWS or DLS square.",
-		Rule:        DrawbackRule{Type: "forbiddenSquareTypes", Types: []string{"DWS", "DLS"}}},
+		Description: "Can't play a tile on a DWS or DLS square (the center star is fine).",
+		Rule:        DrawbackRule{Type: "forbiddenSquareTypes", Types: []string{"DWS", "DLS"}, ExemptCenter: true}},
 	{ID: 22, Name: "Laureations", NameSource: "friend",
 		Description: "Main word can't start with a tile worth more than 1 point.",
 		Rule:        DrawbackRule{Type: "firstTileValueLimit", MaxValue: 1}},
@@ -660,6 +665,9 @@ func evaluateDrawback(rule DrawbackRule, c *scoredCandidate, preMoveRack string,
 	case "forbiddenSquareTypes":
 		for _, t := range c.detailed.Tiles {
 			if !t.IsNew {
+				continue
+			}
+			if rule.ExemptCenter && t.Row == 7 && t.Col == 7 {
 				continue
 			}
 			squareType, ok := premiumTypeAt(t.Row, t.Col, bd)
