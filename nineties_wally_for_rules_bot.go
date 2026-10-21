@@ -29,9 +29,9 @@ type RulesBotConfig struct {
 	LeadBy int `json:"leadBy,omitempty"`
 	// CloseWhenAhead switches the openness rule on.
 	CloseWhenAhead bool `json:"closeWhenAhead,omitempty"`
-	// MinEightLetterLanesClosed: how many fewer 8-letter lanes (normalized, see
-	// board_openness_for_rules_bot.go) than the top move a replacement must
-	// leave. Default 0.125 (one run).
+	// MinEightLetterLanesClosed: how much lower the 8-letter lane value (the
+	// NWL23-weighted share, see board_openness_for_rules_bot.go) must be than
+	// the top move's. Default 0.125.
 	MinEightLetterLanesClosed float64 `json:"minEightLetterLanesClosed,omitempty"`
 	// CloseWhenBehindUpTo: if set, the openness rule also applies when behind
 	// by this many points or fewer (so whenever the lead is at least minus
