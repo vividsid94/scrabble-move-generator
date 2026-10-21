@@ -1,11 +1,17 @@
 package main
 
-import "github.com/domino14/macondo/board"
+import (
+	"strings"
+
+	"github.com/domino14/macondo/board"
+	"github.com/domino14/word-golib/tilemapping"
+)
 
 // 7-letter lanes for 90s Wally, the rules bot: places a 7-tile play could go
 // by hooking a word already on the board. The move generator's cross-checks
 // are used only to find anchors; everything else is board geometry, written
-// from scratch. No dictionary weighting yet.
+// from scratch, then weighted by the NWL23 dictionary
+// (seven_letter_counts_for_rules_bot.go).
 //
 // An anchor is an empty square next to a tile where at least one letter
 // would form a valid word with it (its cross-check isn't empty). A 7-letter
@@ -19,18 +25,39 @@ import "github.com/domino14/macondo/board"
 //   - no square other than the anchor has a tile beside it - a second
 //     touch would be a parallel play, which counts as closed.
 //
-// Normalized like the 8s: the anchor can be any of the 7 letters, so an
-// anchor with all 7 lanes free counts 1, with 3 of 7 free 3/7, and so on.
+// Each lane is worth the share of NWL23 7-letter words that have, in the
+// anchor's spot, any letter the anchor's cross-check allows: a lane where
+// the anchor is the 7th letter and only takes S is worth 8346/25473. The
+// board's 7-letter openness is the sum over every lane. Only the dictionary
+// matters, not the tiles left in the bag.
 
-// sevenLetterLanes is the board's 7-letter lanes in both directions,
-// normalized as above. bd's cross-sets must be up to date.
-func sevenLetterLanes(bd *board.GameBoard) float64 {
-	return float64(sevenLetterLaneCount(bd, false)+sevenLetterLaneCount(bd, true)) / 7
+// sevenLetterOpenness is the board's 7-letter openness in both
+// directions. bd's cross-sets must be up to date.
+func sevenLetterOpenness(bd *board.GameBoard) float64 {
+	words := sevenLetterLaneWords(bd, false) + sevenLetterLaneWords(bd, true)
+	return float64(words) / nwl23SevenLetterWords
 }
 
-// sevenLetterLaneCount counts lanes for plays across (down false) or down
-// (down true). at(line, i) maps a line and a position along it to a square.
-func sevenLetterLaneCount(bd *board.GameBoard, down bool) int {
+// anchorWords: how many NWL23 7-letter words have a letter the cross-check
+// allows at position spot (0-6).
+func anchorWords(cs board.CrossSet, spot int) int {
+	words := 0
+	for ml := tilemapping.MachineLetter(1); ml <= 26; ml++ {
+		if !cs.Allowed(ml) {
+			continue
+		}
+		letter := strings.ToUpper(alph.Letter(ml))
+		if len(letter) == 1 && letter[0] >= 'A' && letter[0] <= 'Z' {
+			words += nwl23SevenLetterCounts[letter[0]-'A'][spot]
+		}
+	}
+	return words
+}
+
+// sevenLetterLaneWords adds up NWL23 word counts over the lanes for plays
+// across (down false) or down (down true). at(line, i) maps a line and a
+// position along it to a square.
+func sevenLetterLaneWords(bd *board.GameBoard, down bool) int {
 	at := func(line, i int) (int, int) {
 		if down {
 			return i, line
@@ -57,11 +84,15 @@ func sevenLetterLaneCount(bd *board.GameBoard, down bool) int {
 		crossDir = board.HorizontalDirection
 	}
 
-	lanes := 0
+	words := 0
 	for line := 0; line < boardSize; line++ {
 		for anchor := 0; anchor < boardSize; anchor++ {
 			r, c := at(line, anchor)
-			if occupied(bd, r, c) || !besideOccupied(line, anchor) || bd.GetCrossSet(r, c, crossDir) == 0 {
+			if occupied(bd, r, c) || !besideOccupied(line, anchor) {
+				continue
+			}
+			cs := bd.GetCrossSet(r, c, crossDir)
+			if cs == 0 {
 				continue
 			}
 			for start := anchor - 6; start <= anchor; start++ {
@@ -87,10 +118,10 @@ func sevenLetterLaneCount(bd *board.GameBoard, down bool) int {
 					}
 				}
 				if free {
-					lanes++
+					words += anchorWords(cs, anchor-start)
 				}
 			}
 		}
 	}
-	return lanes
+	return words
 }
