@@ -573,6 +573,11 @@ func rankMovesForRequest(req GenerateMovesRequest) ([]Move, int, string, error) 
 	rack := tilemapping.RackFromString(req.Rack, alph)
 	generator := movegen.NewGordonGenerator(gd, bd, ld)
 	moves := generator.GenAll(rack, false)
+
+	// Bag empty: rank by Quackle's empty-bag equity, no leaves
+	// (empty_bag_equity.go). Worked out from the board, so it doesn't depend
+	// on the caller sending poolSize.
+	emptyBag, opponentRackPoints := emptyBagFromBoard(bd, req.Rack)
 	
 	fmt.Printf("Generated %d moves for rack '%s'\n", len(moves), req.Rack)
 
@@ -633,10 +638,15 @@ func rankMovesForRequest(req GenerateMovesRequest) ([]Move, int, string, error) 
 		}
 		leave := sortLeaveString(removeRackFromPool(req.Rack, strings.Join(used, "")))
 		leaveValue := getLeaveValue(leave)
+		total := float64(m.Score()) + leaveValue
+		if emptyBag {
+			leaveValue = 0
+			total = emptyBagEquity(m.Score(), leave, opponentRackPoints)
+		}
 
 		ranked = append(ranked, rankedMove{
 			position: m.BoardCoords(), word: word, score: m.Score(),
-			leave: leave, leaveValue: leaveValue, total: float64(m.Score()) + leaveValue,
+			leave: leave, leaveValue: leaveValue, total: total,
 			detailed: detailed,
 		})
 	}
@@ -1105,6 +1115,12 @@ func findAnagramsHandler(w http.ResponseWriter, r *http.Request) {
 // if rawMoves has no word plays and no exchange is available.
 func pickBestCandidate(rawMoves []*macondomove.Move, bd *board.GameBoard, alph *tilemapping.TileMapping, currentRack string, poolForExchange string) *scoredCandidate {
 	var best *scoredCandidate
+	// Bag empty: Quackle's empty-bag equity, no leaves (empty_bag_equity.go).
+	emptyBag := len(poolForExchange) == 0
+	opponentRackPoints := 0
+	if emptyBag {
+		_, opponentRackPoints = emptyBagFromBoard(bd, currentRack)
+	}
 
 	for _, m := range rawMoves {
 		if !strings.Contains(m.String(), "play word:") {
@@ -1124,6 +1140,9 @@ func pickBestCandidate(rawMoves []*macondomove.Move, bd *board.GameBoard, alph *
 		}
 		leave := sortLeaveString(removeRackFromPool(currentRack, strings.Join(used, "")))
 		total := float64(detailed.Score) + getLeaveValue(leave)
+		if emptyBag {
+			total = emptyBagEquity(detailed.Score, leave, opponentRackPoints)
+		}
 
 		if best == nil || total > best.total {
 			best = &scoredCandidate{move: m, detailed: detailed, leave: leave, total: total}

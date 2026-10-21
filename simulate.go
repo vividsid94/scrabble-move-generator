@@ -649,6 +649,17 @@ func simulateOneGame(gd *kwg.KWG, player1Bot, player2Bot BotConfig) SimGameResul
 			baseLeaveValue := getLeaveValue(leave)
 			total := float64(detailed.Score) + applyLeaveRules(leave, currentBot.LeaveRules)
 			baselineTotal := float64(detailed.Score) + baseLeaveValue
+			if len(pool) == 0 {
+				// Bag empty: every bot ranks by Quackle's empty-bag equity, no
+				// leaves or leave rules (empty_bag_equity.go). The opponent's
+				// rack is known exactly here.
+				opponentRack := rack2
+				if currentPlayer == 2 {
+					opponentRack = rack1
+				}
+				total = emptyBagEquity(detailed.Score, leave, rackPointValue(opponentRack))
+				baselineTotal = total
+			}
 
 			candidates = append(candidates, scoredCandidate{
 				move: m, detailed: detailed, leave: leave, total: total, baselineTotal: baselineTotal,
