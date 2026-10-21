@@ -268,6 +268,9 @@ type BotConfig struct {
 	// with any other mode, so there's nothing to reconcile between "play
 	// the longest word" and e.g. "but also avoid bingos."
 	SpecialSelection string `json:"specialSelection,omitempty"` // "" | "longestWord" | "mostTiles"
+	// RulesBot, if set, makes this bot 90s Wally: rank 1 plus hand-written
+	// rules (nineties_wally_for_rules_bot.go). Ignored under SpecialSelection.
+	RulesBot *RulesBotConfig `json:"rulesBot,omitempty"`
 }
 
 // BingoAversionRule excludes bingo candidates (word plays using all 7 rack
@@ -478,6 +481,9 @@ type SimTurn struct {
 	// LanesAfter: bingo lanes on the board after this move (board openness,
 	// board_openness_for_rules_bot.go).
 	LanesAfter int `json:"lanesAfter"`
+	// RulesBotDebug: what a 90s Wally rule changed this turn (empty when it
+	// played Wally's top move).
+	RulesBotDebug string `json:"rulesBotDebug,omitempty"`
 }
 
 type SimGameResult struct {
@@ -779,6 +785,19 @@ func simulateOneGame(gd *kwg.KWG, player1Bot, player2Bot BotConfig) SimGameResul
 			}
 		}
 
+		// 90s Wally: its rules may move the pick off the top move.
+		var rulesBotDebug string
+		if currentBot.RulesBot != nil && currentBot.SpecialSelection == "" && len(candidates) > 0 {
+			myScore, opponentScore := score1, score2
+			if currentPlayer == 2 {
+				myScore, opponentScore = score2, score1
+			}
+			if pick, note := rulesBotPick(*currentBot.RulesBot, candidates, bd, myScore, opponentScore); pick >= 0 {
+				chosen = &candidates[pick]
+				rulesBotDebug = note
+			}
+		}
+
 		// Rule-impact check: what would a plain (no custom rules) bot at the
 		// same rank have picked from this EXACT same candidate list - same
 		// board, same rack, no RNG involved, so this is a clean A/B on the
@@ -852,6 +871,7 @@ func simulateOneGame(gd *kwg.KWG, player1Bot, player2Bot BotConfig) SimGameResul
 			// against, not just the ones where it visibly did something.
 			DrawbackActive: unfilteredForDrawbackCompare != nil,
 		}
+		turn.RulesBotDebug = rulesBotDebug
 		if ruleImpacted {
 			if baselineChosen.isExchange {
 				turn.BaselineType = "exchange"
