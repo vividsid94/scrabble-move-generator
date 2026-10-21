@@ -29,9 +29,10 @@ type RulesBotConfig struct {
 	LeadBy int `json:"leadBy,omitempty"`
 	// CloseWhenAhead switches the openness rule on.
 	CloseWhenAhead bool `json:"closeWhenAhead,omitempty"`
-	// MinLanesClosed: how many fewer lanes than the top move a replacement
-	// must leave. Default 1.
-	MinLanesClosed int `json:"minLanesClosed,omitempty"`
+	// MinLanesClosed: how many fewer lanes (normalized, see
+	// board_openness_for_rules_bot.go) than the top move a replacement must
+	// leave. Default 0.125 (one run).
+	MinLanesClosed float64 `json:"minLanesClosed,omitempty"`
 	// CloseWhenBehindUpTo: if set, the openness rule also applies when behind
 	// by this many points or fewer (so whenever the lead is at least minus
 	// this), not just when ahead by LeadBy.
@@ -44,10 +45,10 @@ type RulesBotSwitch struct {
 	WallyMove     *DetailedMove `json:"wallyMove,omitempty"` // nil when Wally's top move was an exchange
 	WallyExchange string        `json:"wallyExchange,omitempty"`
 	WallyEquity   float64       `json:"wallyEquity"`
-	WallyLanes    int           `json:"wallyLanes"`
+	WallyLanes    float64       `json:"wallyLanes"`
 	ChosenEquity  float64       `json:"chosenEquity"`
-	ChosenLanes   int           `json:"chosenLanes"`
-	LanesBefore   int           `json:"lanesBefore"`
+	ChosenLanes   float64       `json:"chosenLanes"`
+	LanesBefore   float64       `json:"lanesBefore"`
 }
 
 // rulesBotPick returns the index in best-first `candidates` that 90s Wally
@@ -67,7 +68,7 @@ func rulesBotPick(cfg RulesBotConfig, candidates []scoredCandidate, bd *board.Ga
 
 	minClosed := cfg.MinLanesClosed
 	if minClosed <= 0 {
-		minClosed = 1
+		minClosed = 0.125
 	}
 
 	lead := myScore - opponentScore
@@ -77,7 +78,7 @@ func rulesBotPick(cfg RulesBotConfig, candidates []scoredCandidate, bd *board.Ga
 	}
 
 	currentLanes := countBingoLanes(bd)
-	lanesAfter := func(c *scoredCandidate) int {
+	lanesAfter := func(c *scoredCandidate) float64 {
 		if c.isExchange {
 			return currentLanes
 		}
@@ -94,7 +95,8 @@ func rulesBotPick(cfg RulesBotConfig, candidates []scoredCandidate, bd *board.Ga
 			break // best-first, so the rest are further below
 		}
 		lanes := lanesAfter(&candidates[i])
-		if lanes < bestLanes && lanes <= topLanes-minClosed {
+		// The small slack keeps exact multiples of 1/8 from failing on rounding.
+		if lanes < bestLanes && lanes <= topLanes-minClosed+1e-9 {
 			bestIdx, bestLanes = i, lanes
 		}
 	}
@@ -112,6 +114,6 @@ func rulesBotPick(cfg RulesBotConfig, candidates []scoredCandidate, bd *board.Ga
 	} else {
 		sw.WallyMove = top.detailed
 	}
-	return bestIdx, fmt.Sprintf("90s Wally closed the board: %d lanes instead of %d (%.1f equity given up)",
+	return bestIdx, fmt.Sprintf("90s Wally closed the board: %.3g lanes instead of %.3g (%.1f equity given up)",
 		bestLanes, topLanes, top.total-candidates[bestIdx].total), sw
 }

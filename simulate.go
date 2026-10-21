@@ -480,7 +480,7 @@ type SimTurn struct {
 	PoolAfterMove int `json:"poolAfterMove"`
 	// LanesAfter: bingo lanes on the board after this move (board openness,
 	// board_openness_for_rules_bot.go).
-	LanesAfter int `json:"lanesAfter"`
+	LanesAfter float64 `json:"lanesAfter"`
 	// RulesBotDebug: what a 90s Wally rule changed this turn (empty when it
 	// played Wally's top move).
 	RulesBotDebug string `json:"rulesBotDebug,omitempty"`

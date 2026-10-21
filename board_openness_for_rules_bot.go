@@ -19,8 +19,10 @@ import "github.com/domino14/macondo/board"
 //
 // On an empty board, a run through the centre star counts.
 //
-// Runs overlap: one long open stretch counts once per starting square,
-// so a wide-open area scores higher than a single narrow lane.
+// Runs overlap, so the count is normalized: a floater (the tile inside the
+// run) with all 8 of its possible windows open counts as 1, with 7 of 8
+// open as 7/8, and so on. Every run has exactly one tile inside, so that's
+// simply the number of runs divided by 8.
 
 const boardSize = 15
 
@@ -28,8 +30,9 @@ func occupied(bd *board.GameBoard, row, col int) bool {
 	return bd.GetLetter(row, col) != 0
 }
 
-// countBingoLanes counts bingo lanes in both directions.
-func countBingoLanes(bd *board.GameBoard) int {
+// countBingoLanes is the board's bingo lanes in both directions, normalized
+// as above (runs / 8).
+func countBingoLanes(bd *board.GameBoard) float64 {
 	empty := true
 	for r := 0; r < boardSize && empty; r++ {
 		for c := 0; c < boardSize; c++ {
@@ -39,10 +42,10 @@ func countBingoLanes(bd *board.GameBoard) int {
 			}
 		}
 	}
-	return countLanesInDirection(bd, false, empty) + countLanesInDirection(bd, true, empty)
+	return float64(countLanesInDirection(bd, false, empty)+countLanesInDirection(bd, true, empty)) / 8
 }
 
-// countLanesInDirection counts lanes along rows (down false) or columns
+// countLanesInDirection counts runs along rows (down false) or columns
 // (down true). at(line, i) maps a line and a position along it to a square.
 func countLanesInDirection(bd *board.GameBoard, down bool, emptyBoard bool) int {
 	at := func(line, i int) (int, int) {
