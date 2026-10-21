@@ -14,7 +14,10 @@ import (
 //   - Board openness (board_openness_for_rules_bot.go): ahead by LeadBy or
 //     more, play the allowed move leaving the fewest bingo lanes, if it
 //     closes at least MinLanesClosed more than the top move. Ties go to
-//     higher equity. (Opening the board when behind was tried and dropped.)
+//     higher equity. With CloseWhenBehindUpTo set, it also closes when behind
+//     by that much or less (Wally-style bots are overaggressive, so closing
+//     can pay even from slightly behind). Opening the board when behind was
+//     tried and dropped.
 
 // RulesBotConfig turns 90s Wally on for a Sandbox bot (BotConfig.RulesBot).
 // Each rule has its own switch so rules can be tested one at a time.
@@ -29,6 +32,10 @@ type RulesBotConfig struct {
 	// MinLanesClosed: how many fewer lanes than the top move a replacement
 	// must leave. Default 1.
 	MinLanesClosed int `json:"minLanesClosed,omitempty"`
+	// CloseWhenBehindUpTo: if set, the openness rule also applies when behind
+	// by this many points or fewer (so whenever the lead is at least minus
+	// this), not just when ahead by LeadBy.
+	CloseWhenBehindUpTo int `json:"closeWhenBehindUpTo,omitempty"`
 }
 
 // rulesBotPick returns the index in best-first `candidates` that 90s Wally
@@ -51,7 +58,9 @@ func rulesBotPick(cfg RulesBotConfig, candidates []scoredCandidate, bd *board.Ga
 		minClosed = 1
 	}
 
-	if !cfg.CloseWhenAhead || myScore-opponentScore < leadBy {
+	lead := myScore - opponentScore
+	active := lead >= leadBy || (cfg.CloseWhenBehindUpTo > 0 && lead >= -cfg.CloseWhenBehindUpTo)
+	if !cfg.CloseWhenAhead || !active {
 		return 0, ""
 	}
 
