@@ -6,8 +6,8 @@ import (
 	"github.com/domino14/macondo/board"
 )
 
-// Board openness for 90s Wally, the rules bot: how many 8-letter lanes the
-// board has, weighted by the NWL23 dictionary (eight_letter_counts_for_rules_bot.go).
+// Board openness for 90s Wally, the rules bot: the board's 8-letter
+// openness - its 8-letter lanes, weighted by the NWL23 dictionary (eight_letter_counts_for_rules_bot.go).
 // Written from scratch (not dynamic_leaves.go's Openness).
 //
 // An 8-letter lane is a place an 8-letter play through one tile could go:
@@ -23,7 +23,7 @@ import (
 // Each lane is worth the share of NWL23 8-letter words with the floater's
 // letter in the floater's position: a lane where an S is the 8th letter is
 // worth 10898/31736, one where a J is the 5th letter 33/31736. The board's
-// total is the sum. Only the dictionary matters, not the tiles left in the
+// 8-letter openness is the sum. Only the dictionary matters, not the tiles left in the
 // bag. A word with the floater's letter in two open positions counts twice,
 // so a total slightly overstates the share; that doesn't affect comparisons.
 // An empty board has no 8-letter lanes.
@@ -48,9 +48,9 @@ func letterIndex(bd *board.GameBoard, row, col int) int {
 	return int(letter[0] - 'A')
 }
 
-// countEightLetterLanes is the board's 8-letter lanes in both directions,
-// weighted as above.
-func countEightLetterLanes(bd *board.GameBoard) float64 {
+// eightLetterOpenness is the board's 8-letter openness: its lanes in both
+// directions, weighted as above.
+func eightLetterOpenness(bd *board.GameBoard) float64 {
 	words := eightLetterLaneWords(bd, false) + eightLetterLaneWords(bd, true)
 	return float64(words) / nwl23EightLetterWords
 }

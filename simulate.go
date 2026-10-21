@@ -478,9 +478,9 @@ type SimTurn struct {
 	// (Even Steven, #40) can be checked against the real number directly,
 	// same motivation as DrawbackDebug above.
 	PoolAfterMove int `json:"poolAfterMove"`
-	// EightLetterLanesAfter: 8-letter lanes on the board after this move (board openness,
+	// EightLetterOpennessAfter: the board's 8-letter openness after this move (board openness,
 	// board_openness_for_rules_bot.go).
-	EightLetterLanesAfter float64 `json:"eightLetterLanesAfter"`
+	EightLetterOpennessAfter float64 `json:"eightLetterOpennessAfter"`
 	// RulesBotDebug: what a 90s Wally rule changed this turn (empty when it
 	// played Wally's top move).
 	RulesBotDebug string `json:"rulesBotDebug,omitempty"`
@@ -976,7 +976,7 @@ func simulateOneGame(gd *kwg.KWG, player1Bot, player2Bot BotConfig) SimGameResul
 		// instead of trusting the filter blindly, same motivation as
 		// DrawbackDebug above.
 		turn.PoolAfterMove = len(pool)
-		turn.EightLetterLanesAfter = countEightLetterLanes(bd)
+		turn.EightLetterOpennessAfter = eightLetterOpenness(bd)
 		turns = append(turns, turn)
 
 		if currentPlayer == 1 {
