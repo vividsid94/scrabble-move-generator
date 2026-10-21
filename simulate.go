@@ -481,6 +481,9 @@ type SimTurn struct {
 	// EightLetterOpennessAfter: the board's 8-letter openness after this move (board openness,
 	// board_openness_for_rules_bot.go).
 	EightLetterOpennessAfter float64 `json:"eightLetterOpennessAfter"`
+	// SevenLetterLanesAfter: the board's 7-letter lanes after this move
+	// (seven_letter_lanes_for_rules_bot.go).
+	SevenLetterLanesAfter float64 `json:"sevenLetterLanesAfter"`
 	// RulesBotDebug: what a 90s Wally rule changed this turn (empty when it
 	// played Wally's top move).
 	RulesBotDebug string `json:"rulesBotDebug,omitempty"`
@@ -977,6 +980,7 @@ func simulateOneGame(gd *kwg.KWG, player1Bot, player2Bot BotConfig) SimGameResul
 		// DrawbackDebug above.
 		turn.PoolAfterMove = len(pool)
 		turn.EightLetterOpennessAfter = eightLetterOpenness(bd)
+		turn.SevenLetterLanesAfter = sevenLetterLanes(bd)
 		turns = append(turns, turn)
 
 		if currentPlayer == 1 {
