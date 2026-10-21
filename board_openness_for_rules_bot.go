@@ -12,11 +12,10 @@ import "github.com/domino14/macondo/board"
 //     it) - threading through more would need a 9+ letter word;
 //   - the squares just before and after the run are empty (or the edge), so
 //     the word doesn't run into another tile;
-//   - it connects to the board: a tile inside the run, or one new square
-//     with a tile beside it (above/below for a row, left/right for a
-//     column);
-//   - at most one new square has a tile beside it - a run crowded by
-//     neighbouring tiles is closed board, not an open lane.
+//   - it connects to the board through that one tile inside the run;
+//   - no new square has a tile beside it (above/below for a row,
+//     left/right for a column) - a square that would also form a sideways
+//     word isn't open board.
 //
 // On an empty board, a run through the centre star counts.
 //
@@ -103,7 +102,7 @@ func countLanesInDirection(bd *board.GameBoard, down bool, emptyBoard bool) int 
 				tilesInside++
 				end++
 			}
-			if besideCount > 1 || tilesInside > 1 {
+			if besideCount > 0 || tilesInside > 1 {
 				continue
 			}
 			if emptyBoard {
@@ -112,7 +111,7 @@ func countLanesInDirection(bd *board.GameBoard, down bool, emptyBoard bool) int 
 				}
 				continue
 			}
-			if tilesInside > 0 || besideCount == 1 {
+			if tilesInside == 1 {
 				lanes++
 			}
 		}
