@@ -12,8 +12,9 @@ import (
 //
 // Rules so far:
 //   - Board openness (board_openness_for_rules_bot.go): ahead by LeadBy or
-//     more, play the allowed move leaving the fewest bingo lanes; behind by
-//     LeadBy or more, the one leaving the most. Ties go to higher equity.
+//     more, play the allowed move leaving the fewest bingo lanes, if it
+//     closes at least MinLanesClosed more than the top move. Ties go to
+//     higher equity. (Opening the board when behind was tried and dropped.)
 
 // RulesBotConfig turns 90s Wally on for a Sandbox bot (BotConfig.RulesBot).
 // Each rule has its own switch so rules can be tested one at a time.
@@ -21,12 +22,13 @@ type RulesBotConfig struct {
 	// MaxEquityLoss: how far below the top move's equity a rule may go.
 	// Default 6.
 	MaxEquityLoss float64 `json:"maxEquityLoss,omitempty"`
-	// LeadBy: the lead (or deficit) that switches the openness rule on.
-	// Default 30.
+	// LeadBy: the lead that switches the openness rule on. Default 30.
 	LeadBy int `json:"leadBy,omitempty"`
-	// CloseWhenAhead / OpenWhenBehind: the openness rule's two halves.
+	// CloseWhenAhead switches the openness rule on.
 	CloseWhenAhead bool `json:"closeWhenAhead,omitempty"`
-	OpenWhenBehind bool `json:"openWhenBehind,omitempty"`
+	// MinLanesClosed: how many fewer lanes than the top move a replacement
+	// must leave. Default 1.
+	MinLanesClosed int `json:"minLanesClosed,omitempty"`
 }
 
 // rulesBotPick returns the index in best-first `candidates` that 90s Wally
@@ -44,10 +46,12 @@ func rulesBotPick(cfg RulesBotConfig, candidates []scoredCandidate, bd *board.Ga
 		leadBy = 30
 	}
 
-	lead := myScore - opponentScore
-	closing := cfg.CloseWhenAhead && lead >= leadBy
-	opening := cfg.OpenWhenBehind && lead <= -leadBy
-	if !closing && !opening {
+	minClosed := cfg.MinLanesClosed
+	if minClosed <= 0 {
+		minClosed = 1
+	}
+
+	if !cfg.CloseWhenAhead || myScore-opponentScore < leadBy {
 		return 0, ""
 	}
 
@@ -69,17 +73,13 @@ func rulesBotPick(cfg RulesBotConfig, candidates []scoredCandidate, bd *board.Ga
 			break // best-first, so the rest are further below
 		}
 		lanes := lanesAfter(&candidates[i])
-		if (closing && lanes < bestLanes) || (opening && lanes > bestLanes) {
+		if lanes < bestLanes && lanes <= topLanes-minClosed {
 			bestIdx, bestLanes = i, lanes
 		}
 	}
 	if bestIdx == 0 {
 		return 0, ""
 	}
-	direction := "closed"
-	if opening {
-		direction = "opened"
-	}
-	return bestIdx, fmt.Sprintf("90s Wally %s the board: %d lanes instead of %d (%.1f equity given up)",
-		direction, bestLanes, topLanes, candidates[0].total-candidates[bestIdx].total)
+	return bestIdx, fmt.Sprintf("90s Wally closed the board: %d lanes instead of %d (%.1f equity given up)",
+		bestLanes, topLanes, candidates[0].total-candidates[bestIdx].total)
 }
