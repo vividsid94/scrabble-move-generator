@@ -38,11 +38,23 @@ type RulesBotConfig struct {
 	CloseWhenBehindUpTo int `json:"closeWhenBehindUpTo,omitempty"`
 }
 
+// RulesBotSwitch records both moves when a rule moved 90s Wally off
+// Wally's top move, so the Sandbox can show what Wally would have played.
+type RulesBotSwitch struct {
+	WallyMove     *DetailedMove `json:"wallyMove,omitempty"` // nil when Wally's top move was an exchange
+	WallyExchange string        `json:"wallyExchange,omitempty"`
+	WallyEquity   float64       `json:"wallyEquity"`
+	WallyLanes    int           `json:"wallyLanes"`
+	ChosenEquity  float64       `json:"chosenEquity"`
+	ChosenLanes   int           `json:"chosenLanes"`
+	LanesBefore   int           `json:"lanesBefore"`
+}
+
 // rulesBotPick returns the index in best-first `candidates` that 90s Wally
-// plays, and a debug note when a rule moved it off index 0.
-func rulesBotPick(cfg RulesBotConfig, candidates []scoredCandidate, bd *board.GameBoard, myScore, opponentScore int) (int, string) {
+// plays, plus a debug note and both moves when a rule moved it off index 0.
+func rulesBotPick(cfg RulesBotConfig, candidates []scoredCandidate, bd *board.GameBoard, myScore, opponentScore int) (int, string, *RulesBotSwitch) {
 	if len(candidates) == 0 {
-		return -1, ""
+		return -1, "", nil
 	}
 	maxLoss := cfg.MaxEquityLoss
 	if maxLoss <= 0 {
@@ -61,7 +73,7 @@ func rulesBotPick(cfg RulesBotConfig, candidates []scoredCandidate, bd *board.Ga
 	lead := myScore - opponentScore
 	active := lead >= leadBy || (cfg.CloseWhenBehindUpTo > 0 && lead >= -cfg.CloseWhenBehindUpTo)
 	if !cfg.CloseWhenAhead || !active {
-		return 0, ""
+		return 0, "", nil
 	}
 
 	currentLanes := countBingoLanes(bd)
@@ -87,8 +99,19 @@ func rulesBotPick(cfg RulesBotConfig, candidates []scoredCandidate, bd *board.Ga
 		}
 	}
 	if bestIdx == 0 {
-		return 0, ""
+		return 0, "", nil
+	}
+	top := candidates[0]
+	sw := &RulesBotSwitch{
+		WallyEquity: top.total, WallyLanes: topLanes,
+		ChosenEquity: candidates[bestIdx].total, ChosenLanes: bestLanes,
+		LanesBefore: currentLanes,
+	}
+	if top.isExchange {
+		sw.WallyExchange = top.exchangeTiles
+	} else {
+		sw.WallyMove = top.detailed
 	}
 	return bestIdx, fmt.Sprintf("90s Wally closed the board: %d lanes instead of %d (%.1f equity given up)",
-		bestLanes, topLanes, candidates[0].total-candidates[bestIdx].total)
+		bestLanes, topLanes, top.total-candidates[bestIdx].total), sw
 }

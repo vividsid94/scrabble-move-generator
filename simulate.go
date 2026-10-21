@@ -484,6 +484,8 @@ type SimTurn struct {
 	// RulesBotDebug: what a 90s Wally rule changed this turn (empty when it
 	// played Wally's top move).
 	RulesBotDebug string `json:"rulesBotDebug,omitempty"`
+	// RulesBotSwitch: both moves, when a 90s Wally rule changed the pick.
+	RulesBotSwitch *RulesBotSwitch `json:"rulesBotSwitch,omitempty"`
 }
 
 type SimGameResult struct {
@@ -787,14 +789,16 @@ func simulateOneGame(gd *kwg.KWG, player1Bot, player2Bot BotConfig) SimGameResul
 
 		// 90s Wally: its rules may move the pick off the top move.
 		var rulesBotDebug string
+		var rulesBotSwitch *RulesBotSwitch
 		if currentBot.RulesBot != nil && currentBot.SpecialSelection == "" && len(candidates) > 0 {
 			myScore, opponentScore := score1, score2
 			if currentPlayer == 2 {
 				myScore, opponentScore = score2, score1
 			}
-			if pick, note := rulesBotPick(*currentBot.RulesBot, candidates, bd, myScore, opponentScore); pick >= 0 {
+			if pick, note, sw := rulesBotPick(*currentBot.RulesBot, candidates, bd, myScore, opponentScore); pick >= 0 {
 				chosen = &candidates[pick]
 				rulesBotDebug = note
+				rulesBotSwitch = sw
 			}
 		}
 
@@ -872,6 +876,7 @@ func simulateOneGame(gd *kwg.KWG, player1Bot, player2Bot BotConfig) SimGameResul
 			DrawbackActive: unfilteredForDrawbackCompare != nil,
 		}
 		turn.RulesBotDebug = rulesBotDebug
+		turn.RulesBotSwitch = rulesBotSwitch
 		if ruleImpacted {
 			if baselineChosen.isExchange {
 				turn.BaselineType = "exchange"
