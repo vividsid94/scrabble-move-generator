@@ -798,7 +798,7 @@ func simulateOneGame(gd *kwg.KWG, player1Bot, player2Bot BotConfig) SimGameResul
 			if currentPlayer == 2 {
 				myScore, opponentScore = score2, score1
 			}
-			if pick, note, sw := rulesBotPick(*currentBot.RulesBot, candidates, bd, gd, myScore, opponentScore); pick >= 0 {
+			if pick, note, sw := rulesBotPick(*currentBot.RulesBot, candidates, bd, gd, myScore, opponentScore, len(pool)); pick >= 0 {
 				chosen = &candidates[pick]
 				rulesBotDebug = note
 				rulesBotSwitch = sw

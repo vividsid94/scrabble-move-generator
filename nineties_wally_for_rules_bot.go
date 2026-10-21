@@ -18,8 +18,10 @@ import (
 //     curve in bingo_chance_for_rules_bot.go, by the board's 7-letter +
 //     8-letter openness) times what a bingo costs (netBingoCost, times
 //     BingoCostMultiplier). The best
-//     score wins. Covers bingos only - not hotspots. Opening the board when
-//     behind was tried and dropped.
+//     score wins. Covers bingos only - not hotspots. Off once the bag is
+//     empty: the curve was measured with tiles left, and an empty-bag
+//     position is an endgame question. Opening the board when behind was
+//     tried and dropped.
 
 // RulesBotConfig turns 90s Wally on for a Sandbox bot (BotConfig.RulesBot).
 // Each rule has its own switch so rules can be tested one at a time.
@@ -64,9 +66,13 @@ func boardOpenness(bd *board.GameBoard) float64 {
 
 // rulesBotPick returns the index in best-first `candidates` that 90s Wally
 // plays, plus a debug note and both moves when a rule moved it off index 0.
-func rulesBotPick(cfg RulesBotConfig, candidates []scoredCandidate, bd *board.GameBoard, gd *kwg.KWG, myScore, opponentScore int) (int, string, *RulesBotSwitch) {
+// bagSize is the tiles left in the bag at the start of the turn.
+func rulesBotPick(cfg RulesBotConfig, candidates []scoredCandidate, bd *board.GameBoard, gd *kwg.KWG, myScore, opponentScore, bagSize int) (int, string, *RulesBotSwitch) {
 	if len(candidates) == 0 {
 		return -1, "", nil
+	}
+	if bagSize == 0 {
+		return 0, "", nil
 	}
 	maxLoss := cfg.MaxEquityLoss
 	if maxLoss <= 0 {
