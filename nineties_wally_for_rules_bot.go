@@ -12,8 +12,8 @@ import (
 //
 // Rules so far:
 //   - Board openness (board_openness_for_rules_bot.go): ahead by LeadBy or
-//     more, play the allowed move leaving the fewest bingo lanes, if it
-//     closes at least MinLanesClosed more than the top move. Ties go to
+//     more, play the allowed move leaving the fewest 8-letter lanes, if it
+//     closes at least MinEightLetterLanesClosed more than the top move. Ties go to
 //     higher equity. With CloseWhenBehindUpTo set, it also closes when behind
 //     by that much or less (Wally-style bots are overaggressive, so closing
 //     can pay even from slightly behind). Opening the board when behind was
@@ -29,10 +29,10 @@ type RulesBotConfig struct {
 	LeadBy int `json:"leadBy,omitempty"`
 	// CloseWhenAhead switches the openness rule on.
 	CloseWhenAhead bool `json:"closeWhenAhead,omitempty"`
-	// MinLanesClosed: how many fewer lanes (normalized, see
+	// MinEightLetterLanesClosed: how many fewer 8-letter lanes (normalized, see
 	// board_openness_for_rules_bot.go) than the top move a replacement must
 	// leave. Default 0.125 (one run).
-	MinLanesClosed float64 `json:"minLanesClosed,omitempty"`
+	MinEightLetterLanesClosed float64 `json:"minEightLetterLanesClosed,omitempty"`
 	// CloseWhenBehindUpTo: if set, the openness rule also applies when behind
 	// by this many points or fewer (so whenever the lead is at least minus
 	// this), not just when ahead by LeadBy.
@@ -45,10 +45,10 @@ type RulesBotSwitch struct {
 	WallyMove     *DetailedMove `json:"wallyMove,omitempty"` // nil when Wally's top move was an exchange
 	WallyExchange string        `json:"wallyExchange,omitempty"`
 	WallyEquity   float64       `json:"wallyEquity"`
-	WallyLanes    float64       `json:"wallyLanes"`
+	WallyEightLetterLanes  float64       `json:"wallyEightLetterLanes"`
 	ChosenEquity  float64       `json:"chosenEquity"`
-	ChosenLanes   float64       `json:"chosenLanes"`
-	LanesBefore   float64       `json:"lanesBefore"`
+	ChosenEightLetterLanes float64       `json:"chosenEightLetterLanes"`
+	EightLetterLanesBefore float64       `json:"eightLetterLanesBefore"`
 }
 
 // rulesBotPick returns the index in best-first `candidates` that 90s Wally
@@ -66,7 +66,7 @@ func rulesBotPick(cfg RulesBotConfig, candidates []scoredCandidate, bd *board.Ga
 		leadBy = 30
 	}
 
-	minClosed := cfg.MinLanesClosed
+	minClosed := cfg.MinEightLetterLanesClosed
 	if minClosed <= 0 {
 		minClosed = 0.125
 	}
@@ -77,14 +77,14 @@ func rulesBotPick(cfg RulesBotConfig, candidates []scoredCandidate, bd *board.Ga
 		return 0, "", nil
 	}
 
-	currentLanes := countBingoLanes(bd)
+	currentLanes := countEightLetterLanes(bd)
 	lanesAfter := func(c *scoredCandidate) float64 {
 		if c.isExchange {
 			return currentLanes
 		}
 		after := bd.Copy()
 		after.PlayMove(c.move)
-		return countBingoLanes(after)
+		return countEightLetterLanes(after)
 	}
 
 	bestIdx := 0
@@ -105,15 +105,15 @@ func rulesBotPick(cfg RulesBotConfig, candidates []scoredCandidate, bd *board.Ga
 	}
 	top := candidates[0]
 	sw := &RulesBotSwitch{
-		WallyEquity: top.total, WallyLanes: topLanes,
-		ChosenEquity: candidates[bestIdx].total, ChosenLanes: bestLanes,
-		LanesBefore: currentLanes,
+		WallyEquity: top.total, WallyEightLetterLanes: topLanes,
+		ChosenEquity: candidates[bestIdx].total, ChosenEightLetterLanes: bestLanes,
+		EightLetterLanesBefore: currentLanes,
 	}
 	if top.isExchange {
 		sw.WallyExchange = top.exchangeTiles
 	} else {
 		sw.WallyMove = top.detailed
 	}
-	return bestIdx, fmt.Sprintf("90s Wally closed the board: %.3g lanes instead of %.3g (%.1f equity given up)",
+	return bestIdx, fmt.Sprintf("90s Wally closed the board: %.3g 8-letter lanes instead of %.3g (%.1f equity given up)",
 		bestLanes, topLanes, top.total-candidates[bestIdx].total), sw
 }

@@ -2,13 +2,13 @@ package main
 
 import "github.com/domino14/macondo/board"
 
-// Board openness for 90s Wally, the rules bot: how many bingo lanes the board
+// Board openness for 90s Wally, the rules bot: how many 8-letter lanes the board
 // has. Pure board geometry - no dictionary, no hook or letter analysis -
 // written from scratch (not dynamic_leaves.go's Openness).
 //
-// A bingo lane is a place a 7-tile play could physically go:
+// An 8-letter lane is a place a 7-tile play could physically go:
 //   - a straight run in a row or column holding exactly 7 empty squares
-//     and at most one tile already on the board (an 8-letter play through
+//     and exactly one tile already on the board (an 8-letter play through
 //     it) - threading through more would need a 9+ letter word;
 //   - the squares just before and after the run are empty (or the edge), so
 //     the word doesn't run into another tile;
@@ -30,9 +30,9 @@ func occupied(bd *board.GameBoard, row, col int) bool {
 	return bd.GetLetter(row, col) != 0
 }
 
-// countBingoLanes is the board's bingo lanes in both directions, normalized
+// countEightLetterLanes is the board's 8-letter lanes in both directions, normalized
 // as above (runs / 8).
-func countBingoLanes(bd *board.GameBoard) float64 {
+func countEightLetterLanes(bd *board.GameBoard) float64 {
 	empty := true
 	for r := 0; r < boardSize && empty; r++ {
 		for c := 0; c < boardSize; c++ {
@@ -42,12 +42,12 @@ func countBingoLanes(bd *board.GameBoard) float64 {
 			}
 		}
 	}
-	return float64(countLanesInDirection(bd, false, empty)+countLanesInDirection(bd, true, empty)) / 8
+	return float64(countEightLetterRunsInDirection(bd, false, empty)+countEightLetterRunsInDirection(bd, true, empty)) / 8
 }
 
-// countLanesInDirection counts runs along rows (down false) or columns
+// countEightLetterRunsInDirection counts runs along rows (down false) or columns
 // (down true). at(line, i) maps a line and a position along it to a square.
-func countLanesInDirection(bd *board.GameBoard, down bool, emptyBoard bool) int {
+func countEightLetterRunsInDirection(bd *board.GameBoard, down bool, emptyBoard bool) int {
 	at := func(line, i int) (int, int) {
 		if down {
 			return i, line
