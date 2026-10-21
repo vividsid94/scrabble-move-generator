@@ -42,15 +42,15 @@ func boardOpenness(bd *board.GameBoard) float64 {
 	return sevenLetterOpenness(bd) + eightLetterOpenness(bd)
 }
 
-// opennessAfterMove is the board's openness once candidate c is played, on
-// a copy of bd with its cross-sets updated. An exchange leaves the board as
-// it is (before).
-func opennessAfterMove(bd *board.GameBoard, gd *kwg.KWG, c *scoredCandidate, before float64) float64 {
+// boardAfterMove is a copy of bd with candidate c played and its cross-sets
+// updated, for measuring the board the opponent will face. An exchange
+// leaves the board as it is, so it returns bd itself (don't modify it).
+func boardAfterMove(bd *board.GameBoard, gd *kwg.KWG, c *scoredCandidate) *board.GameBoard {
 	if c.isExchange {
-		return before
+		return bd
 	}
 	after := bd.Copy()
 	after.PlayMove(c.move)
 	cross_set.UpdateCrossSetsForMove(after, c.move, gd, ld)
-	return boardOpenness(after)
+	return after
 }

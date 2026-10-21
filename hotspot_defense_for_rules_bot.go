@@ -1,0 +1,49 @@
+package main
+
+// Hotspot defense: one rule of 90s Wally (nineties_wally_for_rules_bot.go).
+// It charges each candidate move for the scoring it leaves the opponent:
+//
+//	cost = opponent's expected next-turn score after the move x CostMultiplier
+//
+// The expected score comes from the board's hotspot load after the move
+// (hotspots_for_rules_bot.go) read off the fixed curve in
+// hotspot_score_for_rules_bot.go. Covers non-bingo scoring - bingos are bingo
+// defense's job. On whenever the bag has tiles (hotspots cost points whatever
+// the score); off once it's empty, like bingo defense.
+//
+// Not tested in series yet - settings are first guesses.
+
+// HotspotDefenseConfig: zero values mean the defaults, so a Sandbox request
+// can override one setting at a time for tests.
+type HotspotDefenseConfig struct {
+	// Off switches the rule off.
+	Off bool `json:"off,omitempty"`
+	// CostMultiplier scales the expected score. Default 1.
+	CostMultiplier float64 `json:"costMultiplier,omitempty"`
+}
+
+const hotspotDefenseCostMultiplier = 1.0
+
+// hotspotDefenseActive: does the rule apply this turn?
+func hotspotDefenseActive(cfg HotspotDefenseConfig, bagSize int) bool {
+	return !cfg.Off && bagSize > 0
+}
+
+// hotspotDefenseCost: the points charged against a move that leaves the board
+// at this hotspot load.
+func hotspotDefenseCost(cfg HotspotDefenseConfig, load float64) float64 {
+	multiplier := cfg.CostMultiplier
+	if multiplier <= 0 {
+		multiplier = hotspotDefenseCostMultiplier
+	}
+	return opponentHotspotScore(load) * multiplier
+}
+
+// HotspotDefenseDetail: what hotspot defense saw, for RulesBotSwitch.
+type HotspotDefenseDetail struct {
+	LoadBefore          float64 `json:"loadBefore"`
+	WallyLoad           float64 `json:"wallyLoad"`
+	WallyExpectedScore  float64 `json:"wallyExpectedScore"`
+	ChosenLoad          float64 `json:"chosenLoad"`
+	ChosenExpectedScore float64 `json:"chosenExpectedScore"`
+}
