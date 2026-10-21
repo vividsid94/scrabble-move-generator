@@ -16,7 +16,8 @@ import (
 //   - Bingo defense: when the rule is on, each allowed move is scored as its
 //     equity minus the opponent's bingo chance after it (read from the fixed
 //     curve in bingo_chance_for_rules_bot.go, by the board's 7-letter +
-//     8-letter openness) times what a bingo costs (netBingoCost). The best
+//     8-letter openness) times what a bingo costs (netBingoCost, times
+//     BingoCostMultiplier). The best
 //     score wins. Covers bingos only - not hotspots. Opening the board when
 //     behind was tried and dropped.
 
@@ -30,6 +31,11 @@ type RulesBotConfig struct {
 	LeadBy int `json:"leadBy,omitempty"`
 	// CloseWhenAhead switches bingo defense on.
 	CloseWhenAhead bool `json:"closeWhenAhead,omitempty"`
+	// BingoCostMultiplier scales netBingoCost in the bingo-defense formula, so
+	// blocking can be valued above a bingo's average one-turn cost (an open
+	// board stays open; when ahead, a bingo swings win chances more than its
+	// points). Default 1.
+	BingoCostMultiplier float64 `json:"bingoCostMultiplier,omitempty"`
 	// CloseWhenBehindUpTo: if set, bingo defense also applies when behind by
 	// this many points or fewer (so whenever the lead is at least minus
 	// this), not just when ahead by LeadBy.
@@ -77,6 +83,11 @@ func rulesBotPick(cfg RulesBotConfig, candidates []scoredCandidate, bd *board.Ga
 		return 0, "", nil
 	}
 
+	bingoCost := netBingoCost
+	if cfg.BingoCostMultiplier > 0 {
+		bingoCost *= cfg.BingoCostMultiplier
+	}
+
 	opennessBefore := boardOpenness(bd)
 	opennessAfter := func(c *scoredCandidate) float64 {
 		if c.isExchange {
@@ -89,7 +100,7 @@ func rulesBotPick(cfg RulesBotConfig, candidates []scoredCandidate, bd *board.Ga
 	}
 	// defended: equity minus the expected cost of an opponent bingo.
 	defended := func(c *scoredCandidate, openness float64) float64 {
-		return c.total - opponentBingoChance(openness)*netBingoCost
+		return c.total - opponentBingoChance(openness)*bingoCost
 	}
 
 	topOpenness := opennessAfter(&candidates[0])
