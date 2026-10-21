@@ -269,7 +269,8 @@ type BotConfig struct {
 	// the longest word" and e.g. "but also avoid bingos."
 	SpecialSelection string `json:"specialSelection,omitempty"` // "" | "longestWord" | "mostTiles"
 	// RulesBot, if set, makes this bot 90s Wally: rank 1 plus hand-written
-	// rules (nineties_wally_for_rules_bot.go). Ignored under SpecialSelection.
+	// rules (nineties_wally_for_rules_bot.go). An empty object is 90s Wally
+	// with every rule at its locked settings. Ignored under SpecialSelection.
 	RulesBot *RulesBotConfig `json:"rulesBot,omitempty"`
 }
 

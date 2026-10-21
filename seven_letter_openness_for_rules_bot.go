@@ -7,8 +7,10 @@ import (
 	"github.com/domino14/word-golib/tilemapping"
 )
 
-// 7-letter lanes for 90s Wally, the rules bot: places a 7-tile play could go
-// by hooking a word already on the board. The move generator's cross-checks
+// 7-letter openness for 90s Wally, the rules bot: one half of board openness
+// (board_openness_for_rules_bot.go) - the board's 7-letter lanes, places a
+// 7-tile play could go by hooking a word already on the board. The move
+// generator's cross-checks
 // are used only to find anchors; everything else is board geometry, written
 // from scratch, then weighted by the NWL23 dictionary
 // (seven_letter_counts_for_rules_bot.go).
