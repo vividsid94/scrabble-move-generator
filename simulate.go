@@ -485,6 +485,9 @@ type SimTurn struct {
 	// SevenLetterOpennessAfter: the board's 7-letter openness after this move
 	// (seven_letter_lanes_for_rules_bot.go).
 	SevenLetterOpennessAfter float64 `json:"sevenLetterOpennessAfter"`
+	// HotspotLoadAfter: the board's hotspot load after this move
+	// (hotspots_for_rules_bot.go).
+	HotspotLoadAfter float64 `json:"hotspotLoadAfter"`
 	// RulesBotDebug: what a 90s Wally rule changed this turn (empty when it
 	// played Wally's top move).
 	RulesBotDebug string `json:"rulesBotDebug,omitempty"`
@@ -982,6 +985,7 @@ func simulateOneGame(gd *kwg.KWG, player1Bot, player2Bot BotConfig) SimGameResul
 		turn.PoolAfterMove = len(pool)
 		turn.EightLetterOpennessAfter = eightLetterOpenness(bd)
 		turn.SevenLetterOpennessAfter = sevenLetterOpenness(bd)
+		turn.HotspotLoadAfter = hotspotLoad(bd)
 		turns = append(turns, turn)
 
 		if currentPlayer == 1 {
