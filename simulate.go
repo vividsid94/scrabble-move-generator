@@ -475,6 +475,9 @@ type SimTurn struct {
 	// (Even Steven, #40) can be checked against the real number directly,
 	// same motivation as DrawbackDebug above.
 	PoolAfterMove int `json:"poolAfterMove"`
+	// LanesAfter: bingo lanes on the board after this move (board openness,
+	// board_openness_for_rules_bot.go).
+	LanesAfter int `json:"lanesAfter"`
 }
 
 type SimGameResult struct {
@@ -948,6 +951,7 @@ func simulateOneGame(gd *kwg.KWG, player1Bot, player2Bot BotConfig) SimGameResul
 		// instead of trusting the filter blindly, same motivation as
 		// DrawbackDebug above.
 		turn.PoolAfterMove = len(pool)
+		turn.LanesAfter = countBingoLanes(bd)
 		turns = append(turns, turn)
 
 		if currentPlayer == 1 {
