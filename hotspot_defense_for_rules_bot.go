@@ -11,21 +11,22 @@ package main
 // defense's job. On whenever the bag has tiles (hotspots cost points whatever
 // the score); off once it's empty, like bingo defense.
 //
-// Locked in 2026-10-21 at CostMultiplier 2, matching bingo defense, after spot
-// checks of prototype positions (at 1 it rarely changed a move on its own, and
-// bingo defense could accept a worse hotspot to block a bingo). Not yet
-// measured in a series against Wally - do that once it's deployed.
+// Series against Wally (2026-10-22, 4,000 games each, both with bingo
+// defense at 2): CostMultiplier 1 won 51.5% (19% of turns changed, 1.9 equity
+// given up each), 2 won 51.2% (27%, 2.6 each; about 50.8% over 6,000), bingo
+// defense alone 50.5%. Default 1 - the cheaper version, as good or better.
+// Being confirmed on a fresh 8,000 games.
 
 // HotspotDefenseConfig: zero values mean the defaults, so a Sandbox request
 // can override one setting at a time for tests.
 type HotspotDefenseConfig struct {
 	// Off switches the rule off.
 	Off bool `json:"off,omitempty"`
-	// CostMultiplier scales the expected score. Default 2.
+	// CostMultiplier scales the expected score. Default 1.
 	CostMultiplier float64 `json:"costMultiplier,omitempty"`
 }
 
-const hotspotDefenseCostMultiplier = 2.0
+const hotspotDefenseCostMultiplier = 1.0
 
 // hotspotDefenseActive: does the rule apply this turn?
 func hotspotDefenseActive(cfg HotspotDefenseConfig, bagSize int) bool {
