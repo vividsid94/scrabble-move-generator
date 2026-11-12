@@ -358,6 +358,18 @@ var drawbacks = []DrawbackDef{
 	{ID: 102, Name: "Peer Pressure (big crowd)", NameSource: "friend",
 		Description: "Each turn 5 random tiles on your rack are highlighted. You must play or exchange at least 3 of them.",
 		Rule:        DrawbackRule{Type: "useHighlightedTiles", Highlight: 5, Need: 3, AppliesToExchanges: true}},
+	// -- Batch 3: score changes.
+	{ID: 48, Name: "Can I Buy a Vowel", NameSource: "friend",
+		Description: "Every vowel you play costs you 5 points. Blanks used as vowels count; Y doesn't.",
+		// Rescored in filterCandidatesByDrawback, like Nerf War: the score
+		// a play really earns, so judging and the bot's pick use it.
+		Rule: DrawbackRule{Type: "vowelPenalty", Value: 5}},
+	{ID: 57, Name: "Devil On Your Shoulder", NameSource: "friend",
+		Description: "Every turn a devil suggests a terrible move (your worst play). Every 4th turn you must play it - obeying sooner resets the count.",
+		// The devil's move is the lowest-equity word play (devilMove). The
+		// caller works out whether this is a must-obey turn from the game
+		// so far (drawbackExtras.MustObeyDevil); Value is the cycle length.
+		Rule: DrawbackRule{Type: "obeyDevil", Value: 4}},
 	{ID: 61, Name: "Copy Cat", NameSource: "friend",
 		Description: "If your opponent plays a tile you have, you must use every copy of it on your rack, or exchange or pass. A blank counts as a blank, whatever letter it was.",
 		Rule:        DrawbackRule{Type: "useOpponentLetters"}},
@@ -638,6 +650,8 @@ type drawbackExtras struct {
 	Quadrant    *int
 	Flavor      string
 	Highlighted string
+	// Devil On Your Shoulder: this is the turn the devil's move is required.
+	MustObeyDevil bool
 }
 
 // openedPremiumSquares (I'll Take That): the empty premium squares in
@@ -1713,6 +1727,34 @@ func copyCatRequired(preMoveRack string, turns []SimTurn, player int) string {
 	return string(required)
 }
 
+// vowelsPlaced: how many of a play's new tiles are vowels (A E I O U - a
+// blank counts as the letter it stands for).
+func vowelsPlaced(tiles []MoveTile) int {
+	n := 0
+	for _, t := range tiles {
+		if t.IsNew && t.Letter != "" && strings.ContainsRune("AEIOU", []rune(strings.ToUpper(t.Letter))[0]) {
+			n++
+		}
+	}
+	return n
+}
+
+// devilMove (Devil On Your Shoulder): the worst word play by equity - the
+// lowest total; the first of equals. nil when there's no word play.
+func devilMove(candidates []scoredCandidate) *scoredCandidate {
+	var worst *scoredCandidate
+	for i := range candidates {
+		c := &candidates[i]
+		if c.isExchange {
+			continue
+		}
+		if worst == nil || c.total < worst.total {
+			worst = c
+		}
+	}
+	return worst
+}
+
 // lettersInCommon: how many letters a and b share, counting repeats.
 func lettersInCommon(a, b string) int {
 	counts := map[rune]int{}
@@ -1919,6 +1961,36 @@ func filterCandidatesByDrawback(candidates []scoredCandidate, rule DrawbackRule,
 	// player's placed tiles worth 1, so the bot picks (and scores) by its
 	// real points. Copies each DetailedMove so the unfiltered snapshot the
 	// caller keeps for comparison isn't changed.
+	// Can I Buy a Vowel: every play rescored, Value points off per vowel
+	// placed (a blank counts as the letter it stands for; Y isn't a vowel).
+	if rule.Type == "vowelPenalty" {
+		rescored := make([]scoredCandidate, len(candidates))
+		for i, c := range candidates {
+			if !c.isExchange {
+				penalty := float64(vowelsPlaced(c.detailed.Tiles)) * rule.Value
+				d := *c.detailed
+				d.Score -= int(penalty)
+				c.detailed = &d
+				c.total -= penalty
+				c.baselineTotal -= penalty
+			}
+			rescored[i] = c
+		}
+		return rescored, ""
+	}
+
+	// Devil On Your Shoulder: on a must-obey turn only the devil's move is
+	// allowed (a pass is still possible - it just doesn't count as obeying).
+	if rule.Type == "obeyDevil" {
+		if !extras.MustObeyDevil {
+			return candidates, ""
+		}
+		if devil := devilMove(candidates); devil != nil {
+			return []scoredCandidate{*devil}, "Devil On Your Shoulder: obey this turn"
+		}
+		return candidates, ""
+	}
+
 	if rule.Type == "nerfTileValues" {
 		rescored := make([]scoredCandidate, len(candidates))
 		for i, c := range candidates {

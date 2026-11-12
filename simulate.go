@@ -621,6 +621,8 @@ func simulateOneGame(gd *kwg.KWG, player1Bot, player2Bot BotConfig) SimGameResul
 	// The board as it was before the most recent play (I'll Take That
 	// compares what a rack could reach then and now).
 	var boardBeforeLastPlay *board.GameBoard
+	// Devil On Your Shoulder: each holder's turns since they last obeyed.
+	devilSinceObey := map[int]int{}
 	endReason := ""
 	lossPlayer, lossReason := 0, ""
 
@@ -644,6 +646,8 @@ func simulateOneGame(gd *kwg.KWG, player1Bot, player2Bot BotConfig) SimGameResul
 			currentBot = player2Bot
 		}
 		poolSizeAtTurnStart := len(pool)
+		// This turn's devil suggestion (Devil On Your Shoulder holders only).
+		var devilThisTurn *scoredCandidate
 
 		rack := tilemapping.RackFromString(currentRack, alph)
 		generator := movegen.NewGordonGenerator(gd, bd, ld)
@@ -774,7 +778,15 @@ func simulateOneGame(gd *kwg.KWG, player1Bot, player2Bot BotConfig) SimGameResul
 					reachBefore := reachableSquares(movegen.NewGordonGenerator(gd, boardBeforeLastPlay, ld).GenAll(rack, false), boardBeforeLastPlay, alph)
 					opened = openedPremiumSquares(turns, currentPlayer, bd, reachableSquares(rawMoves, bd, alph), reachBefore)
 				}
-				candidates, drawbackDebug = filterCandidatesByDrawback(candidates, def.Rule, currentRack, bd, len(pool), turns, currentPlayer, drawbackExtras{Opened: opened})
+				extras := drawbackExtras{Opened: opened}
+				if def.Rule.Type == "obeyDevil" {
+					if d := devilMove(candidates); d != nil {
+						copyOfDevil := *d
+						devilThisTurn = &copyOfDevil
+					}
+					extras.MustObeyDevil = devilSinceObey[currentPlayer] >= int(def.Rule.Value)-1
+				}
+				candidates, drawbackDebug = filterCandidatesByDrawback(candidates, def.Rule, currentRack, bd, len(pool), turns, currentPlayer, extras)
 			}
 		}
 
@@ -1035,6 +1047,13 @@ func simulateOneGame(gd *kwg.KWG, player1Bot, player2Bot BotConfig) SimGameResul
 		turn.SevenLetterOpennessAfter = sevenLetterOpenness(bd)
 		turn.HotspotLoadAfter = hotspotLoad(bd)
 		turns = append(turns, turn)
+		if devilThisTurn != nil {
+			if chosen != nil && sameCandidate(chosen, devilThisTurn) {
+				devilSinceObey[currentPlayer] = 0
+			} else {
+				devilSinceObey[currentPlayer]++
+			}
+		}
 
 		if currentPlayer == 1 {
 			rack1 = newRack

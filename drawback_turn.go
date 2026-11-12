@@ -49,6 +49,8 @@ type DrawbackMovesRequest struct {
 	Quadrant    *int   `json:"quadrant,omitempty"`
 	Flavor      string `json:"flavor,omitempty"`
 	Highlighted string `json:"highlighted,omitempty"`
+	// Devil On Your Shoulder: the caller's count says this turn must obey.
+	MustObeyDevil bool `json:"mustObeyDevil,omitempty"`
 	// ForBot: pick like a bot - avoid moves that break its own lose rule,
 	// and its own Minefield zones, when it has a safe option. A human is
 	// never stopped from making a losing move (the client warns instead).
@@ -88,6 +90,9 @@ type DrawbackMovesResponse struct {
 	Forced          *bool          `json:"forced,omitempty"`
 	Opened          [][2]int       `json:"opened,omitempty"`
 	Proposed        *DrawbackMove  `json:"proposed,omitempty"`
+	// Devil On Your Shoulder: the devil's suggestion this turn (the worst
+	// word play), so the caller can show it and tell whether it was obeyed.
+	Devil *DrawbackMove `json:"devil,omitempty"`
 	ProposedAllowed bool           `json:"proposedAllowed"`
 	ProposedReason  string         `json:"proposedReason,omitempty"`
 	Debug           string         `json:"debug,omitempty"`
@@ -283,6 +288,7 @@ func judgeDrawbackTurn(req DrawbackMovesRequest) (*DrawbackMovesResponse, error)
 		extras.Quota = req.Quota
 	}
 	extras.Quadrant = req.Quadrant
+	extras.MustObeyDevil = req.MustObeyDevil
 	extras.Flavor = req.Flavor
 	extras.Highlighted = req.Highlighted
 	if rule.Type == "mustCoverOpenedPremium" && len(req.BoardBeforeLastPlay) == 15 {
@@ -340,6 +346,12 @@ func judgeDrawbackTurn(req DrawbackMovesRequest) (*DrawbackMovesResponse, error)
 	sort.SliceStable(allowed, func(i, j int) bool { return allowed[i].total > allowed[j].total })
 
 	resp := &DrawbackMovesResponse{Debug: debug, Moves: []DrawbackMove{}}
+	if rule.Type == "obeyDevil" {
+		if devil := devilMove(all); devil != nil {
+			m := toDrawbackMove(devil, bd, fullScores)
+			resp.Devil = &m
+		}
+	}
 	for i := range allowed {
 		if allowed[i].isExchange {
 			resp.CanExchange = true
