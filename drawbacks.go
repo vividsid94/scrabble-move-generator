@@ -370,6 +370,17 @@ var drawbacks = []DrawbackDef{
 		// caller works out whether this is a must-obey turn from the game
 		// so far (drawbackExtras.MustObeyDevil); Value is the cycle length.
 		Rule: DrawbackRule{Type: "obeyDevil", Value: 4}},
+	// -- Batch 4: rack changes.
+	{ID: 41, Name: "Short-handed", NameSource: "friend",
+		Description: "Your rack only holds 6 tiles.",
+		// Not a move rule: whoever deals and refills racks reads Value
+		// (rackSizeFor here for the Sandbox, the game server for Play).
+		Rule: DrawbackRule{Type: "shortHanded", Value: 6}},
+	{ID: 60, Name: "Restlessness", NameSource: "friend",
+		Description: "A tile can't stay on your rack for more than 2 turns. When its count hits 0 you must play or exchange it - and if you can't, pass.",
+		// Each tile's count comes from the turn history (restlessTimers):
+		// Value turns, then it has to go. Exchanges are judged too.
+		Rule: DrawbackRule{Type: "restlessTiles", Value: 2, AppliesToExchanges: true}},
 	{ID: 61, Name: "Copy Cat", NameSource: "friend",
 		Description: "If your opponent plays a tile you have, you must use every copy of it on your rack, or exchange or pass. A blank counts as a blank, whatever letter it was.",
 		Rule:        DrawbackRule{Type: "useOpponentLetters"}},
@@ -1572,6 +1583,15 @@ func evaluateDrawback(rule DrawbackRule, c *scoredCandidate, preMoveRack string,
 		}
 		return true
 
+	// Restlessness: every rack tile whose count is down to 0 has to be used
+	// - played, or exchanged.
+	case "restlessTiles":
+		used := c.exchangeTiles
+		if !c.isExchange {
+			used = newlyUsedLetters(c.detailed.Tiles)
+		}
+		return containsLetters(used, restlessDue(turns, currentPlayer, preMoveRack, int(rule.Value)))
+
 	// Frontload: the cap drops by Step for each of the player's earlier
 	// turns, down to MinScore.
 	case "shrinkingScoreCap":
@@ -1653,6 +1673,93 @@ func evaluateDrawback(rule DrawbackRule, c *scoredCandidate, preMoveRack string,
 		// to check.
 		return true
 	}
+}
+
+// RestlessTile (Restlessness): one rack tile and how many more of the
+// player's turns it may stay ("?" for a blank).
+type RestlessTile struct {
+	Letter string `json:"letter"`
+	Timer  int    `json:"timer"`
+}
+
+// restlessTimers works out each tile's count on rack from the history:
+// every tile arrives with maxAge; each of the player's turns it survives
+// (kept through a play, an exchange or a pass) takes one off, down to 0.
+// Identical letters are interchangeable, so a played or exchanged letter
+// always counts as the oldest copy - the kindest reading for the player.
+func restlessTimers(turns []SimTurn, player int, rack string, maxAge int) []RestlessTile {
+	var held []RestlessTile
+	for _, t := range turns {
+		if t.Player != player {
+			continue
+		}
+		current := withArrivals(held, t.RackBefore, maxAge)
+		used := ""
+		switch t.Type {
+		case "play":
+			used = newlyUsedLetters(t.Tiles)
+		case "exchange":
+			used = t.TilesExchanged
+		}
+		held = held[:0:0]
+		for _, tile := range removeOldestFirst(current, used) {
+			if tile.Timer > 0 {
+				tile.Timer--
+			}
+			held = append(held, tile)
+		}
+	}
+	return withArrivals(held, rack, maxAge)
+}
+
+// withArrivals: the tiles on rack - the held ones still there, oldest
+// first, and anything else as a new arrival with maxAge.
+func withArrivals(held []RestlessTile, rack string, maxAge int) []RestlessTile {
+	sorted := append([]RestlessTile{}, held...)
+	sort.SliceStable(sorted, func(i, j int) bool { return sorted[i].Timer < sorted[j].Timer })
+	left := []rune(rack)
+	var out []RestlessTile
+	for _, tile := range sorted {
+		for i, r := range left {
+			if string(r) == tile.Letter {
+				out = append(out, tile)
+				left = append(left[:i], left[i+1:]...)
+				break
+			}
+		}
+	}
+	for _, r := range left {
+		out = append(out, RestlessTile{Letter: string(r), Timer: maxAge})
+	}
+	return out
+}
+
+// removeOldestFirst takes one tile per letter in used, the lowest count first.
+func removeOldestFirst(tiles []RestlessTile, used string) []RestlessTile {
+	out := append([]RestlessTile{}, tiles...)
+	for _, r := range used {
+		best := -1
+		for i, tile := range out {
+			if tile.Letter == string(r) && (best == -1 || tile.Timer < out[best].Timer) {
+				best = i
+			}
+		}
+		if best >= 0 {
+			out = append(out[:best], out[best+1:]...)
+		}
+	}
+	return out
+}
+
+// restlessDue: the rack letters whose count is 0 this turn.
+func restlessDue(turns []SimTurn, player int, rack string, maxAge int) string {
+	due := ""
+	for _, tile := range restlessTimers(turns, player, rack, maxAge) {
+		if tile.Timer == 0 {
+			due += tile.Letter
+		}
+	}
+	return due
 }
 
 // ownTurnCount: how many turns (plays, exchanges, passes) the player has

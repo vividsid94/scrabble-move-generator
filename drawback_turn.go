@@ -93,6 +93,8 @@ type DrawbackMovesResponse struct {
 	// Devil On Your Shoulder: the devil's suggestion this turn (the worst
 	// word play), so the caller can show it and tell whether it was obeyed.
 	Devil *DrawbackMove `json:"devil,omitempty"`
+	// Restlessness: each rack tile's count.
+	Timers []RestlessTile `json:"timers,omitempty"`
 	ProposedAllowed bool           `json:"proposedAllowed"`
 	ProposedReason  string         `json:"proposedReason,omitempty"`
 	Debug           string         `json:"debug,omitempty"`
@@ -346,6 +348,9 @@ func judgeDrawbackTurn(req DrawbackMovesRequest) (*DrawbackMovesResponse, error)
 	sort.SliceStable(allowed, func(i, j int) bool { return allowed[i].total > allowed[j].total })
 
 	resp := &DrawbackMovesResponse{Debug: debug, Moves: []DrawbackMove{}}
+	if rule.Type == "restlessTiles" {
+		resp.Timers = restlessTimers(req.Turns, req.Player, req.Rack, int(rule.Value))
+	}
 	if rule.Type == "obeyDevil" {
 		if devil := devilMove(all); devil != nil {
 			m := toDrawbackMove(devil, bd, fullScores)

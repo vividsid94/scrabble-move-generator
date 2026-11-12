@@ -46,6 +46,17 @@ import (
 	"github.com/domino14/word-golib/tilemapping"
 )
 
+// rackSizeFor: how many tiles a bot's rack holds - 7, or a Short-handed
+// drawback's Value.
+func rackSizeFor(bot BotConfig) int {
+	if bot.DrawbackID != nil {
+		if def, ok := drawbackByID[*bot.DrawbackID]; ok && def.Rule.Type == "shortHanded" {
+			return int(def.Rule.Value)
+		}
+	}
+	return 7
+}
+
 // reachableSquares is every square some word play in moves (generated on
 // bd) puts a new tile on - I'll Take That's "what can this rack reach".
 func reachableSquares(moves []*macondomove.Move, bd *board.GameBoard, alph *tilemapping.TileMapping) map[rcPos]bool {
@@ -605,9 +616,9 @@ func simulateOneGame(gd *kwg.KWG, player1Bot, player2Bot BotConfig) SimGameResul
 	bd.UpdateAllAnchors()
 
 	pool := standardTilePool
-	rack1 := drawRandomTiles(pool, 7)
+	rack1 := drawRandomTiles(pool, rackSizeFor(player1Bot))
 	pool = removeRackFromPool(pool, rack1)
-	rack2 := drawRandomTiles(pool, 7)
+	rack2 := drawRandomTiles(pool, rackSizeFor(player2Bot))
 	pool = removeRackFromPool(pool, rack2)
 
 	score1, score2 := 0, 0
@@ -983,7 +994,7 @@ func simulateOneGame(gd *kwg.KWG, player1Bot, player2Bot BotConfig) SimGameResul
 			consecutiveScoreless++
 
 			rackAfterRemoval := removeRackFromPool(currentRack, chosen.exchangeTiles)
-			needed := 7 - len([]rune(rackAfterRemoval))
+			needed := rackSizeFor(currentBot) - len([]rune(rackAfterRemoval))
 			drawn := drawRandomTiles(pool, needed)
 			pool = removeRackFromPool(pool, drawn)
 			pool = pool + chosen.exchangeTiles
@@ -1022,7 +1033,7 @@ func simulateOneGame(gd *kwg.KWG, player1Bot, player2Bot BotConfig) SimGameResul
 				}
 			}
 			rackAfterRemoval := removeRackFromPool(currentRack, strings.Join(used, ""))
-			needed := 7 - len([]rune(rackAfterRemoval))
+			needed := rackSizeFor(currentBot) - len([]rune(rackAfterRemoval))
 			drawn := drawRandomTiles(pool, needed)
 			pool = removeRackFromPool(pool, drawn)
 			newRack = sortLeaveString(rackAfterRemoval + drawn)
