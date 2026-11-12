@@ -158,7 +158,7 @@ var drawbacks = []DrawbackDef{
 	{ID: 15, Name: "Modesty", NameSource: "claude",
 		Description: "Can't score more than 40 points on a turn.",
 		Rule:        DrawbackRule{Type: "score", Comparator: "lte", Value: 40}},
-	{ID: 16, Name: "UV Gotta Be Kidding", NameSource: "friend",
+	{ID: 16, Name: "Negative Nancy", NameSource: "friend",
 		Description: "Must keep a leave with negative valuation every turn - unless you empty your rack.",
 		// AppliesToExchanges: true - confirmed for real against rack
 		// ?DEOPRT that without it, the bot exchanges into a strongly
@@ -207,7 +207,7 @@ var drawbacks = []DrawbackDef{
 	{ID: 26, Name: "Lone Wolf", NameSource: "claude",
 		Description: "Your plays can only make one word - no cross-words.",
 		Rule:        DrawbackRule{Type: "wordsFormedCount", Comparator: "eq", Value: 1}},
-	{ID: 27, Name: "Diamond In The Rough", NameSource: "friend",
+	{ID: 27, Name: "Settle For Less", NameSource: "friend",
 		Description: "Can't play either of the top 2 equity plays.",
 		Rule:        DrawbackRule{Type: "excludeTopNCandidates", N: 2}},
 	{ID: 28, Name: "Feel My Power", NameSource: "friend",
@@ -287,7 +287,7 @@ var drawbacks = []DrawbackDef{
 	{ID: 34, Name: "Time Crunch", NameSource: "friend",
 		Description: "Game runs past 25 turns and you lose.",
 		Rule:        DrawbackRule{Type: "loseIfPastTurnLimit", Value: 25}},
-	{ID: 10, Name: "Turnabout Board", NameSource: "friend",
+	{ID: 10, Name: "Sandbagger", NameSource: "friend",
 		Description: "You can't be winning before turn 16.",
 		Rule:        DrawbackRule{Type: "loseIfLeadingBeforeTurn", Value: 16}},
 	{ID: 9, Name: "Vervain", NameSource: "friend",
