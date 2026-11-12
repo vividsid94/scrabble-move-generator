@@ -535,6 +535,17 @@ func zeroedInMustSkip(rule DrawbackRule, poolSize int, turns []SimTurn, player i
 	return needed > 0 && needed >= poolSize/8+1
 }
 
+// drawbackExtras: what filterCandidatesByDrawback needs worked out once per
+// turn, not per candidate. Opened: I'll Take That's opened squares. Blocked
+// and Quota: Shifting Sands' squares (row*15+col) and Quota's two numbers
+// when the caller rolled them (a server game); nil means roll here (the
+// Sandbox).
+type drawbackExtras struct {
+	Opened  map[rcPos]bool
+	Blocked map[int]bool
+	Quota   []int
+}
+
 // openedPremiumSquares (I'll Take That): the empty premium squares in
 // reachNow (squares this player's rack can put a tile on with a legal play
 // now) that weren't in reachBefore (the same rack, on the board before the
@@ -1476,9 +1487,9 @@ func evaluateDrawback(rule DrawbackRule, c *scoredCandidate, preMoveRack string,
 // game log can be checked by eye ("needed 3 or 6 tiles, played 3") instead
 // of having to trust the filter blindly - see simulate.go's own call site.
 //
-// opened: I'll Take That's opened squares this turn (openedPremiumSquares);
-// nil for every other rule.
-func filterCandidatesByDrawback(candidates []scoredCandidate, rule DrawbackRule, preMoveRack string, bd *board.GameBoard, poolSizeBefore int, turns []SimTurn, currentPlayer int, opened map[rcPos]bool) ([]scoredCandidate, string) {
+// extras: things worked out once per turn by the caller - see drawbackExtras.
+func filterCandidatesByDrawback(candidates []scoredCandidate, rule DrawbackRule, preMoveRack string, bd *board.GameBoard, poolSizeBefore int, turns []SimTurn, currentPlayer int, extras drawbackExtras) ([]scoredCandidate, string) {
+	opened := extras.Opened
 	// I'll Take That (forcing): if any play covers an opened square, the
 	// plays collapse to those; exchanges always stay in.
 	if rule.Type == "mustCoverOpenedPremium" {
@@ -1632,6 +1643,11 @@ func filterCandidatesByDrawback(candidates []scoredCandidate, rule DrawbackRule,
 		for _, sq := range others[:blockedCount] {
 			blocked[sq] = true
 		}
+		// A server game rolls its own squares (and keeps them) - use those.
+		if extras.Blocked != nil {
+			blocked = extras.Blocked
+			blockedCount = len(blocked)
+		}
 		filtered := make([]scoredCandidate, 0, len(candidates))
 		for i := range candidates {
 			c := &candidates[i]
@@ -1656,6 +1672,10 @@ func filterCandidatesByDrawback(candidates []scoredCandidate, rule DrawbackRule,
 	if rule.Type == "randomTileCountQuota" {
 		n1 := rand.Intn(7) + 1
 		n2 := rand.Intn(7) + 1
+		// A server game rolls its own numbers (and keeps them) - use those.
+		if len(extras.Quota) == 2 {
+			n1, n2 = extras.Quota[0], extras.Quota[1]
+		}
 		filtered := make([]scoredCandidate, 0, len(candidates))
 		for i := range candidates {
 			n := drawnTileCount(&candidates[i])

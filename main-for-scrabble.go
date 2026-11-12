@@ -364,6 +364,8 @@ func main() {
 	http.HandleFunc("/simulate-series", simulateSeriesHandler)
 	http.HandleFunc("/board-metrics", boardMetricsHandler)
 	http.HandleFunc("/bot-turn", botTurnHandler)
+	http.HandleFunc("/drawback-moves", drawbackMovesHandler)
+	http.HandleFunc("/drawback-loss", drawbackLossHandler)
 	http.HandleFunc("/proxy", proxyHandler)
 
 	port := os.Getenv("PORT")

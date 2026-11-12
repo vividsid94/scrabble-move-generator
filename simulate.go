@@ -774,7 +774,7 @@ func simulateOneGame(gd *kwg.KWG, player1Bot, player2Bot BotConfig) SimGameResul
 					reachBefore := reachableSquares(movegen.NewGordonGenerator(gd, boardBeforeLastPlay, ld).GenAll(rack, false), boardBeforeLastPlay, alph)
 					opened = openedPremiumSquares(turns, currentPlayer, bd, reachableSquares(rawMoves, bd, alph), reachBefore)
 				}
-				candidates, drawbackDebug = filterCandidatesByDrawback(candidates, def.Rule, currentRack, bd, len(pool), turns, currentPlayer, opened)
+				candidates, drawbackDebug = filterCandidatesByDrawback(candidates, def.Rule, currentRack, bd, len(pool), turns, currentPlayer, drawbackExtras{Opened: opened})
 			}
 		}
 
