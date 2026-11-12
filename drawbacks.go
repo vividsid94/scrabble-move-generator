@@ -156,8 +156,8 @@ var drawbacks = []DrawbackDef{
 		Description: "Can't play words longer than 5 letters.",
 		Rule:        DrawbackRule{Type: "wordLength", Comparator: "lte", Value: 5}},
 	{ID: 15, Name: "Modesty", NameSource: "claude",
-		Description: "Can't score more than 35 points on a turn.",
-		Rule:        DrawbackRule{Type: "score", Comparator: "lte", Value: 35}},
+		Description: "Can't score more than 40 points on a turn.",
+		Rule:        DrawbackRule{Type: "score", Comparator: "lte", Value: 40}},
 	{ID: 16, Name: "UV Gotta Be Kidding", NameSource: "friend",
 		Description: "Must keep a leave with negative valuation every turn - unless you empty your rack.",
 		// AppliesToExchanges: true - confirmed for real against rack
@@ -176,8 +176,8 @@ var drawbacks = []DrawbackDef{
 		Description: "Can't score an even amount of points on a turn.",
 		Rule:        DrawbackRule{Type: "scoreParity", Parity: "odd"}},
 	{ID: 35, Name: "Kingly Sum", NameSource: "friend",
-		Description: "Main word's tiles must add up to at least 10.",
-		Rule:        DrawbackRule{Type: "tileValueSum", Comparator: "gte", Value: 10}},
+		Description: "You can only play main words whose tiles add up to at least 7.",
+		Rule:        DrawbackRule{Type: "tileValueSum", Comparator: "gte", Value: 7}},
 	{ID: 37, Name: "Gone Fishing", NameSource: "friend",
 		Description: "Can only play 1, 2, or 7 tiles on a turn.",
 		Rule:        DrawbackRule{Type: "tileCount", In: []int{1, 2, 7}}},
@@ -190,7 +190,7 @@ var drawbacks = []DrawbackDef{
 		Description: "Can't play horizontally (1-tile plays exempt).",
 		Rule:        DrawbackRule{Type: "direction", Forbid: "horizontal"}},
 	{ID: 4, Name: "Plurality", NameSource: "friend",
-		Description: "If you hold an S or blank, you can only play one tile.",
+		Description: "If you have an S or blank on your rack, you can only play one tile.",
 		Rule:        DrawbackRule{Type: "rackHasAnyLimitsTileCount", RackLetters: "S?", MaxTiles: 1}},
 	{ID: 5, Name: "Strength in Numbers", NameSource: "claude",
 		Description: "Can only play an E if you have 3 or more E's on your rack.",
@@ -201,7 +201,7 @@ var drawbacks = []DrawbackDef{
 	{ID: 11, Name: "Double Trouble", NameSource: "friend",
 		Description: "Can't play a tile on a DWS or DLS square (the center star is fine).",
 		Rule:        DrawbackRule{Type: "forbiddenSquareTypes", Types: []string{"DWS", "DLS"}, ExemptCenter: true}},
-	{ID: 22, Name: "Laureations", NameSource: "friend",
+	{ID: 22, Name: "Humble Beginnings", NameSource: "claude",
 		Description: "Main word can't start with a tile worth more than 1 point.",
 		Rule:        DrawbackRule{Type: "firstTileValueLimit", MaxValue: 1}},
 	{ID: 26, Name: "Lone Wolf", NameSource: "claude",
@@ -211,7 +211,7 @@ var drawbacks = []DrawbackDef{
 		Description: "Can't play either of the top 2 equity plays.",
 		Rule:        DrawbackRule{Type: "excludeTopNCandidates", N: 2}},
 	{ID: 28, Name: "Feel My Power", NameSource: "friend",
-		Description: "Can't play S, J, K, Q, X, Z, or a blank unless you score 50+.",
+		Description: "You can't play S, J, K, Q, X, Z, or ? unless you score at least 50.",
 		Rule:        DrawbackRule{Type: "restrictedTileSetScoreFloor", Letters: "SJKQXZ?", MinScore: 50}},
 	{ID: 32, Name: "Parallel Play", NameSource: "friend",
 		Description: "Plays must form 3+ words, or 2+ once the bag is empty.",
@@ -266,13 +266,13 @@ var drawbacks = []DrawbackDef{
 		// turn's list, not re-rolled per candidate.
 		Rule: DrawbackRule{Type: "randomTileCountQuota"}},
 	{ID: 39, Name: "Well Aged", NameSource: "friend",
-		Description: "Can't play a tile you drew after your last turn.",
+		Description: "If you scored points on your last turn, you can't play any of the tiles you just drew. Bingos are always allowed.",
 		Rule:        DrawbackRule{Type: "cannotPlayFreshlyDrawnTile"}},
 	{ID: 33, Name: "Here For A Good Time", NameSource: "friend",
-		Description: "Only 40 tiles may ever leave your rack, for the whole game (exchanges count).",
-		// AppliesToExchanges: an exchange's tiles leave the rack too, so it
-		// has to fit the remaining allowance like a play does.
-		Rule: DrawbackRule{Type: "maxTilesLeaveRack", MaxTiles: 40, AppliesToExchanges: true}},
+		Description: "You can only place 40 tiles on the board, for the whole game.",
+		// Counts only tiles placed on the board; exchanges are free (the
+		// type name is from when they counted too).
+		Rule: DrawbackRule{Type: "maxTilesLeaveRack", MaxTiles: 40}},
 	{ID: 7, Name: "Shifting Sands", NameSource: "claude",
 		Description: "50% of squares are off-limits, re-randomized every turn (never the center star).",
 		// Rolled in filterCandidatesByDrawback's own special case - one
@@ -305,7 +305,7 @@ var drawbacks = []DrawbackDef{
 	{ID: 19, Name: "Border Patrol", NameSource: "claude",
 		Description: "Fewer than 5 of your tiles in row 1, or in row 15, by game end and you lose.",
 		Rule:        DrawbackRule{Type: "loseIfFewTilesInRows", Rows: []int{0, 14}, Value: 5}},
-	{ID: 38, Name: "Claustrophobia", NameSource: "friend",
+	{ID: 38, Name: "Minefield", NameSource: "friend",
 		Description: "A random 3x3 zone touching the board's edge is set at game start; whoever plays inside it loses.",
 		// The zone is rolled per game in simulateOneGame (rollClaustroZone)
 		// and applies to BOTH players - see claustroLoss.
@@ -615,7 +615,7 @@ func squareName(row, col int) string {
 	return fmt.Sprintf("%c%d", 'A'+col, row+1)
 }
 
-// claustroZone is Claustrophobia's 3x3 zone, by its top-left square, and
+// claustroZone is Minefield's 3x3 zone, by its top-left square, and
 // the player whose drawback it is. Only that player knows where it is (it
 // would give the drawback away), but it applies to both.
 type claustroZone struct {
@@ -912,24 +912,18 @@ func lastTurnByPlayer(turns []SimTurn, player int) *SimTurn {
 	return nil
 }
 
-// tilesLeftRackTotal is how many tiles have left player's rack so far this
-// game: every play's new tiles plus every exchange's returned tiles (Here
-// For A Good Time).
-func tilesLeftRackTotal(turns []SimTurn, player int) int {
+// tilesPlacedTotal is how many tiles player has placed on the board so far
+// this game (Here For A Good Time). Exchanges don't count.
+func tilesPlacedTotal(turns []SimTurn, player int) int {
 	total := 0
 	for _, t := range turns {
-		if t.Player != player {
+		if t.Player != player || t.Type != "play" {
 			continue
 		}
-		switch t.Type {
-		case "play":
-			for _, tile := range t.Tiles {
-				if tile.IsNew {
-					total++
-				}
+		for _, tile := range t.Tiles {
+			if tile.IsNew {
+				total++
 			}
-		case "exchange":
-			total += len([]rune(t.TilesExchanged))
 		}
 	}
 	return total
@@ -1314,10 +1308,11 @@ func evaluateDrawback(rule DrawbackRule, c *scoredCandidate, preMoveRack string,
 	// means everything already in hand is aged by definition. Exchanges
 	// themselves stay allowed (no AppliesToExchanges on this rule) - this
 	// is about which tiles get PLACED, not which get discarded.
-	// Here For A Good Time: this move's tiles (placed or exchanged) must fit
-	// in what's left of the player's whole-game allowance.
+	// Here For A Good Time: this play's tiles must fit in what's left of the
+	// player's whole-game allowance of tiles placed. Exchanges never reach
+	// here (no AppliesToExchanges), so they're free.
 	case "maxTilesLeaveRack":
-		return tilesLeftRackTotal(turns, currentPlayer)+drawnTileCount(c) <= rule.MaxTiles
+		return tilesPlacedTotal(turns, currentPlayer)+newTileCount(c) <= rule.MaxTiles
 
 	// I'll Take That (forcing): does this play put a new tile on a square
 	// the opponent's last play opened?
@@ -1330,19 +1325,19 @@ func evaluateDrawback(rule DrawbackRule, c *scoredCandidate, preMoveRack string,
 		}
 		return false
 
+	// Well Aged: only after a scoring play - an exchange, a pass or a
+	// 0-point play lifts it for the next turn, so it can't trap anyone in
+	// an exchange loop. A bingo (all 7 tiles) is always allowed. Otherwise
+	// every new tile must come from what was kept through that play.
 	case "cannotPlayFreshlyDrawnTile":
-		last := lastTurnByPlayer(turns, currentPlayer)
-		if last == nil {
+		if newTileCount(c) == 7 {
 			return true
 		}
-		left := ""
-		switch last.Type {
-		case "play":
-			left = newlyUsedLetters(last.Tiles)
-		case "exchange":
-			left = last.TilesExchanged
+		last := lastTurnByPlayer(turns, currentPlayer)
+		if last == nil || last.Type != "play" || last.Score <= 0 {
+			return true
 		}
-		agedRack := removeRackFromPool(last.RackBefore, left)
+		agedRack := removeRackFromPool(last.RackBefore, newlyUsedLetters(last.Tiles))
 		for _, t := range c.detailed.Tiles {
 			if !t.IsNew {
 				continue

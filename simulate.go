@@ -509,7 +509,7 @@ type SimGameResult struct {
 	// keeps their score at that moment.
 	LossPlayer int    `json:"lossPlayer,omitempty"`
 	LossReason string `json:"lossReason,omitempty"`
-	// Claustrophobia zones in play this game (one per holder).
+	// Minefield zones in play this game (one per holder).
 	ClaustroZones []claustroZone `json:"claustroZones,omitempty"`
 }
 
@@ -601,7 +601,7 @@ func simulateOneGame(gd *kwg.KWG, player1Bot, player2Bot BotConfig) SimGameResul
 	endReason := ""
 	lossPlayer, lossReason := 0, ""
 
-	// Claustrophobia: each holder's 3x3 zone, rolled once per game. It
+	// Minefield: each holder's 3x3 zone, rolled once per game. It
 	// applies to BOTH players - whoever places a tile inside loses - but only
 	// its holder knows where it is.
 	var claustroZones []claustroZone
@@ -750,7 +750,7 @@ func simulateOneGame(gd *kwg.KWG, player1Bot, player2Bot BotConfig) SimGameResul
 			}
 		}
 
-		// A bot avoids its OWN Claustrophobia zone when it has a safe option.
+		// A bot avoids its OWN Minefield zone when it has a safe option.
 		// It doesn't know where the opponent's zone is, so it can walk in.
 		var ownZones []claustroZone
 		for _, z := range claustroZones {
@@ -1010,7 +1010,7 @@ func simulateOneGame(gd *kwg.KWG, player1Bot, player2Bot BotConfig) SimGameResul
 		// opponent's move or on the turn count, not just on your own move.
 		gameEnding := (len(newRack) == 0 && len(pool) == 0) || consecutiveScoreless >= 6
 		if turn.Type == "play" && placesInZone(turn.Tiles, claustroZones) {
-			lossPlayer, lossReason = currentPlayer, "Claustrophobia: played inside the zone"
+			lossPlayer, lossReason = currentPlayer, "Minefield: played inside the zone"
 		}
 		for _, holder := range []int{currentPlayer, 3 - currentPlayer} {
 			if lossPlayer != 0 {
