@@ -90,6 +90,9 @@ type DrawbackRule struct {
 
 	Letters  string `json:"letters,omitempty"` // restrictedTileSetScoreFloor
 	MinScore int    `json:"minScore,omitempty"`
+	// BlankMinScore (restrictedTileSetScoreFloor): a blank's own floor, when
+	// it differs from MinScore (Feel My Power: 70).
+	BlankMinScore int `json:"blankMinScore,omitempty"`
 
 	// Forcing (category C - see the ledger) flips filterCandidatesByDrawback's
 	// own aggregation policy for this rule: instead of dropping candidates
@@ -211,8 +214,8 @@ var drawbacks = []DrawbackDef{
 		Description: "Can't play either of the top 2 equity plays.",
 		Rule:        DrawbackRule{Type: "excludeTopNCandidates", N: 2}},
 	{ID: 28, Name: "Feel My Power", NameSource: "friend",
-		Description: "You can't play S, J, K, Q, X, Z, or ? unless you score at least 50.",
-		Rule:        DrawbackRule{Type: "restrictedTileSetScoreFloor", Letters: "SJKQXZ?", MinScore: 50}},
+		Description: "You can't play S, J, K, Q, X or Z unless you score at least 50, or ? unless you score at least 70.",
+		Rule:        DrawbackRule{Type: "restrictedTileSetScoreFloor", Letters: "SJKQXZ?", MinScore: 50, BlankMinScore: 70}},
 	{ID: 32, Name: "Parallel Play", NameSource: "friend",
 		Description: "Plays must form 3+ words, or 2+ once the bag is empty.",
 		Rule:        DrawbackRule{Type: "wordsFormedCount", Comparator: "gte", Value: 3, ValueWhenBagEmpty: 2}},
@@ -228,7 +231,7 @@ var drawbacks = []DrawbackDef{
 
 	// -- Category C: forcing --
 	{ID: 29, Name: "Zyzzyva", NameSource: "friend",
-		Description: "If a legal play starts with your rack's last-alphabetical tile, you must make it.",
+		Description: "If you can play a word that starts with your rack's last-alphabetical tile (placed by you), you must - or exchange or pass.",
 		Rule:        DrawbackRule{Type: "startsWithLastAlphabeticalRackTile", Forcing: true}},
 	{ID: 30, Name: "Fynbos", NameSource: "friend",
 		Description: "If you can play exactly 6 tiles, you must.",
@@ -258,7 +261,7 @@ var drawbacks = []DrawbackDef{
 		// exchanges (or a pass) remain.
 		Rule: DrawbackRule{Type: "exceedOpponentLastPlayTileCount"}},
 	{ID: 23, Name: "Alphabet Soup", NameSource: "claude",
-		Description: "Every word you play must start with a letter you haven't started a word with before.",
+		Description: "Every word you form, cross-words included, must start with a letter you haven't started a word with before.",
 		Rule:        DrawbackRule{Type: "uniqueStartingLetterPerWord"}},
 	{ID: 14, Name: "Quota", NameSource: "claude",
 		Description: "Randomly assigned 2 numbers 1-7 each turn; must use exactly that many tiles (exchanges count).",
@@ -321,9 +324,10 @@ var drawbacks = []DrawbackDef{
 		// Lose rule, judged at game end: exchanges and passes both count.
 		Rule: DrawbackRule{Type: "loseIfFewExchangesOrPasses", Value: 6}},
 	{ID: 25, Name: "I'll Take That", NameSource: "friend",
-		Description: "If your opponent's play opens a bonus square you can reach, you must play there.",
-		// Forcing: "opened" = an empty premium square right next to a tile
-		// the opponent placed on their immediately preceding turn.
+		Description: "If your opponent's play opens up a bonus square you can now reach with a word, you must cover it - or exchange or pass.",
+		// Forcing. "Opened" (2026-11-12) = an empty premium square this
+		// player's rack can cover with a legal play now but couldn't have
+		// before the opponent's last play - see openedPremiumSquares.
 		Rule: DrawbackRule{Type: "mustCoverOpenedPremium", Forcing: true}},
 	{ID: 17, Name: "Nerf War", NameSource: "friend",
 		Description: "Tiles you place score 1 point on the turn you place them (blanks 0). Once on the board they're worth their usual value, to both players. Hidden from your opponent until the game ends.",
@@ -529,10 +533,12 @@ func zeroedInMustSkip(rule DrawbackRule, poolSize int, turns []SimTurn, player i
 	return needed > 0 && needed >= poolSize/8+1
 }
 
-// openedPremiumSquares: the empty premium squares right next to a tile the
-// opponent placed on the immediately preceding turn (I'll Take That). None
-// when that turn wasn't the opponent's play.
-func openedPremiumSquares(turns []SimTurn, player int, bd *board.GameBoard) map[rcPos]bool {
+// openedPremiumSquares (I'll Take That): the empty premium squares in
+// reachNow (squares this player's rack can put a tile on with a legal play
+// now) that weren't in reachBefore (the same rack, on the board before the
+// opponent's last play). None when the last turn wasn't the opponent's
+// play. simulate.go builds both sets with reachableSquares.
+func openedPremiumSquares(turns []SimTurn, player int, bd *board.GameBoard, reachNow, reachBefore map[rcPos]bool) map[rcPos]bool {
 	opened := map[rcPos]bool{}
 	if len(turns) == 0 {
 		return opened
@@ -541,15 +547,12 @@ func openedPremiumSquares(turns []SimTurn, player int, bd *board.GameBoard) map[
 	if last.Player == player || last.Type != "play" {
 		return opened
 	}
-	for _, t := range last.Tiles {
-		if !t.IsNew {
+	for pos := range reachNow {
+		if reachBefore[pos] {
 			continue
 		}
-		for _, d := range [][2]int{{-1, 0}, {1, 0}, {0, -1}, {0, 1}} {
-			r, c := t.Row+d[0], t.Col+d[1]
-			if _, ok := premiumTypeAt(r, c, bd); ok {
-				opened[rcPos{r, c}] = true
-			}
+		if _, ok := premiumTypeAt(pos.row, pos.col, bd); ok {
+			opened[pos] = true
 		}
 	}
 	return opened
@@ -910,24 +913,51 @@ func firstTileOf(c *scoredCandidate) MoveTile {
 	return first
 }
 
-// firstTileOfTurn is firstTileOf's own twin for an already-committed
-// SimTurn instead of a live scoredCandidate - Category D's rules need to
-// ask this same question about PAST turns (Alphabet Soup: what letter did
-// I start my last few words with), not just the candidate under
-// evaluation right now.
-func firstTileOfTurn(t SimTurn) MoveTile {
-	tiles := t.Tiles
-	first := tiles[0]
-	for _, tile := range tiles[1:] {
-		if t.Direction == "down" {
-			if tile.Row < first.Row {
-				first = tile
+// wordsFormed is every word candidate c forms: its main word, then the
+// cross word through each new tile, walked on bd (the board before the
+// move). Each word is its tiles in reading order. evaluate.js wordsOfMove,
+// same.
+func wordsFormed(c *scoredCandidate, bd *board.GameBoard) [][]MoveTile {
+	words := [][]MoveTile{c.detailed.Tiles}
+	dr, dc := 1, 0 // cross words run down when the main word runs across
+	if c.detailed.Direction == "down" {
+		dr, dc = 0, 1
+	}
+	for _, t := range c.detailed.Tiles {
+		if !t.IsNew {
+			continue
+		}
+		r, col := t.Row-dr, t.Col-dc
+		for r >= 0 && col >= 0 && bd.GetLetter(r, col) != 0 {
+			r, col = r-dr, col-dc
+		}
+		r, col = r+dr, col+dc
+		var cross []MoveTile
+		for r < 15 && col < 15 {
+			if r == t.Row && col == t.Col {
+				cross = append(cross, t)
+			} else if ml := bd.GetLetter(r, col); ml != 0 {
+				cross = append(cross, MoveTile{Row: r, Col: col, Letter: strings.ToUpper(alph.Letter(ml.Unblank())), IsBlank: ml.IsBlanked()})
+			} else {
+				break
 			}
-		} else if tile.Col < first.Col {
-			first = tile
+			r, col = r+dr, col+dc
+		}
+		if len(cross) > 1 {
+			words = append(words, cross)
 		}
 	}
-	return first
+	return words
+}
+
+// wordStartLetters is the first letter of each word c forms (upper case).
+func wordStartLetters(c *scoredCandidate, bd *board.GameBoard) []string {
+	words := wordsFormed(c, bd)
+	starts := make([]string, len(words))
+	for i, w := range words {
+		starts[i] = strings.ToUpper(w[0].Letter)
+	}
+	return starts
 }
 
 // lastWordPlayByPlayer scans the game's turn history backward for the most
@@ -1207,27 +1237,28 @@ func evaluateDrawback(rule DrawbackRule, c *scoredCandidate, preMoveRack string,
 		return compareFloat(float64(countWordsFormed(c, bd)), rule.Comparator, threshold)
 
 	case "restrictedTileSetScoreFloor":
-		usesRestricted := false
+		// The play must reach the highest floor among the restricted tiles
+		// it places (a blank's is BlankMinScore, when set).
+		floor := 0
 		for _, t := range c.detailed.Tiles {
 			if !t.IsNew {
 				continue
 			}
 			if t.IsBlank {
 				if strings.ContainsRune(rule.Letters, '?') {
-					usesRestricted = true
-					break
+					blankFloor := rule.MinScore
+					if rule.BlankMinScore > 0 {
+						blankFloor = rule.BlankMinScore
+					}
+					floor = max(floor, blankFloor)
 				}
 				continue
 			}
 			if strings.ContainsRune(rule.Letters, []rune(t.Letter)[0]) {
-				usesRestricted = true
-				break
+				floor = max(floor, rule.MinScore)
 			}
 		}
-		if !usesRestricted {
-			return true
-		}
-		return c.detailed.Score >= rule.MinScore
+		return c.detailed.Score >= floor
 
 	case "poolParityAfterMove":
 		drawn := drawnTileCount(c)
@@ -1260,8 +1291,15 @@ func evaluateDrawback(rule DrawbackRule, c *scoredCandidate, preMoveRack string,
 		if lastAlpha == 0 {
 			return false
 		}
-		first := firstTileOf(c)
-		return first.IsNew && !first.IsBlank && first.Letter == string(lastAlpha)
+		// Some word the play forms (main or cross) starts with a tile the
+		// player placed that's that letter (not a blank): T(AR) and H(A)
+		// next to PA count; (TACO)S, (TAR)T and (STAR)T don't.
+		for _, word := range wordsFormed(c, bd) {
+			if first := word[0]; first.IsNew && !first.IsBlank && first.Letter == string(lastAlpha) {
+				return true
+			}
+		}
+		return false
 
 	// Category D ("Stateful"): unlike A/B/C, these need to know something
 	// about turns OTHER than this one - but per drawbacks.go's own header
@@ -1343,12 +1381,21 @@ func evaluateDrawback(rule DrawbackRule, c *scoredCandidate, preMoveRack string,
 	// IS that letter for every other purpose in this codebase (board
 	// storage, scoring), and there's no reason "which letter you started
 	// with" should be the one exception.
+	// Alphabet Soup: every word the play forms (cross-words included)
+	// starts with a different letter, none used to start a word before
+	// (SimTurn.WordStarts, recorded as each play is made).
 	case "uniqueStartingLetterPerWord":
-		first := firstTileOf(c)
+		used := map[string]bool{}
 		for _, t := range allWordPlaysByPlayer(turns, currentPlayer) {
-			if firstTileOfTurn(t).Letter == first.Letter {
+			for _, l := range t.WordStarts {
+				used[l] = true
+			}
+		}
+		for _, l := range wordStartLetters(c, bd) {
+			if used[l] {
 				return false
 			}
+			used[l] = true
 		}
 		return true
 
@@ -1370,16 +1417,10 @@ func evaluateDrawback(rule DrawbackRule, c *scoredCandidate, preMoveRack string,
 	case "maxTilesLeaveRack":
 		return tilesPlacedTotal(turns, currentPlayer)+newTileCount(c) <= rule.MaxTiles
 
-	// I'll Take That (forcing): does this play put a new tile on a square
-	// the opponent's last play opened?
+	// I'll Take That is handled in filterCandidatesByDrawback (it needs the
+	// opened squares, worked out once per turn in simulate.go).
 	case "mustCoverOpenedPremium":
-		opened := openedPremiumSquares(turns, currentPlayer, bd)
-		for _, t := range c.detailed.Tiles {
-			if t.IsNew && opened[rcPos{t.Row, t.Col}] {
-				return true
-			}
-		}
-		return false
+		return true
 
 	// Well Aged: only after a scoring play - an exchange, a pass or a
 	// 0-point play lifts it for the next turn, so it can't trap anyone in
@@ -1432,7 +1473,35 @@ func evaluateDrawback(rule DrawbackRule, c *scoredCandidate, preMoveRack string,
 // once to filter, then gone). Surfaced as SimTurn.DrawbackDebug so a real
 // game log can be checked by eye ("needed 3 or 6 tiles, played 3") instead
 // of having to trust the filter blindly - see simulate.go's own call site.
-func filterCandidatesByDrawback(candidates []scoredCandidate, rule DrawbackRule, preMoveRack string, bd *board.GameBoard, poolSizeBefore int, turns []SimTurn, currentPlayer int) ([]scoredCandidate, string) {
+//
+// opened: I'll Take That's opened squares this turn (openedPremiumSquares);
+// nil for every other rule.
+func filterCandidatesByDrawback(candidates []scoredCandidate, rule DrawbackRule, preMoveRack string, bd *board.GameBoard, poolSizeBefore int, turns []SimTurn, currentPlayer int, opened map[rcPos]bool) ([]scoredCandidate, string) {
+	// I'll Take That (forcing): if any play covers an opened square, the
+	// plays collapse to those; exchanges always stay in.
+	if rule.Type == "mustCoverOpenedPremium" {
+		kept := make([]scoredCandidate, 0, len(candidates))
+		bites := false
+		for i := range candidates {
+			c := &candidates[i]
+			if c.isExchange {
+				kept = append(kept, *c)
+				continue
+			}
+			for _, t := range c.detailed.Tiles {
+				if t.IsNew && opened[rcPos{t.Row, t.Col}] {
+					kept = append(kept, *c)
+					bites = true
+					break
+				}
+			}
+		}
+		if bites {
+			return kept, ""
+		}
+		return candidates, ""
+	}
+
 	// Nerf War: nothing is forbidden - every word play is rescored with the
 	// player's placed tiles worth 1, so the bot picks (and scores) by its
 	// real points. Copies each DetailedMove so the unfiltered snapshot the
@@ -1536,8 +1605,9 @@ func filterCandidatesByDrawback(candidates []scoredCandidate, rule DrawbackRule,
 				qualifying = append(qualifying, *c)
 			}
 		}
+		// Exchanges always stay in (you can always exchange or pass).
 		if len(qualifying) > 0 {
-			return qualifying, ""
+			return append(qualifying, exchanges...), ""
 		}
 		return exchanges, ""
 	}
@@ -1595,22 +1665,23 @@ func filterCandidatesByDrawback(candidates []scoredCandidate, rule DrawbackRule,
 	}
 
 	// Category C ("Forcing"): evaluated backwards from every other rule
-	// here (see DrawbackRule.Forcing's own comment). Collect the word-plays
-	// that qualify (exchanges are never eligible to satisfy a forcing rule -
-	// the player is required to make the qualifying PLAY, not sidestep it
-	// with an exchange); if any exist, the whole list collapses to just
-	// those, exchanges included in the result set. If none qualify, the
-	// rule doesn't bite this turn - return candidates unchanged.
+	// here (see DrawbackRule.Forcing's own comment). If any word-play
+	// qualifies, the plays collapse to just those - but exchanges always
+	// stay in (2026-11-12: you can always exchange or pass unless a rule
+	// says otherwise, e.g. when you don't know the word that fits). If
+	// none qualify, the rule doesn't bite this turn.
 	if rule.Forcing {
 		qualifying := make([]scoredCandidate, 0, len(candidates))
 		for i := range candidates {
 			c := &candidates[i]
-			if !c.isExchange && evaluateDrawback(rule, c, preMoveRack, bd, poolSizeBefore, turns, currentPlayer) {
+			if c.isExchange || evaluateDrawback(rule, c, preMoveRack, bd, poolSizeBefore, turns, currentPlayer) {
 				qualifying = append(qualifying, *c)
 			}
 		}
-		if len(qualifying) > 0 {
-			return qualifying, ""
+		for i := range qualifying {
+			if !qualifying[i].isExchange {
+				return qualifying, ""
+			}
 		}
 		return candidates, ""
 	}

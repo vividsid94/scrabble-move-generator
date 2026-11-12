@@ -46,6 +46,23 @@ import (
 	"github.com/domino14/word-golib/tilemapping"
 )
 
+// reachableSquares is every square some word play in moves (generated on
+// bd) puts a new tile on - I'll Take That's "what can this rack reach".
+func reachableSquares(moves []*macondomove.Move, bd *board.GameBoard, alph *tilemapping.TileMapping) map[rcPos]bool {
+	squares := map[rcPos]bool{}
+	for _, m := range moves {
+		if !strings.Contains(m.String(), "play word:") {
+			continue
+		}
+		for _, t := range toDetailedMove(m, bd, alph).Tiles {
+			if t.IsNew {
+				squares[rcPos{t.Row, t.Col}] = true
+			}
+		}
+	}
+	return squares
+}
+
 //go:embed leaves.json
 var leavesJSONData []byte
 
@@ -425,6 +442,9 @@ type SimTurn struct {
 	RackBefore     string     `json:"rackBefore"`
 	TilesExchanged string     `json:"tilesExchanged,omitempty"`
 	RunningTotal   int        `json:"runningTotal"`
+	// WordStarts (plays only): the first letter of every word the play
+	// formed, cross-words included - Alphabet Soup's memory.
+	WordStarts []string `json:"wordStarts,omitempty"`
 
 	// Only set when this player's bot has LeaveRules AND they actually
 	// changed the outcome this turn - i.e. re-ranking this exact same
@@ -598,6 +618,9 @@ func simulateOneGame(gd *kwg.KWG, player1Bot, player2Bot BotConfig) SimGameResul
 	}
 
 	var turns []SimTurn
+	// The board as it was before the most recent play (I'll Take That
+	// compares what a rack could reach then and now).
+	var boardBeforeLastPlay *board.GameBoard
 	endReason := ""
 	lossPlayer, lossReason := 0, ""
 
@@ -746,7 +769,12 @@ func simulateOneGame(gd *kwg.KWG, player1Bot, player2Bot BotConfig) SimGameResul
 			if def, ok := drawbackByID[*currentBot.DrawbackID]; ok {
 				unfilteredForDrawbackCompare = make([]scoredCandidate, len(candidates))
 				copy(unfilteredForDrawbackCompare, candidates)
-				candidates, drawbackDebug = filterCandidatesByDrawback(candidates, def.Rule, currentRack, bd, len(pool), turns, currentPlayer)
+				var opened map[rcPos]bool
+				if def.Rule.Type == "mustCoverOpenedPremium" && boardBeforeLastPlay != nil {
+					reachBefore := reachableSquares(movegen.NewGordonGenerator(gd, boardBeforeLastPlay, ld).GenAll(rack, false), boardBeforeLastPlay, alph)
+					opened = openedPremiumSquares(turns, currentPlayer, bd, reachableSquares(rawMoves, bd, alph), reachBefore)
+				}
+				candidates, drawbackDebug = filterCandidatesByDrawback(candidates, def.Rule, currentRack, bd, len(pool), turns, currentPlayer, opened)
 			}
 		}
 
@@ -957,8 +985,10 @@ func simulateOneGame(gd *kwg.KWG, player1Bot, player2Bot BotConfig) SimGameResul
 			turn.Direction = chosen.detailed.Direction
 			turn.Tiles = chosen.detailed.Tiles
 			turn.RunningTotal = currentScoreBefore + chosen.detailed.Score
+			turn.WordStarts = wordStartLetters(chosen, bd) // before the tiles go down
 			consecutiveScoreless = 0
 
+			boardBeforeLastPlay = bd.Copy()
 			bd.PlayMove(chosen.move)
 			cross_set.UpdateCrossSetsForMove(bd, chosen.move, gd, ld)
 
