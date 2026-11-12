@@ -246,8 +246,11 @@ var drawbacks = []DrawbackDef{
 		Description: "Must alternate between playing vertically and horizontally.",
 		Rule:        DrawbackRule{Type: "mustAlternateDirection"}},
 	{ID: 18, Name: "Tunnel Vision", NameSource: "friend",
-		Description: "Must play through your opponent's immediately preceding play.",
-		Rule:        DrawbackRule{Type: "mustPlayThroughOpponentLastMove"}},
+		Description: "You must place a tile on a square next to the last word played, by either player (the highlighted squares).",
+		// His option C: the last word that put tiles on the board, by
+		// either player - so a pass doesn't pin you to the opponent's old
+		// word. See tunnelSquares.
+		Rule: DrawbackRule{Type: "mustPlayNextToLastPlay"}},
 	{ID: 24, Name: "Oneupsmanship", NameSource: "friend",
 		Description: "Must use more tiles than your opponent's last play - if you can't, exchange or pass.",
 		// Filtered in filterCandidatesByDrawback's own special case: a
@@ -303,10 +306,10 @@ var drawbacks = []DrawbackDef{
 		Description: "Fewer than 3 plays of 8 or more letters (bingo or not) by game end and you lose.",
 		Rule:        DrawbackRule{Type: "loseIfFewLongPlays", Value: 3, MinLength: 8}},
 	{ID: 20, Name: "Corner Rush", NameSource: "claude",
-		Description: "No tile of yours on A1 by turn 14 and you lose.",
+		Description: "No tile of yours on A1 by turn 14 and you lose. If your opponent takes A1 first, you lose on the spot.",
 		Rule:        DrawbackRule{Type: "loseIfNoTileOnSquareByTurn", Row: 0, Col: 0, Value: 14}},
-	{ID: 19, Name: "Border Patrol", NameSource: "claude",
-		Description: "Fewer than 5 of your tiles in row 1, or in row 15, by game end and you lose.",
+	{ID: 19, Name: "Bookends", NameSource: "friend",
+		Description: "You must have at least 5 tiles in Row 1 and Row 15 by the end of the game or you lose.",
 		Rule:        DrawbackRule{Type: "loseIfFewTilesInRows", Rows: []int{0, 14}, Value: 5}},
 	{ID: 38, Name: "Minefield", NameSource: "friend",
 		Description: "A random 3x3 zone touching the board's edge is set at game start; whoever plays inside it loses.",
@@ -323,7 +326,7 @@ var drawbacks = []DrawbackDef{
 		// the opponent placed on their immediately preceding turn.
 		Rule: DrawbackRule{Type: "mustCoverOpenedPremium", Forcing: true}},
 	{ID: 17, Name: "Nerf War", NameSource: "friend",
-		Description: "All of your tiles score 1 point, hidden from your opponent until the game ends.",
+		Description: "Tiles you place score 1 point on the turn you place them (blanks 0). Once on the board they're worth their usual value, to both players. Hidden from your opponent until the game ends.",
 		// Rescored in filterCandidatesByDrawback's own special case: tiles
 		// you place count 1 (blanks stay 0); tiles already on the board keep
 		// their value; premiums and the bingo bonus still apply.
@@ -434,6 +437,15 @@ func drawbackLossAfterTurn(rule DrawbackRule, turn SimTurn, poolSizeBefore int, 
 			return true, fmt.Sprintf("ahead %d-%d after turn %d", mine, theirs, len(turns))
 		}
 	case "loseIfNoTileOnSquareByTurn":
+		// The opponent taking the square ends it at once - the holder can
+		// never cover it after that.
+		if !byHolder && turn.Type == "play" {
+			for _, t := range turn.Tiles {
+				if t.IsNew && t.Row == rule.Row && t.Col == rule.Col {
+					return true, "the opponent took " + squareName(rule.Row, rule.Col)
+				}
+			}
+		}
 		if float64(len(turns)) == rule.Value && !holderCoveredSquare(turns, holder, rule.Row, rule.Col) {
 			return true, fmt.Sprintf("no tile of yours on %s by turn %d", squareName(rule.Row, rule.Col), len(turns))
 		}
@@ -739,6 +751,36 @@ func compareFloat(actual float64, comparator string, threshold float64) bool {
 // RulesBot-specific, and this is now its only consumer.
 
 type rcPos struct{ row, col int }
+
+// tunnelSquares is Tunnel Vision's target squares: take the last word that
+// put tiles on the board, by either player (its whole main word, including
+// tiles it ran through), and from each of its tiles walk up, down, left and
+// right to the first empty square on bd. nil before any word is on the
+// board (anything goes). evaluate.js tunnelSquares, same.
+func tunnelSquares(turns []SimTurn, bd *board.GameBoard) map[rcPos]bool {
+	steps := [4][2]int{{-1, 0}, {1, 0}, {0, -1}, {0, 1}}
+	inBounds := func(r, c int) bool { return r >= 0 && r < 15 && c >= 0 && c < 15 }
+	for i := len(turns) - 1; i >= 0; i-- {
+		t := turns[i]
+		if t.Type != "play" || newTileCountOf(t.Tiles) == 0 {
+			continue
+		}
+		squares := map[rcPos]bool{}
+		for _, tile := range t.Tiles {
+			for _, d := range steps {
+				r, c := tile.Row+d[0], tile.Col+d[1]
+				for inBounds(r, c) && bd.GetLetter(r, c) != 0 {
+					r, c = r+d[0], c+d[1]
+				}
+				if inBounds(r, c) {
+					squares[rcPos{r, c}] = true
+				}
+			}
+		}
+		return squares
+	}
+	return nil
+}
 
 var twsSquares = map[rcPos]bool{
 	{0, 0}: true, {0, 7}: true, {0, 14}: true,
@@ -1258,20 +1300,15 @@ func evaluateDrawback(rule DrawbackRule, c *scoredCandidate, preMoveRack string,
 	// can run through the opponent's tile without placing anything new
 	// exactly there) shares at least one square with a tile the opponent
 	// placed NEW on their immediately preceding play.
-	case "mustPlayThroughOpponentLastMove":
-		opponent := 1
-		if currentPlayer == 1 {
-			opponent = 2
-		}
-		last := lastWordPlayByPlayer(turns, opponent)
-		if last == nil {
+	// Tunnel Vision: a new tile on one of tunnelSquares.
+	case "mustPlayNextToLastPlay":
+		squares := tunnelSquares(turns, bd)
+		if squares == nil {
 			return true
 		}
 		for _, t := range c.detailed.Tiles {
-			for _, lt := range last.Tiles {
-				if lt.IsNew && lt.Row == t.Row && lt.Col == t.Col {
-					return true
-				}
+			if t.IsNew && squares[rcPos{t.Row, t.Col}] {
+				return true
 			}
 		}
 		return false
