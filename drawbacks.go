@@ -1088,11 +1088,12 @@ func evaluateDrawback(rule DrawbackRule, c *scoredCandidate, preMoveRack string,
 		return false
 
 	case "direction":
-		// Kevin's own exemption: a play that's just one tile long overall
-		// (necessarily the game's opening move - anything later must
-		// connect to existing tiles, which makes it longer than one tile)
-		// has no real direction to forbid.
-		if len(c.detailed.Tiles) <= 1 {
+		// Kevin's own exemption: one-tile plays. Placing a single tile has
+		// no real direction, even when the word it makes runs the forbidden
+		// way (X above an I makes XI down). Count only the NEW tiles -
+		// counting the whole main word refused XI because the I was
+		// already there.
+		if newTileCount(c) <= 1 {
 			return true
 		}
 		if rule.Forbid == "vertical" {
