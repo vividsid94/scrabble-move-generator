@@ -128,6 +128,14 @@ type DrawbackRule struct {
 	// Never extends to exchanges (checked in evaluateDrawback itself, not
 	// here) - exchanging your whole rack away isn't a bingo.
 	AllowEmptyLeave bool `json:"allowEmptyLeave,omitempty"`
+
+	// Step (Frontload): how much the score cap drops each turn (Value is
+	// the first turn's cap, MinScore the floor).
+	Step int `json:"step,omitempty"`
+	// Highlight / Need (Peer Pressure): how many rack tiles are picked each
+	// turn, and how many of them the move has to use.
+	Highlight int `json:"highlight,omitempty"`
+	Need      int `json:"need,omitempty"`
 }
 
 // DrawbackDef pairs one drawback's identity (its game number, name, and
@@ -309,6 +317,47 @@ var drawbacks = []DrawbackDef{
 		Description: "If you can score 60 or more, you must exchange or pass.",
 		// Judged across the whole candidate list in filterCandidatesByDrawback.
 		Rule: DrawbackRule{Type: "noPlaysIfAnyScoresAtLeast", Value: 60}},
+	// -- Batch 2: counters and per-turn rolls.
+	{ID: 42, Name: "Climbing the Ranks", NameSource: "friend",
+		Description: "You must play 1 tile, then 2, then 3, and so on. If you can't play the right number, you drop a rank. Exchanging resets you to 1.",
+		// Judged across the whole list in filterCandidatesByDrawback; the
+		// rank comes from the history (climbRank). MaxTiles caps it.
+		Rule: DrawbackRule{Type: "climbTileCount", MaxTiles: 7}},
+	{ID: 44, Name: "Drop-Zone", NameSource: "friend",
+		Description: "Each turn you're given a random quarter of the board (8x8). You must place a tile in it, or exchange or pass.",
+		// The quarter is rolled per turn (drawbackExtras.Quadrant).
+		Rule: DrawbackRule{Type: "randomQuadrant"}},
+	{ID: 50, Name: "Frontload", NameSource: "friend",
+		Description: "On your first turn you can score at most 120. Each turn after, 10 less - down to 10.",
+		Rule:        DrawbackRule{Type: "shrinkingScoreCap", Value: 120, Step: 10, MinScore: 10}},
+	{ID: 54, Name: "Mood Swings", NameSource: "friend",
+		Description: "A 3-turn cycle: anything goes, then only one consonant, then only one vowel. Exchanging or passing moves the cycle on.",
+		Rule:        DrawbackRule{Type: "moodCycle"}},
+	{ID: 55, Name: "Ghostly Presence", NameSource: "friend",
+		Description: "Every play you make has a 20% chance of scoring 0.",
+		// Not a move rule: the 0 is rolled after the play is chosen (the
+		// game server, and simulateOneGame for the Sandbox).
+		Rule: DrawbackRule{Type: "ghostlyScore", Value: 0.2}},
+	{ID: 56, Name: "Performance Anxiety", NameSource: "friend",
+		Description: "Fewer than 5 turns scoring 40 or more by the end of the game and you lose.",
+		Rule:        DrawbackRule{Type: "loseIfFewBigPlays", Value: 5, MinScore: 40}},
+	{ID: 62, Name: "Flavor Of The Day", NameSource: "friend",
+		Description: "Each turn one kind of bonus square is named (DLS, DWS, TLS or TWS). It's the only bonus square you can use that turn - plain squares are fine.",
+		// The kind is rolled per turn (drawbackExtras.Flavor). The center
+		// star is always fine, so the opening move is possible.
+		Rule: DrawbackRule{Type: "randomBonusFlavor"}},
+	// Peer Pressure, three variants to playtest (his #59): Highlight tiles
+	// picked at random from the rack each turn (drawbackExtras.Highlighted),
+	// and the move - a play or an exchange - must use Need of them.
+	{ID: 100, Name: "Peer Pressure", NameSource: "friend",
+		Description: "Each turn 4 random tiles on your rack are highlighted. You must play or exchange at least 3 of them.",
+		Rule:        DrawbackRule{Type: "useHighlightedTiles", Highlight: 4, Need: 3, AppliesToExchanges: true}},
+	{ID: 101, Name: "Peer Pressure (lite)", NameSource: "friend",
+		Description: "Each turn 3 random tiles on your rack are highlighted. You must play or exchange at least 2 of them.",
+		Rule:        DrawbackRule{Type: "useHighlightedTiles", Highlight: 3, Need: 2, AppliesToExchanges: true}},
+	{ID: 102, Name: "Peer Pressure (big crowd)", NameSource: "friend",
+		Description: "Each turn 5 random tiles on your rack are highlighted. You must play or exchange at least 3 of them.",
+		Rule:        DrawbackRule{Type: "useHighlightedTiles", Highlight: 5, Need: 3, AppliesToExchanges: true}},
 	{ID: 61, Name: "Copy Cat", NameSource: "friend",
 		Description: "If your opponent plays a tile you have, you must use every copy of it on your rack, or exchange or pass. A blank counts as a blank, whatever letter it was.",
 		Rule:        DrawbackRule{Type: "useOpponentLetters"}},
@@ -372,7 +421,7 @@ func isLoseRule(rule DrawbackRule) bool {
 	case "loseIfPlayScoreBelow", "loseIfPastTurnLimit", "loseIfLeadingBeforeTurn",
 		"loseIfOpponentBingos", "loseIfOpponentCoversSquare", "loseIfFewLongPlays",
 		"loseIfNoTileOnSquareByTurn", "loseIfFewTilesInRows", "loseIfPlayInZone",
-		"loseIfFewExchangesOrPasses":
+		"loseIfFewExchangesOrPasses", "loseIfFewBigPlays":
 		return true
 	}
 	return false
@@ -501,6 +550,19 @@ func drawbackLossAfterTurn(rule DrawbackRule, turn SimTurn, poolSizeBefore int, 
 // drawbackLossAtGameEnd reports whether `holder`'s lose rule is broken once
 // the game is over (We All Floater Down Here), and why.
 func drawbackLossAtGameEnd(rule DrawbackRule, turns []SimTurn, holder int) (bool, string) {
+	// Performance Anxiety: fewer than Value plays scoring MinScore or more.
+	if rule.Type == "loseIfFewBigPlays" {
+		count := 0
+		for _, t := range turns {
+			if t.Player == holder && t.Type == "play" && t.Score >= rule.MinScore {
+				count++
+			}
+		}
+		if float64(count) < rule.Value {
+			return true, fmt.Sprintf("only %d play(s) of %d+ points by game end", count, rule.MinScore)
+		}
+		return false, ""
+	}
 	if rule.Type == "loseIfFewExchangesOrPasses" {
 		count := 0
 		for _, t := range turns {
@@ -570,6 +632,12 @@ type drawbackExtras struct {
 	Opened  map[rcPos]bool
 	Blocked map[int]bool
 	Quota   []int
+	// Drop-Zone's quarter (0 top-left, 1 top-right, 2 bottom-left, 3
+	// bottom-right), Flavor Of The Day's kind, Peer Pressure's picked tiles
+	// ("?" for a blank) - nil/"" means roll here (the Sandbox).
+	Quadrant    *int
+	Flavor      string
+	Highlighted string
 }
 
 // openedPremiumSquares (I'll Take That): the empty premium squares in
@@ -1490,6 +1558,37 @@ func evaluateDrawback(rule DrawbackRule, c *scoredCandidate, preMoveRack string,
 		}
 		return true
 
+	// Frontload: the cap drops by Step for each of the player's earlier
+	// turns, down to MinScore.
+	case "shrinkingScoreCap":
+		limit := int(rule.Value) - rule.Step*ownTurnCount(turns, currentPlayer)
+		if limit < rule.MinScore {
+			limit = rule.MinScore
+		}
+		return c.detailed.Score <= limit
+
+	// Mood Swings: the player's own turns so far, mod 3 - 0 anything, 1 at
+	// most one consonant placed, 2 at most one vowel placed.
+	case "moodCycle":
+		consonants, vowels := 0, 0
+		for _, t := range c.detailed.Tiles {
+			if !t.IsNew {
+				continue
+			}
+			if strings.ContainsRune("AEIOU", []rune(strings.ToUpper(t.Letter))[0]) {
+				vowels++
+			} else {
+				consonants++
+			}
+		}
+		switch ownTurnCount(turns, currentPlayer) % 3 {
+		case 1:
+			return consonants <= 1
+		case 2:
+			return vowels <= 1
+		}
+		return true
+
 	// Claustrophobia: no new tile in the outer Value rows or columns.
 	case "forbiddenBorder":
 		depth := int(rule.Value)
@@ -1542,6 +1641,40 @@ func evaluateDrawback(rule DrawbackRule, c *scoredCandidate, preMoveRack string,
 	}
 }
 
+// ownTurnCount: how many turns (plays, exchanges, passes) the player has
+// taken so far. Wally's step-in opener is player 0, so it never counts.
+func ownTurnCount(turns []SimTurn, player int) int {
+	n := 0
+	for _, t := range turns {
+		if t.Player == player {
+			n++
+		}
+	}
+	return n
+}
+
+// climbRank (Climbing the Ranks): how many tiles this turn calls for -
+// one more than the player's last play placed (capped), back to 1 after
+// an exchange, unchanged by a pass, 1 to begin with.
+func climbRank(turns []SimTurn, player, maxTiles int) int {
+	rank := 1
+	for _, t := range turns {
+		if t.Player != player {
+			continue
+		}
+		switch t.Type {
+		case "play":
+			rank = newTileCountOf(t.Tiles) + 1
+		case "exchange":
+			rank = 1
+		}
+	}
+	if rank > maxTiles {
+		rank = maxTiles
+	}
+	return rank
+}
+
 // topRow is the row a play starts on: the smallest row among its tiles.
 func topRow(tiles []MoveTile) int {
 	top := 15
@@ -1580,6 +1713,22 @@ func copyCatRequired(preMoveRack string, turns []SimTurn, player int) string {
 	return string(required)
 }
 
+// lettersInCommon: how many letters a and b share, counting repeats.
+func lettersInCommon(a, b string) int {
+	counts := map[rune]int{}
+	for _, r := range b {
+		counts[r]++
+	}
+	n := 0
+	for _, r := range a {
+		if counts[r] > 0 {
+			counts[r]--
+			n++
+		}
+	}
+	return n
+}
+
 // containsLetters: does have contain every letter of want, counting repeats?
 func containsLetters(have, want string) bool {
 	counts := map[rune]int{}
@@ -1613,6 +1762,117 @@ func containsLetters(have, want string) bool {
 // extras: things worked out once per turn by the caller - see drawbackExtras.
 func filterCandidatesByDrawback(candidates []scoredCandidate, rule DrawbackRule, preMoveRack string, bd *board.GameBoard, poolSizeBefore int, turns []SimTurn, currentPlayer int, extras drawbackExtras) ([]scoredCandidate, string) {
 	opened := extras.Opened
+	// Climbing the Ranks: plays of exactly the rank's tile count; if there
+	// are none, one rank lower, and so on. Exchanges always stay in.
+	if rule.Type == "climbTileCount" {
+		exchanges := make([]scoredCandidate, 0)
+		for _, c := range candidates {
+			if c.isExchange {
+				exchanges = append(exchanges, c)
+			}
+		}
+		for need := climbRank(turns, currentPlayer, rule.MaxTiles); need >= 1; need-- {
+			kept := append([]scoredCandidate{}, exchanges...)
+			found := false
+			for i := range candidates {
+				if !candidates[i].isExchange && newTileCount(&candidates[i]) == need {
+					kept = append(kept, candidates[i])
+					found = true
+				}
+			}
+			if found {
+				return kept, fmt.Sprintf("Climbing the Ranks: %d tiles this turn", need)
+			}
+		}
+		return exchanges, "Climbing the Ranks: no play fits"
+	}
+
+	// Drop-Zone: a play must put a new tile in this turn's quarter.
+	if rule.Type == "randomQuadrant" {
+		q := rand.Intn(4)
+		if extras.Quadrant != nil {
+			q = *extras.Quadrant
+		}
+		rowLo, colLo := 0, 0
+		if q >= 2 {
+			rowLo = 7
+		}
+		if q%2 == 1 {
+			colLo = 7
+		}
+		kept := make([]scoredCandidate, 0, len(candidates))
+		for _, c := range candidates {
+			if c.isExchange {
+				kept = append(kept, c)
+				continue
+			}
+			for _, t := range c.detailed.Tiles {
+				if t.IsNew && t.Row >= rowLo && t.Row <= rowLo+7 && t.Col >= colLo && t.Col <= colLo+7 {
+					kept = append(kept, c)
+					break
+				}
+			}
+		}
+		return kept, fmt.Sprintf("Drop-Zone: quarter %d", q)
+	}
+
+	// Flavor Of The Day: no new tile on a bonus square of any other kind
+	// (the center star is always fine).
+	if rule.Type == "randomBonusFlavor" {
+		flavor := extras.Flavor
+		if flavor == "" {
+			flavor = []string{"DLS", "DWS", "TLS", "TWS"}[rand.Intn(4)]
+		}
+		kept := make([]scoredCandidate, 0, len(candidates))
+		for _, c := range candidates {
+			ok := true
+			if !c.isExchange {
+				for _, t := range c.detailed.Tiles {
+					if !t.IsNew || (t.Row == 7 && t.Col == 7) {
+						continue
+					}
+					if kind, isBonus := premiumTypeAt(t.Row, t.Col, bd); isBonus && kind != flavor {
+						ok = false
+						break
+					}
+				}
+			}
+			if ok {
+				kept = append(kept, c)
+			}
+		}
+		return kept, "Flavor Of The Day: " + flavor
+	}
+
+	// Peer Pressure: the move (a play or an exchange) must use Need of this
+	// turn's highlighted tiles - all of them when fewer are left.
+	if rule.Type == "useHighlightedTiles" {
+		highlighted := extras.Highlighted
+		if highlighted == "" {
+			rack := []rune(preMoveRack)
+			rand.Shuffle(len(rack), func(i, j int) { rack[i], rack[j] = rack[j], rack[i] })
+			if len(rack) > rule.Highlight {
+				rack = rack[:rule.Highlight]
+			}
+			highlighted = string(rack)
+		}
+		need := rule.Need
+		if n := len([]rune(highlighted)); n < need {
+			need = n
+		}
+		kept := make([]scoredCandidate, 0, len(candidates))
+		for _, c := range candidates {
+			used := c.exchangeTiles
+			if !c.isExchange {
+				used = newlyUsedLetters(c.detailed.Tiles)
+			}
+			if lettersInCommon(used, highlighted) >= need {
+				kept = append(kept, c)
+			}
+		}
+		return kept, "Peer Pressure: " + highlighted
+	}
+
 	// Megalophobia: if any play scores Value or more, no play is allowed -
 	// only exchanges (or a pass).
 	if rule.Type == "noPlaysIfAnyScoresAtLeast" {

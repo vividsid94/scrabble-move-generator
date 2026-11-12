@@ -981,10 +981,17 @@ func simulateOneGame(gd *kwg.KWG, player1Bot, player2Bot BotConfig) SimGameResul
 			turn.Type = "play"
 			turn.Word = chosen.detailed.Word
 			turn.Score = chosen.detailed.Score
+			// Ghostly Presence: a chance the play scores 0 (rolled once
+			// it's chosen, so the bot can't plan around it).
+			if currentBot.DrawbackID != nil {
+				if def, ok := drawbackByID[*currentBot.DrawbackID]; ok && def.Rule.Type == "ghostlyScore" && rand.Float64() < def.Rule.Value {
+					turn.Score = 0
+				}
+			}
 			turn.Position = chosen.detailed.StartPosition
 			turn.Direction = chosen.detailed.Direction
 			turn.Tiles = chosen.detailed.Tiles
-			turn.RunningTotal = currentScoreBefore + chosen.detailed.Score
+			turn.RunningTotal = currentScoreBefore + turn.Score
 			turn.WordStarts = wordStartLetters(chosen, bd) // before the tiles go down
 			consecutiveScoreless = 0
 

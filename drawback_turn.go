@@ -45,6 +45,10 @@ type DrawbackMovesRequest struct {
 	// off-limits squares ([row, col]) and Quota's two numbers.
 	BlockedSquares [][2]int `json:"blockedSquares,omitempty"`
 	Quota          []int    `json:"quota,omitempty"`
+	// Drop-Zone's quarter, Flavor Of The Day's kind, Peer Pressure's tiles.
+	Quadrant    *int   `json:"quadrant,omitempty"`
+	Flavor      string `json:"flavor,omitempty"`
+	Highlighted string `json:"highlighted,omitempty"`
 	// ForBot: pick like a bot - avoid moves that break its own lose rule,
 	// and its own Minefield zones, when it has a safe option. A human is
 	// never stopped from making a losing move (the client warns instead).
@@ -278,6 +282,9 @@ func judgeDrawbackTurn(req DrawbackMovesRequest) (*DrawbackMovesResponse, error)
 	if len(req.Quota) == 2 {
 		extras.Quota = req.Quota
 	}
+	extras.Quadrant = req.Quadrant
+	extras.Flavor = req.Flavor
+	extras.Highlighted = req.Highlighted
 	if rule.Type == "mustCoverOpenedPremium" && len(req.BoardBeforeLastPlay) == 15 {
 		before, beforePlayed := boardFromStrings(req.BoardBeforeLastPlay, gd)
 		beforeCands := turnCandidates(before, gd, req.Rack, req.PoolSize)
