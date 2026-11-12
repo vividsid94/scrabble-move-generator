@@ -1042,14 +1042,17 @@ func simulateOneGame(gd *kwg.KWG, player1Bot, player2Bot BotConfig) SimGameResul
 		if turn.Type == "play" && placesInZone(turn.Tiles, claustroZones) {
 			lossPlayer, lossReason = currentPlayer, "Minefield: played inside the zone"
 		}
-		for _, holder := range []int{currentPlayer, 3 - currentPlayer} {
-			if lossPlayer != 0 {
-				break
-			}
-			if lost, reason := loseRuleBroken(player1Bot, player2Bot, holder, func(rule DrawbackRule) (bool, string) {
+		// If BOTH players break theirs at once, the losses cancel out: the
+		// game ends here and is scored normally ("bothDrawbackLoss").
+		if lossPlayer == 0 {
+			holders, reasons := brokenLoseRules(player1Bot, player2Bot, []int{currentPlayer, 3 - currentPlayer}, func(rule DrawbackRule, holder int) (bool, string) {
 				return drawbackLossAfterTurn(rule, turn, poolSizeAtTurnStart, turns, holder, gameEnding)
-			}); lost {
-				lossPlayer, lossReason = holder, reason
+			})
+			if len(holders) == 1 {
+				lossPlayer, lossReason = holders[0], reasons[0]
+			} else if len(holders) == 2 {
+				lossReason = strings.Join(reasons, "; ")
+				endReason = "bothDrawbackLoss"
 				break
 			}
 		}
@@ -1070,15 +1073,17 @@ func simulateOneGame(gd *kwg.KWG, player1Bot, player2Bot BotConfig) SimGameResul
 		currentPlayer = 3 - currentPlayer
 	}
 
-	// Rules judged once the game is over (We All Floater Down Here).
-	if endReason != "drawbackLoss" {
-		for _, holder := range []int{1, 2} {
-			if lost, reason := loseRuleBroken(player1Bot, player2Bot, holder, func(rule DrawbackRule) (bool, string) {
-				return drawbackLossAtGameEnd(rule, turns, holder)
-			}); lost {
-				endReason, lossPlayer, lossReason = "drawbackLoss", holder, reason
-				break
-			}
+	// Rules judged once the game is over (We All Floater Down Here). Both
+	// broken: they cancel out, and the game keeps its normal ending and
+	// scoring (lossReason still says what happened).
+	if endReason != "drawbackLoss" && endReason != "bothDrawbackLoss" {
+		holders, reasons := brokenLoseRules(player1Bot, player2Bot, []int{1, 2}, func(rule DrawbackRule, holder int) (bool, string) {
+			return drawbackLossAtGameEnd(rule, turns, holder)
+		})
+		if len(holders) == 1 {
+			endReason, lossPlayer, lossReason = "drawbackLoss", holders[0], reasons[0]
+		} else if len(holders) == 2 {
+			lossReason = strings.Join(reasons, "; ")
 		}
 	}
 
@@ -1128,6 +1133,23 @@ func simulateOneGame(gd *kwg.KWG, player1Bot, player2Bot BotConfig) SimGameResul
 		LossReason:       lossReason,
 		ClaustroZones:    claustroZones,
 	}
+}
+
+// brokenLoseRules runs check for each of holders (via loseRuleBroken) and
+// returns the ones whose lose rule was broken, with their reasons.
+func brokenLoseRules(player1Bot, player2Bot BotConfig, holders []int, check func(DrawbackRule, int) (bool, string)) ([]int, []string) {
+	var broken []int
+	var reasons []string
+	for _, holder := range holders {
+		h := holder
+		if lost, reason := loseRuleBroken(player1Bot, player2Bot, h, func(rule DrawbackRule) (bool, string) {
+			return check(rule, h)
+		}); lost {
+			broken = append(broken, h)
+			reasons = append(reasons, reason)
+		}
+	}
+	return broken, reasons
 }
 
 // loseRuleBroken runs check against `holder`'s drawback if it's a lose

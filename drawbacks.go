@@ -217,8 +217,10 @@ var drawbacks = []DrawbackDef{
 		Description: "You can't play S, J, K, Q, X or Z unless you score at least 50, or ? unless you score at least 70.",
 		Rule:        DrawbackRule{Type: "restrictedTileSetScoreFloor", Letters: "SJKQXZ?", MinScore: 50, BlankMinScore: 70}},
 	{ID: 32, Name: "Parallel Play", NameSource: "friend",
-		Description: "Plays must form 3+ words, or 2+ once the bag is empty.",
-		Rule:        DrawbackRule{Type: "wordsFormedCount", Comparator: "gte", Value: 3, ValueWhenBagEmpty: 2}},
+		// A "must" since 2026-11-12 (was: every play forms 3+ words, 2+ with
+		// the bag empty - far too punishing, and it couldn't open).
+		Description: "If you can make a play that forms at least 2 words, you must - or exchange or pass.",
+		Rule:        DrawbackRule{Type: "wordsFormedCount", Comparator: "gte", Value: 2, Forcing: true}},
 	{ID: 40, Name: "Even Steven", NameSource: "claude",
 		Description: "Can't leave an odd number of tiles in the bag after your play.",
 		// AppliesToExchanges: true - an exchange changes pool size exactly
