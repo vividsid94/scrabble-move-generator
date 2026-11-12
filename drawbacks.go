@@ -381,6 +381,15 @@ var drawbacks = []DrawbackDef{
 		// Each tile's count comes from the turn history (restlessTimers):
 		// Value turns, then it has to go. Exchanges are judged too.
 		Rule: DrawbackRule{Type: "restlessTiles", Value: 2, AppliesToExchanges: true}},
+	// -- Batch 5: tiles that change letter. Not move rules: whoever runs
+	// the game changes the tiles after the holder's turn (letterChanges
+	// here for the Sandbox, the game server for Play - keep the two in step).
+	{ID: 53, Name: "Demotion", NameSource: "friend",
+		Description: "Every tile you keep on your rack drops a step each turn (E→A→I→O→U, blank→S, Z→X→J→K→Q, S→R→N→T→L, H→M→D→C→Y→P→B→F→G→W→V). Exchanging a tile brings back its original letter.",
+		Rule: DrawbackRule{Type: "demotion"}},
+	{ID: 63, Name: "Unusual", NameSource: "friend",
+		Description: "Each vowel you draw has a 25% chance to become a U. Exchanging it brings back the original letter.",
+		Rule: DrawbackRule{Type: "unusualVowels", Value: 0.25}},
 	{ID: 61, Name: "Copy Cat", NameSource: "friend",
 		Description: "If your opponent plays a tile you have, you must use every copy of it on your rack, or exchange or pass. A blank counts as a blank, whatever letter it was.",
 		Rule:        DrawbackRule{Type: "useOpponentLetters"}},
@@ -1673,6 +1682,109 @@ func evaluateDrawback(rule DrawbackRule, c *scoredCandidate, preMoveRack string,
 		// to check.
 		return true
 	}
+}
+
+// --- Demotion / Unusual: tiles that change letter --------------------------
+
+// demotionChains: each letter drops to the next one in its chain; the last
+// letter of a chain stays put. A blank drops to S.
+var demotionChains = []string{"EAIOU", "ZXJKQ", "SRNTL", "HMDCYPBFGWV"}
+
+var demotesTo = func() map[string]string {
+	m := map[string]string{"?": "S"}
+	for _, chain := range demotionChains {
+		for i := 0; i+1 < len(chain); i++ {
+			m[chain[i:i+1]] = chain[i+1 : i+2]
+		}
+	}
+	return m
+}()
+
+// ChangedTile: a rack tile that isn't its original letter any more.
+type ChangedTile struct {
+	Now string `json:"now"`
+	Was string `json:"was"`
+}
+
+// takeChanged: the tiles in used leave the rack - a changed copy of a
+// letter goes first. Returns the changed tiles still on the rack, and used
+// with each changed tile turned back into its original letter (what an
+// exchange returns to the bag).
+func takeChanged(changed []ChangedTile, used string) ([]ChangedTile, string) {
+	left := append([]ChangedTile{}, changed...)
+	restored := ""
+	for _, r := range used {
+		l := string(r)
+		found := false
+		for i, c := range left {
+			if c.Now == l {
+				restored += c.Was
+				left = append(left[:i], left[i+1:]...)
+				found = true
+				break
+			}
+		}
+		if !found {
+			restored += l
+		}
+	}
+	return left, restored
+}
+
+// letterChanges: the holder's rack after their turn. kept is what stayed
+// from before the turn, drawn the new tiles; changed the kept tiles that
+// were already changed. Demotion drops every kept tile a step; Unusual
+// turns each drawn vowel into a U with chance value.
+func letterChanges(ruleType string, value float64, kept, drawn string, changed []ChangedTile) (string, []ChangedTile) {
+	switch ruleType {
+	case "demotion":
+		pending := append([]ChangedTile{}, changed...)
+		var out []ChangedTile
+		newKept := ""
+		for _, r := range kept {
+			l := string(r)
+			next, drops := demotesTo[l]
+			if !drops {
+				next = l
+			}
+			tile := ChangedTile{Now: next, Was: l}
+			for i, c := range pending {
+				if c.Now == l {
+					tile.Was = c.Was
+					pending = append(pending[:i], pending[i+1:]...)
+					break
+				}
+			}
+			if tile.Now != tile.Was {
+				out = append(out, tile)
+			}
+			newKept += next
+		}
+		return sortLeaveString(newKept + drawn), out
+	case "unusualVowels":
+		out := append([]ChangedTile{}, changed...)
+		newDrawn := ""
+		for _, r := range drawn {
+			l := string(r)
+			if strings.Contains("AEIO", l) && rand.Float64() < value {
+				out = append(out, ChangedTile{Now: "U", Was: l})
+				l = "U"
+			}
+			newDrawn += l
+		}
+		return sortLeaveString(kept + newDrawn), out
+	}
+	return sortLeaveString(kept + drawn), changed
+}
+
+// letterRule: the bot's drawback rule if it changes letters, else "".
+func letterRule(bot BotConfig) (string, float64) {
+	if bot.DrawbackID != nil {
+		if def, ok := drawbackByID[*bot.DrawbackID]; ok && (def.Rule.Type == "demotion" || def.Rule.Type == "unusualVowels") {
+			return def.Rule.Type, def.Rule.Value
+		}
+	}
+	return "", 0
 }
 
 // RestlessTile (Restlessness): one rack tile and how many more of the

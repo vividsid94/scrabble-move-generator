@@ -620,6 +620,15 @@ func simulateOneGame(gd *kwg.KWG, player1Bot, player2Bot BotConfig) SimGameResul
 	pool = removeRackFromPool(pool, rack1)
 	rack2 := drawRandomTiles(pool, rackSizeFor(player2Bot))
 	pool = removeRackFromPool(pool, rack2)
+	// Demotion / Unusual: each player's rack tiles that changed letter
+	// (Unusual starts on the opening deal).
+	changedTiles := map[int][]ChangedTile{}
+	if rule, value := letterRule(player1Bot); rule == "unusualVowels" {
+		rack1, changedTiles[1] = letterChanges(rule, value, "", rack1, nil)
+	}
+	if rule, value := letterRule(player2Bot); rule == "unusualVowels" {
+		rack2, changedTiles[2] = letterChanges(rule, value, "", rack2, nil)
+	}
 
 	score1, score2 := 0, 0
 	consecutiveScoreless := 0
@@ -978,6 +987,7 @@ func simulateOneGame(gd *kwg.KWG, player1Bot, player2Bot BotConfig) SimGameResul
 		}
 		var newRack string
 
+		keptTiles, drawnTiles := currentRack, ""
 		switch {
 		case chosen == nil:
 			turn.Type = "pass"
@@ -997,8 +1007,12 @@ func simulateOneGame(gd *kwg.KWG, player1Bot, player2Bot BotConfig) SimGameResul
 			needed := rackSizeFor(currentBot) - len([]rune(rackAfterRemoval))
 			drawn := drawRandomTiles(pool, needed)
 			pool = removeRackFromPool(pool, drawn)
-			pool = pool + chosen.exchangeTiles
+			// A changed tile goes back to the bag as its original letter.
+			var returned string
+			changedTiles[currentPlayer], returned = takeChanged(changedTiles[currentPlayer], chosen.exchangeTiles)
+			pool = pool + returned
 			newRack = sortLeaveString(rackAfterRemoval + drawn)
+			keptTiles, drawnTiles = rackAfterRemoval, drawn
 
 		default: // word play
 			turn.Type = "play"
@@ -1037,6 +1051,8 @@ func simulateOneGame(gd *kwg.KWG, player1Bot, player2Bot BotConfig) SimGameResul
 			drawn := drawRandomTiles(pool, needed)
 			pool = removeRackFromPool(pool, drawn)
 			newRack = sortLeaveString(rackAfterRemoval + drawn)
+			changedTiles[currentPlayer], _ = takeChanged(changedTiles[currentPlayer], strings.Join(used, ""))
+			keptTiles, drawnTiles = rackAfterRemoval, drawn
 
 			if currentPlayer == 1 {
 				score1 = turn.RunningTotal
@@ -1064,6 +1080,11 @@ func simulateOneGame(gd *kwg.KWG, player1Bot, player2Bot BotConfig) SimGameResul
 			} else {
 				devilSinceObey[currentPlayer]++
 			}
+		}
+
+		// Demotion / Unusual change the tiles after the holder's turn.
+		if rule, value := letterRule(currentBot); rule != "" {
+			newRack, changedTiles[currentPlayer] = letterChanges(rule, value, keptTiles, drawnTiles, changedTiles[currentPlayer])
 		}
 
 		if currentPlayer == 1 {
