@@ -287,6 +287,32 @@ var drawbacks = []DrawbackDef{
 		// shared roll per turn, like Quota. Value is how many squares (was
 		// half the board, far too harsh in playtesting).
 		Rule: DrawbackRule{Type: "randomBlockedSquares", Value: 60}},
+
+	// -- New drawbacks (his list, #41-#64), batch 1: plain rules. Exchanging
+	// and passing stay allowed for all of them.
+	{ID: 43, Name: "Claustrophobia", NameSource: "friend",
+		Description: "You can't place tiles in the outer two rows or columns.",
+		Rule:        DrawbackRule{Type: "forbiddenBorder", Value: 2}},
+	{ID: 45, Name: "Go Big or Go Home", NameSource: "friend",
+		Description: "If you can outscore your opponent's last play, you must. If you can't, you must exchange or pass.",
+		Rule:        DrawbackRule{Type: "outscoreOpponentLastPlay"}},
+	{ID: 46, Name: "Triskaidekaphobia", NameSource: "friend",
+		Description: "If the tiles on your rack add up to 13 points or more, you must exchange or pass.",
+		Rule:        DrawbackRule{Type: "rackValueBelow", Value: 13}},
+	{ID: 47, Name: "Rising Tide", NameSource: "friend",
+		Description: "Your play must start on a higher row than your opponent's last play. If it can't, you must exchange or pass.",
+		Rule:        DrawbackRule{Type: "startAboveOpponentLastPlay"}},
+	{ID: 49, Name: "Lonerism", NameSource: "friend",
+		Description: "If you have more than one of the same tile, you can't play any of them. Exchanging is allowed.",
+		Rule:        DrawbackRule{Type: "noDuplicateRackTiles"}},
+	{ID: 58, Name: "Megalophobia", NameSource: "friend",
+		Description: "If you can score 60 or more, you must exchange or pass.",
+		// Judged across the whole candidate list in filterCandidatesByDrawback.
+		Rule: DrawbackRule{Type: "noPlaysIfAnyScoresAtLeast", Value: 60}},
+	{ID: 61, Name: "Copy Cat", NameSource: "friend",
+		Description: "If your opponent plays a tile you have, you must use every copy of it on your rack, or exchange or pass. A blank counts as a blank, whatever letter it was.",
+		Rule:        DrawbackRule{Type: "useOpponentLetters"}},
+
 	// -- Lose conditions: breaking one ends the game on the spot - the
 	// player who broke it loses, scored 0, and the winner keeps their score
 	// (see isLoseRule / drawbackLossAfterTurn and simulateOneGame).
@@ -1464,12 +1490,109 @@ func evaluateDrawback(rule DrawbackRule, c *scoredCandidate, preMoveRack string,
 		}
 		return true
 
+	// Claustrophobia: no new tile in the outer Value rows or columns.
+	case "forbiddenBorder":
+		depth := int(rule.Value)
+		for _, t := range c.detailed.Tiles {
+			if t.IsNew && (t.Row < depth || t.Row > 14-depth || t.Col < depth || t.Col > 14-depth) {
+				return false
+			}
+		}
+		return true
+
+	// Lonerism: a letter held more than once (two blanks count) can't be
+	// played.
+	case "noDuplicateRackTiles":
+		for _, letter := range newlyUsedLetters(c.detailed.Tiles) {
+			if strings.Count(preMoveRack, string(letter)) > 1 {
+				return false
+			}
+		}
+		return true
+
+	// Copy Cat: every rack copy of each letter the opponent placed on their
+	// immediately preceding turn (a blank counts as "?") has to be used.
+	case "useOpponentLetters":
+		required := copyCatRequired(preMoveRack, turns, currentPlayer)
+		return required == "" || containsLetters(newlyUsedLetters(c.detailed.Tiles), required)
+
+	// Go Big or Go Home: outscore the opponent's last word play.
+	case "outscoreOpponentLastPlay":
+		last := lastWordPlayByPlayer(turns, 3-currentPlayer)
+		return last == nil || c.detailed.Score > last.Score
+
+	// Rising Tide: start on a higher row (a smaller row number) than the
+	// opponent's last word play started on.
+	case "startAboveOpponentLastPlay":
+		last := lastWordPlayByPlayer(turns, 3-currentPlayer)
+		if last == nil || len(last.Tiles) == 0 {
+			return true
+		}
+		return topRow(c.detailed.Tiles) < topRow(last.Tiles)
+
+	// Triskaidekaphobia: plays only while the rack adds up to under Value.
+	case "rackValueBelow":
+		return float64(rackPointValue(preMoveRack)) < rule.Value
+
 	default:
 		// Unknown/not-yet-implemented type - never silently disqualify a
 		// player's whole move set over a rule this build doesn't know how
 		// to check.
 		return true
 	}
+}
+
+// topRow is the row a play starts on: the smallest row among its tiles.
+func topRow(tiles []MoveTile) int {
+	top := 15
+	for _, t := range tiles {
+		if t.Row < top {
+			top = t.Row
+		}
+	}
+	return top
+}
+
+// copyCatRequired: the rack tiles Copy Cat makes the player use - every copy
+// on preMoveRack of each letter ("?" for a blank) the opponent placed on the
+// turn just before this one. "" when that turn wasn't the opponent's play.
+func copyCatRequired(preMoveRack string, turns []SimTurn, player int) string {
+	if len(turns) == 0 {
+		return ""
+	}
+	last := turns[len(turns)-1]
+	if last.Player != 3-player || last.Type != "play" {
+		return ""
+	}
+	seen := map[rune]bool{}
+	var required []rune
+	for _, letter := range newlyUsedLetters(last.Tiles) {
+		if seen[letter] {
+			continue
+		}
+		seen[letter] = true
+		for _, held := range preMoveRack {
+			if held == letter {
+				required = append(required, held)
+			}
+		}
+	}
+	return string(required)
+}
+
+// containsLetters: does have contain every letter of want, counting repeats?
+func containsLetters(have, want string) bool {
+	counts := map[rune]int{}
+	for _, r := range have {
+		counts[r]++
+	}
+	for _, r := range want {
+		if counts[r] == 0 {
+			return false
+		}
+		counts[r]--
+	}
+	return true
 }
 
 // filterCandidatesByDrawback applies one drawback to a turn's already-
@@ -1490,6 +1613,23 @@ func evaluateDrawback(rule DrawbackRule, c *scoredCandidate, preMoveRack string,
 // extras: things worked out once per turn by the caller - see drawbackExtras.
 func filterCandidatesByDrawback(candidates []scoredCandidate, rule DrawbackRule, preMoveRack string, bd *board.GameBoard, poolSizeBefore int, turns []SimTurn, currentPlayer int, extras drawbackExtras) ([]scoredCandidate, string) {
 	opened := extras.Opened
+	// Megalophobia: if any play scores Value or more, no play is allowed -
+	// only exchanges (or a pass).
+	if rule.Type == "noPlaysIfAnyScoresAtLeast" {
+		for i := range candidates {
+			if !candidates[i].isExchange && float64(candidates[i].detailed.Score) >= rule.Value {
+				exchanges := make([]scoredCandidate, 0)
+				for _, c := range candidates {
+					if c.isExchange {
+						exchanges = append(exchanges, c)
+					}
+				}
+				return exchanges, fmt.Sprintf("Megalophobia: a %d+ play exists", int(rule.Value))
+			}
+		}
+		return candidates, ""
+	}
+
 	// I'll Take That (forcing): if any play covers an opened square, the
 	// plays collapse to those; exchanges always stay in.
 	if rule.Type == "mustCoverOpenedPremium" {
