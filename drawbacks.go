@@ -54,7 +54,7 @@ type DrawbackRule struct {
 	// star is a DWS).
 	ExemptCenter bool `json:"exemptCenter,omitempty"`
 
-	// MinLength (loseIfFewLongPlays): the main-word length that counts as a
+	// MinLength (loseIfFewLongPlays): the shortest main word that counts as a
 	// "long" play (We All Floater Down Here: 8).
 	MinLength int `json:"minLength,omitempty"`
 
@@ -84,7 +84,7 @@ type DrawbackRule struct {
 
 	MaxValue int `json:"maxValue,omitempty"` // firstTileValueLimit
 
-	ValueWhenBagEmpty float64 `json:"valueWhenBagEmpty,omitempty"` // wordsFormedCount
+	ValueWhenBagEmpty float64 `json:"valueWhenBagEmpty,omitempty"` // wordsFormedCount, score
 
 	N int `json:"n,omitempty"` // excludeTopNCandidates
 
@@ -274,16 +274,19 @@ var drawbacks = []DrawbackDef{
 		// type name is from when they counted too).
 		Rule: DrawbackRule{Type: "maxTilesLeaveRack", MaxTiles: 40}},
 	{ID: 7, Name: "Shifting Sands", NameSource: "claude",
-		Description: "50% of squares are off-limits, re-randomized every turn (never the center star).",
+		Description: "60 squares are off-limits, re-randomized every turn (never the center star).",
 		// Rolled in filterCandidatesByDrawback's own special case - one
-		// shared roll per turn, like Quota. Value is the off-limits share.
-		Rule: DrawbackRule{Type: "randomBlockedSquares", Value: 0.5}},
+		// shared roll per turn, like Quota. Value is how many squares (was
+		// half the board, far too harsh in playtesting).
+		Rule: DrawbackRule{Type: "randomBlockedSquares", Value: 60}},
 	// -- Lose conditions: breaking one ends the game on the spot - the
 	// player who broke it loses, scored 0, and the winner keeps their score
 	// (see isLoseRule / drawbackLossAfterTurn and simulateOneGame).
 	{ID: 8, Name: "Scoring Never Stops", NameSource: "friend",
-		Description: "Score under 25 on a play (15 once the bag is empty) and you lose.",
-		Rule:        DrawbackRule{Type: "loseIfPlayScoreBelow", Value: 25, ValueWhenBagEmpty: 15}},
+		// No longer a lose condition (2026-11-12): a play under the
+		// threshold just isn't allowed, so you exchange or pass instead.
+		Description: "You must score at least 30 or you must pass or exchange (15 once the bag is empty).",
+		Rule:        DrawbackRule{Type: "score", Comparator: "gte", Value: 30, ValueWhenBagEmpty: 15}},
 	{ID: 34, Name: "Time Crunch", NameSource: "friend",
 		Description: "Game runs past 25 turns and you lose.",
 		Rule:        DrawbackRule{Type: "loseIfPastTurnLimit", Value: 25}},
@@ -297,7 +300,7 @@ var drawbacks = []DrawbackDef{
 		Description: "Your opponent covers a triple word score and you lose.",
 		Rule:        DrawbackRule{Type: "loseIfOpponentCoversSquare", Types: []string{"TWS"}}},
 	{ID: 12, Name: "We All Floater Down Here", NameSource: "friend",
-		Description: "Fewer than 3 eight-letter plays (bingo or not) by game end and you lose.",
+		Description: "Fewer than 3 plays of 8 or more letters (bingo or not) by game end and you lose.",
 		Rule:        DrawbackRule{Type: "loseIfFewLongPlays", Value: 3, MinLength: 8}},
 	{ID: 20, Name: "Corner Rush", NameSource: "claude",
 		Description: "No tile of yours on A1 by turn 14 and you lose.",
@@ -490,12 +493,12 @@ func drawbackLossAtGameEnd(rule DrawbackRule, turns []SimTurn, holder int) (bool
 	}
 	count := 0
 	for _, t := range turns {
-		if t.Player == holder && t.Type == "play" && len(t.Tiles) == rule.MinLength {
+		if t.Player == holder && t.Type == "play" && len(t.Tiles) >= rule.MinLength {
 			count++
 		}
 	}
 	if float64(count) < rule.Value {
-		return true, fmt.Sprintf("only %d %d-letter play(s) by game end", count, rule.MinLength)
+		return true, fmt.Sprintf("only %d play(s) of %d+ letters by game end", count, rule.MinLength)
 	}
 	return false, ""
 }
@@ -691,7 +694,8 @@ func containsString(list []string, s string) bool {
 	return false
 }
 
-// Scoring Never Stops: a play scoring under Value (ValueWhenBagEmpty once
+// loseIfPlayScoreBelow (unused since Scoring Never Stops became a "score"
+// rule): a play scoring under Value (ValueWhenBagEmpty once
 // the bag is empty) loses. Exchanges and passes aren't plays.
 func playScoreBelow(rule DrawbackRule, score, poolSizeBefore int) (bool, string) {
 	threshold := rule.Value
@@ -1047,8 +1051,14 @@ func evaluateDrawback(rule DrawbackRule, c *scoredCandidate, preMoveRack string,
 		}
 		return true
 
+	// Modesty's cap, Scoring Never Stops' floor (ValueWhenBagEmpty once the
+	// bag is empty, when the rule has one).
 	case "score":
-		return compareFloat(float64(c.detailed.Score), rule.Comparator, rule.Value)
+		threshold := rule.Value
+		if poolSizeBefore == 0 && rule.ValueWhenBagEmpty > 0 {
+			threshold = rule.ValueWhenBagEmpty
+		}
+		return compareFloat(float64(c.detailed.Score), rule.Comparator, threshold)
 
 	case "scoreParity":
 		isEven := c.detailed.Score%2 == 0
@@ -1224,11 +1234,20 @@ func evaluateDrawback(rule DrawbackRule, c *scoredCandidate, preMoveRack string,
 
 	// Crisscross: same 1-tile-play exemption Fear of Heights/Vertie already
 	// use (a play that's just one tile long has no real direction).
+	// Crisscross: one-tile plays are always fine (count NEW tiles), and they
+	// don't set the direction either - compare with the last play of more
+	// than one tile.
 	case "mustAlternateDirection":
-		if len(c.detailed.Tiles) <= 1 {
+		if newTileCount(c) <= 1 {
 			return true
 		}
-		last := lastWordPlayByPlayer(turns, currentPlayer)
+		var last *SimTurn
+		for i := len(turns) - 1; i >= 0; i-- {
+			if turns[i].Player == currentPlayer && turns[i].Type == "play" && newTileCountOf(turns[i].Tiles) > 1 {
+				last = &turns[i]
+				break
+			}
+		}
 		if last == nil {
 			return true
 		}
@@ -1499,7 +1518,7 @@ func filterCandidatesByDrawback(candidates []scoredCandidate, rule DrawbackRule,
 			}
 		}
 		rand.Shuffle(len(others), func(i, j int) { others[i], others[j] = others[j], others[i] })
-		blockedCount := int(float64(len(others)) * rule.Value)
+		blockedCount := min(int(rule.Value), len(others))
 		blocked := make(map[int]bool, blockedCount)
 		for _, sq := range others[:blockedCount] {
 			blocked[sq] = true
