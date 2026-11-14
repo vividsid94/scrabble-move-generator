@@ -62,6 +62,11 @@ type DrawbackMovesRequest struct {
 	ProposedExchange string     `json:"proposedExchange,omitempty"`
 	// Limit: how many allowed moves to return, best first (0 = none).
 	Limit int `json:"limit,omitempty"`
+	// Regicide, Decay, Goose Egg: what this player's rack tiles are worth
+	// (every copy), and board squares worth something other than normal to
+	// them ([row, col, value]). Every play is rescored with these.
+	RackValues  []TileValue `json:"rackValues,omitempty"`
+	BoardValues [][3]int    `json:"boardValues,omitempty"`
 }
 
 // DrawbackMove is one allowed move. Score is what it scores for this player
@@ -277,6 +282,10 @@ func judgeDrawbackTurn(req DrawbackMovesRequest) (*DrawbackMovesResponse, error)
 		if !all[i].isExchange {
 			fullScores[newTilesKey(all[i].detailed.Tiles)] = all[i].detailed.Score
 		}
+	}
+
+	if vals := newTileValues(req.RackValues, req.BoardValues); vals != nil {
+		all = rescoreWithValues(all, bd, vals)
 	}
 
 	extras := drawbackExtras{}

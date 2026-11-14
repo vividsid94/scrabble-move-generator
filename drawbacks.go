@@ -390,6 +390,19 @@ var drawbacks = []DrawbackDef{
 	{ID: 63, Name: "Unusual", NameSource: "friend",
 		Description: "Each vowel you draw has a 25% chance to become a U. Exchanging it brings back the original letter.",
 		Rule: DrawbackRule{Type: "unusualVowels", Value: 0.25}},
+	// -- Batch 6: tiles worth less. Not move rules: the game server keeps
+	// each tile's value and sends them with every request (rackValues,
+	// boardValues), and every play is rescored with them (valuedScore).
+	// The Sandbox doesn't track tile values yet, so these do nothing there.
+	{ID: 51, Name: "Regicide", NameSource: "friend",
+		Description: "At the start of each turn your highest-scoring tile becomes worth 0 for you - for good, wherever it goes.",
+		Rule: DrawbackRule{Type: "regicide"}},
+	{ID: 52, Name: "Decay", NameSource: "friend",
+		Description: "Every tile you keep on your rack loses 1 point each turn. Once played, it stays at that value for everyone. Exchanging it brings back its normal value.",
+		Rule: DrawbackRule{Type: "decay"}},
+	{ID: 64, Name: "Goose Egg", NameSource: "friend",
+		Description: "At the start of each turn 2 more random tiles on your rack become worth 0 for you, until you exchange them.",
+		Rule: DrawbackRule{Type: "gooseEgg", Value: 2}},
 	{ID: 61, Name: "Copy Cat", NameSource: "friend",
 		Description: "If your opponent plays a tile you have, you must use every copy of it on your rack, or exchange or pass. A blank counts as a blank, whatever letter it was.",
 		Rule:        DrawbackRule{Type: "useOpponentLetters"}},
@@ -1089,6 +1102,111 @@ func wordsFormed(c *scoredCandidate, bd *board.GameBoard) [][]MoveTile {
 		}
 	}
 	return words
+}
+
+// TileValue (Regicide, Decay, Goose Egg): what one rack tile is worth to
+// its holder.
+type TileValue struct {
+	Letter string `json:"letter"`
+	Value  int    `json:"value"`
+}
+
+// tileValues: what tiles are worth to the player moving - each rack copy's
+// value by letter ("?" for a blank), highest first, and board squares whose
+// value isn't the normal one. A play uses a letter's highest-valued copies.
+type tileValues struct {
+	Rack  map[string][]int
+	Board map[rcPos]int
+}
+
+func newTileValues(rack []TileValue, board [][3]int) *tileValues {
+	if len(rack) == 0 && len(board) == 0 {
+		return nil
+	}
+	v := &tileValues{Rack: map[string][]int{}, Board: map[rcPos]int{}}
+	for _, t := range rack {
+		v.Rack[strings.ToUpper(t.Letter)] = append(v.Rack[strings.ToUpper(t.Letter)], t.Value)
+	}
+	for l := range v.Rack {
+		sort.Sort(sort.Reverse(sort.IntSlice(v.Rack[l])))
+	}
+	for _, sq := range board {
+		v.Board[rcPos{sq[0], sq[1]}] = sq[2]
+	}
+	return v
+}
+
+// valuedScore: candidate c's score with tiles worth what vals says - every
+// word it forms (main word and cross words, walked on bd, the board before
+// the move), letter and word multipliers on the new tiles only, plus 50 for
+// using all 7 tiles. With every value normal it equals the usual score.
+func valuedScore(c *scoredCandidate, bd *board.GameBoard, vals *tileValues) int {
+	used := map[string]int{}
+	newValue := map[rcPos]int{}
+	newCount := 0
+	for _, t := range c.detailed.Tiles {
+		if !t.IsNew {
+			continue
+		}
+		newCount++
+		key := strings.ToUpper(t.Letter)
+		if t.IsBlank {
+			key = "?"
+		}
+		value := tileLetterValue(t)
+		if list := vals.Rack[key]; used[key] < len(list) {
+			value = list[used[key]]
+		}
+		if t.IsBlank {
+			value = 0
+		}
+		used[key]++
+		newValue[rcPos{t.Row, t.Col}] = value
+	}
+	total := 0
+	for i, word := range wordsFormed(c, bd) {
+		if i == 0 && len(word) < 2 {
+			continue // a one-tile play's real word is its cross word
+		}
+		sum, wordMult := 0, 1
+		for _, t := range word {
+			pos := rcPos{t.Row, t.Col}
+			if v, isNew := newValue[pos]; isNew {
+				lm, wm := squareMultipliers(t.Row, t.Col, bd)
+				sum += v * lm
+				wordMult *= wm
+			} else if v, ok := vals.Board[pos]; ok {
+				sum += v
+			} else {
+				sum += tileLetterValue(t)
+			}
+		}
+		total += sum * wordMult
+	}
+	if newCount == 7 {
+		total += 50
+	}
+	return total
+}
+
+// rescoreWithValues: every word play in cands rescored with vals, then
+// re-ranked best first.
+func rescoreWithValues(cands []scoredCandidate, bd *board.GameBoard, vals *tileValues) []scoredCandidate {
+	out := make([]scoredCandidate, len(cands))
+	for i, c := range cands {
+		if !c.isExchange {
+			valued := valuedScore(&c, bd, vals)
+			delta := float64(c.detailed.Score - valued)
+			d := *c.detailed
+			d.Score = valued
+			c.detailed = &d
+			c.total -= delta
+			c.baselineTotal -= delta
+		}
+		out[i] = c
+	}
+	sort.SliceStable(out, func(i, j int) bool { return out[i].total > out[j].total })
+	return out
 }
 
 // wordStartLetters is the first letter of each word c forms (upper case).
