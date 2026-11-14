@@ -437,9 +437,11 @@ var drawbacks = []DrawbackDef{
 		Description: "You must have at least 5 tiles in Row 1 and Row 15 by the end of the game or you lose.",
 		Rule:        DrawbackRule{Type: "loseIfFewTilesInRows", Rows: []int{0, 14}, Value: 5}},
 	{ID: 38, Name: "Minefield", NameSource: "friend",
-		Description: "A random 3x3 zone touching the board's edge is set at game start; whoever plays inside it loses.",
-		// The zone is rolled per game in simulateOneGame (rollClaustroZone)
-		// and applies to BOTH players - see claustroLoss.
+		Description: "A random 3x3 zone touching the board's edge is set at game start. Play a tile inside it and you lose - your opponent can play there safely.",
+		// The zone is rolled per game in simulateOneGame (rollClaustroZone).
+		// Only its holder loses for playing there (2026-11-14 - it used to
+		// catch anyone, and since the opponent can't see it, it worked as
+		// a trap for them instead of a drawback).
 		Rule: DrawbackRule{Type: "loseIfPlayInZone"}},
 	{ID: 36, Name: "Zeroed In", NameSource: "friend",
 		Description: "Must exchange or pass at least 6 times over the course of the game.",

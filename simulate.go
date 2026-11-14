@@ -1126,7 +1126,13 @@ func simulateOneGame(gd *kwg.KWG, player1Bot, player2Bot BotConfig) SimGameResul
 		// spot. Both players are checked - some rules trigger on the
 		// opponent's move or on the turn count, not just on your own move.
 		gameEnding := (len(newRack) == 0 && len(pool) == 0) || consecutiveScoreless >= 6
-		if turn.Type == "play" && placesInZone(turn.Tiles, claustroZones) {
+		var myZones []claustroZone
+		for _, z := range claustroZones {
+			if z.Holder == currentPlayer {
+				myZones = append(myZones, z)
+			}
+		}
+		if turn.Type == "play" && placesInZone(turn.Tiles, myZones) {
 			lossPlayer, lossReason = currentPlayer, "Minefield: played inside the zone"
 		}
 		// If BOTH players break theirs at once, the losses cancel out: the
