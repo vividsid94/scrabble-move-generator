@@ -393,7 +393,7 @@ var drawbacks = []DrawbackDef{
 	// -- Batch 6: tiles worth less. Not move rules: the game server keeps
 	// each tile's value and sends them with every request (rackValues,
 	// boardValues), and every play is rescored with them (valuedScore).
-	// The Sandbox doesn't track tile values yet, so these do nothing there.
+	// The Sandbox keeps the values itself (simValues).
 	{ID: 51, Name: "Regicide", NameSource: "friend",
 		Description: "At the start of each turn your highest-scoring tile becomes worth 0 for you - for good, wherever it goes.",
 		Rule: DrawbackRule{Type: "regicide"}},
@@ -1187,6 +1187,184 @@ func valuedScore(c *scoredCandidate, bd *board.GameBoard, vals *tileValues) int 
 		total += 50
 	}
 	return total
+}
+
+// --- The Sandbox's tile values (Regicide, Decay, Goose Egg) ----------------
+// Same rules as the game server's drawbacks.js changeValues /
+// startTurnValues, except that an exchanged Regicide tile isn't followed
+// into the bag (it comes back normal).
+
+func normalTileValue(letter string) int {
+	if letter == "?" || letter == "" {
+		return 0
+	}
+	return letterPointValues[[]rune(letter)[0]]
+}
+
+// valueRuleOf: the bot's drawback rule if it changes tile values, else "".
+func valueRuleOf(bot BotConfig) (string, float64) {
+	if bot.DrawbackID != nil {
+		if def, ok := drawbackByID[*bot.DrawbackID]; ok {
+			switch def.Rule.Type {
+			case "regicide", "decay", "gooseEgg":
+				return def.Rule.Type, def.Rule.Value
+			}
+		}
+	}
+	return "", 0
+}
+
+// rackValuesOf: every rack copy with its value (overrides take copies of
+// their letter, the rest are normal).
+func rackValuesOf(rack string, overrides []TileValue) []TileValue {
+	pending := append([]TileValue{}, overrides...)
+	out := make([]TileValue, 0, len(rack))
+	for _, r := range rack {
+		l := string(r)
+		v := normalTileValue(l)
+		for i, o := range pending {
+			if o.Letter == l {
+				v = o.Value
+				pending = append(pending[:i], pending[i+1:]...)
+				break
+			}
+		}
+		out = append(out, TileValue{Letter: l, Value: v})
+	}
+	return out
+}
+
+func valueOverrides(tiles []TileValue) []TileValue {
+	var out []TileValue
+	for _, t := range tiles {
+		if t.Value != normalTileValue(t.Letter) {
+			out = append(out, t)
+		}
+	}
+	return out
+}
+
+// takeValued: used letters leave the rack - a play uses each letter's
+// highest-valued copy, an exchange sends the lowest.
+func takeValued(tiles []TileValue, used string, highest bool) ([]TileValue, []TileValue) {
+	left := append([]TileValue{}, tiles...)
+	var taken []TileValue
+	for _, r := range used {
+		best := -1
+		for i, t := range left {
+			if t.Letter == string(r) && (best == -1 || (highest && t.Value > left[best].Value) || (!highest && t.Value < left[best].Value)) {
+				best = i
+			}
+		}
+		if best >= 0 {
+			taken = append(taken, left[best])
+			left = append(left[:best], left[best+1:]...)
+		}
+	}
+	return left, taken
+}
+
+// startTurnZeroes: Regicide's highest-valued tile, or Value of Goose Egg's
+// random ones, go to 0.
+func startTurnZeroes(rule string, value float64, tiles []TileValue) []TileValue {
+	out := append([]TileValue{}, tiles...)
+	var live []int
+	for i, t := range out {
+		if t.Value > 0 {
+			live = append(live, i)
+		}
+	}
+	switch rule {
+	case "regicide":
+		if len(live) > 0 {
+			best := live[0]
+			for _, i := range live {
+				if out[i].Value > out[best].Value {
+					best = i
+				}
+			}
+			out[best].Value = 0
+		}
+	case "gooseEgg":
+		rand.Shuffle(len(live), func(i, j int) { live[i], live[j] = live[j], live[i] })
+		for k := 0; k < len(live) && k < int(value); k++ {
+			out[live[k]].Value = 0
+		}
+	}
+	return out
+}
+
+// simValues: one Sandbox game's tile values - each player's rack overrides
+// and board squares worth something else to them.
+type simValues struct {
+	rack  map[int][]TileValue
+	board map[int]map[rcPos]int
+}
+
+func newSimValues() *simValues {
+	return &simValues{rack: map[int][]TileValue{}, board: map[int]map[rcPos]int{1: {}, 2: {}}}
+}
+
+// forTurn: what the player's tiles are worth this turn (nil when normal).
+func (s *simValues) forTurn(player int, rack string, bot BotConfig) *tileValues {
+	rule, _ := valueRuleOf(bot)
+	if rule == "" && len(s.board[player]) == 0 {
+		return nil
+	}
+	v := &tileValues{Rack: map[string][]int{}, Board: s.board[player]}
+	for _, t := range rackValuesOf(rack, s.rack[player]) {
+		v.Rack[t.Letter] = append(v.Rack[t.Letter], t.Value)
+	}
+	for l := range v.Rack {
+		sort.Sort(sort.Reverse(sort.IntSlice(v.Rack[l])))
+	}
+	return v
+}
+
+// startTurn: Regicide / Goose Egg zero tiles before the player moves.
+func (s *simValues) startTurn(player int, rack string, bot BotConfig) {
+	if rule, value := valueRuleOf(bot); rule == "regicide" || rule == "gooseEgg" {
+		s.rack[player] = valueOverrides(startTurnZeroes(rule, value, rackValuesOf(rack, s.rack[player])))
+	}
+}
+
+// afterTurn: the player's values follow their tiles - played ones keep
+// their value on the board (Decay's for both players), exchanged ones come
+// back normal, and Decay takes a point off every kept tile.
+func (s *simValues) afterTurn(player int, bot BotConfig, rackBefore, used, drawn string, placed []MoveTile) {
+	rule, _ := valueRuleOf(bot)
+	if rule == "" {
+		return
+	}
+	kept, taken := takeValued(rackValuesOf(rackBefore, s.rack[player]), used, placed != nil)
+	for _, t := range placed {
+		if !t.IsNew || t.IsBlank {
+			continue
+		}
+		for i, x := range taken {
+			if x.Letter == strings.ToUpper(t.Letter) {
+				if x.Value != normalTileValue(x.Letter) {
+					holders := []int{player}
+					if rule == "decay" {
+						holders = []int{1, 2}
+					}
+					for _, p := range holders {
+						s.board[p][rcPos{t.Row, t.Col}] = x.Value
+					}
+				}
+				taken = append(taken[:i], taken[i+1:]...)
+				break
+			}
+		}
+	}
+	if rule == "decay" {
+		for i := range kept {
+			if kept[i].Value > 0 {
+				kept[i].Value--
+			}
+		}
+	}
+	s.rack[player] = valueOverrides(kept)
 }
 
 // rescoreWithValues: every word play in cands rescored with vals, then

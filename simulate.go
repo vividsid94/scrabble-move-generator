@@ -623,6 +623,8 @@ func simulateOneGame(gd *kwg.KWG, player1Bot, player2Bot BotConfig) SimGameResul
 	// Demotion / Unusual: each player's rack tiles that changed letter
 	// (Unusual starts on the opening deal).
 	changedTiles := map[int][]ChangedTile{}
+	// Regicide / Decay / Goose Egg: what tiles are worth to whom.
+	tileVals := newSimValues()
 	if rule, value := letterRule(player1Bot); rule == "unusualVowels" {
 		rack1, changedTiles[1] = letterChanges(rule, value, "", rack1, nil)
 	}
@@ -666,6 +668,7 @@ func simulateOneGame(gd *kwg.KWG, player1Bot, player2Bot BotConfig) SimGameResul
 			currentBot = player2Bot
 		}
 		poolSizeAtTurnStart := len(pool)
+		tileVals.startTurn(currentPlayer, currentRack, currentBot)
 		// This turn's devil suggestion (Devil On Your Shoulder holders only).
 		var devilThisTurn *scoredCandidate
 
@@ -774,6 +777,12 @@ func simulateOneGame(gd *kwg.KWG, player1Bot, player2Bot BotConfig) SimGameResul
 				}
 				candidates = withoutBingos
 			}
+		}
+
+		// Tile values (Regicide, Decay, Goose Egg - the player's own, or an
+		// opponent's Decay on the board): every play rescored first.
+		if vals := tileVals.forTurn(currentPlayer, currentRack, currentBot); vals != nil {
+			candidates = rescoreWithValues(candidates, bd, vals)
 		}
 
 		// Drawback Scrabble: same insertion point as BingoAversion above,
@@ -1080,6 +1089,26 @@ func simulateOneGame(gd *kwg.KWG, player1Bot, player2Bot BotConfig) SimGameResul
 			} else {
 				devilSinceObey[currentPlayer]++
 			}
+		}
+
+		// Tile values follow the tiles (before Demotion / Unusual change letters).
+		switch {
+		case chosen == nil:
+			tileVals.afterTurn(currentPlayer, currentBot, currentRack, "", "", nil)
+		case chosen.isExchange:
+			tileVals.afterTurn(currentPlayer, currentBot, currentRack, chosen.exchangeTiles, drawnTiles, nil)
+		default:
+			usedLetters := ""
+			for _, t := range chosen.detailed.Tiles {
+				if t.IsNew {
+					if t.IsBlank {
+						usedLetters += "?"
+					} else {
+						usedLetters += strings.ToUpper(t.Letter)
+					}
+				}
+			}
+			tileVals.afterTurn(currentPlayer, currentBot, currentRack, usedLetters, drawnTiles, chosen.detailed.Tiles)
 		}
 
 		// Demotion / Unusual change the tiles after the holder's turn.
