@@ -362,6 +362,7 @@ func main() {
 	http.HandleFunc("/solve-endgame-exact", solveEndgameExactHandler)
 	http.HandleFunc("/solve-endgame-explain", solveEndgameExplainHandler)
 	http.HandleFunc("/simulate-series", simulateSeriesHandler)
+	http.HandleFunc("/champ-moves", champMovesHandler)
 	http.HandleFunc("/board-metrics", boardMetricsHandler)
 	http.HandleFunc("/bot-turn", botTurnHandler)
 	http.HandleFunc("/drawback-moves", drawbackMovesHandler)
@@ -601,28 +602,7 @@ func rankMovesForRequest(req GenerateMovesRequest) ([]Move, int, string, error) 
 			continue
 		}
 
-		// Extract word from move string
-		// Format: "<action: play word: POSITION WORD score: SCORE tp: TILES_PLAYED leave: LEAVE>"
-		word := ""
-		parts := strings.Split(moveStr, "play word:")
-		if len(parts) > 1 {
-			wordPart := strings.TrimSpace(parts[1])
-			// Split by spaces and find the word (skip position)
-			wordFields := strings.Fields(wordPart)
-			for _, field := range wordFields {
-				// Skip position-like strings (like "8D") and score info
-				if len(field) >= 2 && !strings.ContainsAny(field, "0123456789") &&
-					!strings.HasPrefix(field, "score:") &&
-					!strings.HasPrefix(field, "tp:") &&
-					!strings.HasPrefix(field, "leave:") {
-					// Found the word, but check if it's not just dots
-					if !strings.HasPrefix(field, ".....") {
-						word = field
-					}
-					break
-				}
-			}
-		}
+		word := moveWordFromString(moveStr)
 
 		// Recompute the leave from the actual tiles used rather than trusting
 		// Move.Leave().UserVisible's blank/casing convention - same rationale
@@ -700,6 +680,31 @@ func rankMovesForRequest(req GenerateMovesRequest) ([]Move, int, string, error) 
 		})
 	}
 	return responseMoves, len(moves), lexiconName, nil
+}
+
+// moveWordFromString pulls the word out of a macondo move's String() -
+// "<action: play word: POSITION WORD score: SCORE tp: TILES_PLAYED leave:
+// LEAVE>" - the format the client's display pipeline expects. Shared by
+// rankMovesForRequest and champ_sim.go.
+func moveWordFromString(moveStr string) string {
+	parts := strings.Split(moveStr, "play word:")
+	if len(parts) < 2 {
+		return ""
+	}
+	for _, field := range strings.Fields(strings.TrimSpace(parts[1])) {
+		// Skip position-like strings (like "8D") and score info
+		if len(field) >= 2 && !strings.ContainsAny(field, "0123456789") &&
+			!strings.HasPrefix(field, "score:") &&
+			!strings.HasPrefix(field, "tp:") &&
+			!strings.HasPrefix(field, "leave:") {
+			// Found the word, but check if it's not just dots
+			if !strings.HasPrefix(field, ".....") {
+				return field
+			}
+			return ""
+		}
+	}
+	return ""
 }
 
 func validateWordHandler(w http.ResponseWriter, r *http.Request) {
