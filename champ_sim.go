@@ -32,11 +32,14 @@ package main
 //
 // Playouts run in parallel across CPU cores, each worker on its own copy
 // of the board, so the same budget buys far more playouts than Quackle's
-// single thread (its Championship Player: 132 / 330 in 66 seconds).
+// single thread (its Championship Player: 132 / 330 in 66 seconds; ours
+// defaults to 1,000 / 2,500).
 
 import (
 	"bufio"
+	"crypto/sha256"
 	_ "embed"
+	"encoding/hex"
 	"encoding/json"
 	"math"
 	"math/rand"
@@ -407,7 +410,7 @@ type champConfig struct {
 // candidates it reached, best win chance first, and whether time ran out.
 func champRank(root *champRoot, cands []champChoice, cfg champConfig) ([]*champStat, bool) {
 	deadline := time.Now().Add(cfg.budget)
-	nWorkers := runtime.NumCPU()
+	nWorkers := champWorkerCount()
 	workers := make([]*champWorker, nWorkers)
 	seed := time.Now().UnixNano()
 	for i := range workers {
@@ -447,6 +450,80 @@ func champRank(root *champRoot, cands []champChoice, cfg champConfig) ([]*champS
 	return simmed, timedOut
 }
 
+// --- The guard ----------------------------------------------------------------------
+// One press uses many cores for several seconds, so Wilma mustn't be able
+// to starve the rest of the service (Wally's moves, Ask Wally, the other
+// endpoints): one sim at a time, on at most half the cores, and the same
+// position asked again is answered from a short-lived cache.
+
+// champSlot holds the one running sim; a second request waits briefly for
+// it, then gets 503 "busy".
+var champSlot = make(chan struct{}, 1)
+
+const champSlotWait = 3 * time.Second
+
+func champWorkerCount() int {
+	n := runtime.NumCPU() / 2
+	if n < 1 {
+		n = 1
+	}
+	return n
+}
+
+const (
+	champCacheTTL = 10 * time.Minute
+	champCacheMax = 256
+)
+
+type champCacheEntry struct {
+	resp    ChampMovesResponse
+	expires time.Time
+}
+
+var (
+	champCacheMu sync.Mutex
+	champCache   = map[string]champCacheEntry{}
+)
+
+// champCacheKey identifies a request: the position plus the settings.
+func champCacheKey(req ChampMovesRequest) string {
+	b, _ := json.Marshal(req)
+	sum := sha256.Sum256(b)
+	return hex.EncodeToString(sum[:])
+}
+
+func champCacheGet(key string) (ChampMovesResponse, bool) {
+	champCacheMu.Lock()
+	defer champCacheMu.Unlock()
+	e, ok := champCache[key]
+	if !ok || time.Now().After(e.expires) {
+		delete(champCache, key)
+		return ChampMovesResponse{}, false
+	}
+	return e.resp, true
+}
+
+func champCachePut(key string, resp ChampMovesResponse) {
+	champCacheMu.Lock()
+	defer champCacheMu.Unlock()
+	now := time.Now()
+	if len(champCache) >= champCacheMax {
+		// Drop the expired ones; if that isn't enough, the one closest to expiring.
+		oldestKey, oldest := "", now.Add(champCacheTTL+time.Hour)
+		for k, e := range champCache {
+			if now.After(e.expires) {
+				delete(champCache, k)
+			} else if e.expires.Before(oldest) {
+				oldestKey, oldest = k, e.expires
+			}
+		}
+		if len(champCache) >= champCacheMax && oldestKey != "" {
+			delete(champCache, oldestKey)
+		}
+	}
+	champCache[key] = champCacheEntry{resp: resp, expires: now.Add(champCacheTTL)}
+}
+
 // --- The endpoint -----------------------------------------------------------------
 
 type ChampMovesRequest struct {
@@ -484,15 +561,20 @@ type ChampMovesResponse struct {
 	ElapsedMs  int64            `json:"elapsedMs"`
 	TimedOut   bool             `json:"timedOut"`
 	Workers    int              `json:"workers"`
+	Cached     bool             `json:"cached,omitempty"` // answered from the cache, no new sims
 	Lexicon    string           `json:"lexicon,omitempty"`
 }
 
 const (
 	champDefaultCandidates = 14
 	champMaxCandidates     = 33
-	champDefaultMinIter    = 132 // Quackle's Championship Player
-	champDefaultMaxIter    = 330
-	champDefaultSeconds    = 8.0
+	// Quackle's Championship Player uses 132 / 330 because it's single-
+	// threaded with 66 seconds; across all cores we can afford far more,
+	// which takes a candidate's win chance from about +/-4 points to
+	// about +/-1.5.
+	champDefaultMinIter    = 1000
+	champDefaultMaxIter    = 2500
+	champDefaultSeconds    = 15.0
 	champMaxSeconds        = 30.0
 )
 
@@ -574,6 +656,25 @@ func champMovesHandler(w http.ResponseWriter, r *http.Request) {
 	cross_set.GenAllCrossSets(bd, gd, ld)
 	bd.UpdateAllAnchors()
 
+	// Same position, same settings: the saved answer.
+	cacheKey := champCacheKey(req)
+	if cached, ok := champCacheGet(cacheKey); ok {
+		cached.Cached = true
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(cached)
+		return
+	}
+	// One sim at a time.
+	select {
+	case champSlot <- struct{}{}:
+		defer func() { <-champSlot }()
+	case <-time.After(champSlotWait):
+		http.Error(w, "Wilma is busy with another position - try again in a few seconds", http.StatusServiceUnavailable)
+		return
+	case <-r.Context().Done():
+		return
+	}
+
 	cfg := champConfig{candidates: champDefaultCandidates, minIterations: champDefaultMinIter, maxIterations: champDefaultMaxIter}
 	if req.Candidates > 0 {
 		cfg.candidates = min(req.Candidates, champMaxCandidates)
@@ -603,7 +704,7 @@ func champMovesHandler(w http.ResponseWriter, r *http.Request) {
 	cands := champCandidates(gd, bd, req.Rack, bagLen)
 	ranked, timedOut := champRank(root, cands, cfg)
 
-	resp := ChampMovesResponse{Plies: root.plies, TimedOut: timedOut, Workers: runtime.NumCPU(), Lexicon: lexiconName}
+	resp := ChampMovesResponse{Plies: root.plies, TimedOut: timedOut, Workers: champWorkerCount(), Lexicon: lexiconName}
 	for _, st := range ranked {
 		resp.Iterations += st.n
 		gain := 0.0
@@ -616,6 +717,9 @@ func champMovesHandler(w http.ResponseWriter, r *http.Request) {
 		})
 	}
 	resp.ElapsedMs = time.Since(start).Milliseconds()
+	if !timedOut {
+		champCachePut(cacheKey, resp)
+	}
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(resp)
 }
