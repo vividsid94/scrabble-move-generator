@@ -27,15 +27,15 @@ import (
 
 var localhostOriginRe = regexp.MustCompile(`^http://localhost:\d+$`)
 
+// Our sites, and any subdomain of them (www., staging.) - the same rule as
+// whiffers-api's isAllowedOrigin.
+var siteOriginRe = regexp.MustCompile(`^https://([a-z0-9-]+\.)?(whiffers230|tileturnover)\.com$`)
+
 func setCORSHeaders(w http.ResponseWriter, r *http.Request) {
 	origin := r.Header.Get("Origin")
-	allowedOrigins := map[string]bool{
-		"https://tileturnover.com": true,
-		"https://whiffers230.com":  true,
-	}
 	// Vite (and old Netlify Dev) don't stick to one port, so any localhost
 	// port is allowed in dev rather than chasing whichever one got picked.
-	if allowedOrigins[origin] || localhostOriginRe.MatchString(origin) {
+	if siteOriginRe.MatchString(origin) || localhostOriginRe.MatchString(origin) {
 		w.Header().Set("Access-Control-Allow-Origin", origin)
 		w.Header().Set("Vary", "Origin")
 	}
